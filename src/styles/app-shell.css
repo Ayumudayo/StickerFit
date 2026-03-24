@@ -1,0 +1,1209 @@
+.desktopShell {
+  width: min(1400px, calc(100% - 32px));
+  gap: 24px;
+  padding: 24px 0 40px;
+}
+
+.desktopShellEditing {
+  padding-bottom: 16px;
+}
+
+.desktopHeader {
+  padding: 0 0 18px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0;
+  box-shadow: none;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.desktopHeaderCopy {
+  gap: 12px;
+}
+
+.desktopTitle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 0;
+  color: #ffffff;
+  font-size: clamp(1.9rem, 3vw, 2.55rem);
+}
+
+.desktopTitleIcon {
+  color: #5865F2;
+}
+
+.desktopHeaderActions {
+  justify-self: end;
+  align-self: start;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.desktopStatus {
+  gap: 8px;
+  padding: 10px 16px;
+  white-space: nowrap;
+}
+
+.desktopStatus.statusOk {
+  background: rgba(34, 197, 94, 0.12);
+  color: #86efac;
+  border: 1px solid rgba(34, 197, 94, 0.22);
+}
+
+.desktopStatus.statusWarn {
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.22);
+}
+
+.desktopPickerGrid,
+.editorWorkspace {
+  display: grid;
+  gap: 24px;
+}
+
+.desktopPickerGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.desktopPickerCard,
+.appCard,
+.timelineCard,
+.frameCard,
+.noticeCard,
+.previewCard,
+.detailsPanel,
+.detailsCard,
+.resultCard,
+.emptyState,
+.errorCard {
+  background: rgba(17, 18, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 22px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+}
+
+.desktopPickerCard {
+  padding: 11px 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.pickerHeaderRow,
+.pickerControlRow,
+.sectionIntro,
+.sectionIntroActions,
+.cardHeading,
+.settingRow,
+.transportRow,
+.transportControls,
+.timelineNotches,
+.outputPathRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.advancedSettingsCard {
+  display: grid;
+  gap: 16px;
+  min-height: 176px;
+  align-content: start;
+}
+
+.advancedSettingsBody {
+  display: grid;
+  gap: 16px;
+}
+
+.advancedSettingsHint {
+  margin: 0;
+}
+
+.advancedOptimizerPanel {
+  position: absolute;
+  top: 24px;
+  right: 24px;
+  width: 340px;
+  z-index: 100;
+  background: rgba(17, 18, 24, 0.96);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+  display: grid;
+  gap: 18px;
+  min-height: 176px;
+  align-content: start;
+}
+
+.advancedOptimizerGrid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.pickerHeaderRow,
+.cardHeading,
+.settingRow,
+.timelineNotches,
+.outputPathRow {
+  justify-content: space-between;
+}
+
+.pickerControlRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.desktopPickerCard .pickerHeaderRow {
+  margin-bottom: 6px;
+}
+
+.pickerInlineBadge,
+.frameCountBadge,
+.timelineClock {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #cbd5e1;
+  font-size: 0.82rem;
+}
+
+.timelineClock {
+  flex: 0 0 auto;
+  min-width: max-content;
+  justify-self: end;
+  white-space: nowrap;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.pickerDisplaySurface {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  min-height: 34px;
+  border-radius: 11px;
+  background: #09090b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.pickerDisplaySurface.is-muted {
+  color: #71717a;
+}
+
+.pickerDisplaySurface.is-empty {
+  color: #71717a;
+  border: 1px dashed rgba(88, 101, 242, 0.5);
+  background: rgba(88, 101, 242, 0.05);
+}
+
+.pickerSurfaceIcon {
+  color: #71717a;
+  flex: 0 0 auto;
+}
+
+.desktopPickerActions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+}
+
+.desktopSelectButton,
+.iconButtonAction {
+  min-width: max-content;
+  flex: 0 0 auto;
+}
+
+.desktopPickerCard .secondaryAction,
+.desktopPickerCard .subtleAction {
+  min-height: 34px;
+  padding: 6px 11px;
+  border-radius: 11px;
+}
+
+.iconButtonAction {
+  padding-inline: 9px;
+}
+
+.emptyStateWide {
+  padding: 28px;
+}
+
+.editorWorkspace {
+  grid-template-columns: clamp(248px, 23vw, 304px) minmax(0, 1fr);
+  grid-template-areas: "rail stage";
+  align-items: stretch;
+  height: max(360px, var(--editor-workspace-min-height, 0px));
+  overflow: hidden;
+}
+
+.editorWorkspaceStatic {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "stage";
+  height: max(360px, var(--editor-workspace-min-height, 0px));
+  overflow: hidden;
+}
+
+.stageColumn,
+.frameRail,
+.settingsColumn {
+  min-width: 0;
+}
+
+.stageColumn {
+  grid-area: stage;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  align-content: stretch;
+  position: relative;
+}
+
+.previewWorkspaceColumn {
+  display: grid;
+  gap: 6px;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  position: relative;
+}
+
+.previewBottomDock {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  align-self: end;
+}
+
+.previewInfoBar {
+  display: grid;
+  grid-template-columns: minmax(0, 0.96fr) minmax(0, 1.04fr);
+  gap: 20px;
+  align-items: stretch;
+  padding: 12px 14px;
+  min-height: 96px;
+  border-radius: 12px;
+  background: rgba(14, 15, 20, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.previewInfoMetrics,
+.previewInfoSettings {
+  min-width: 0;
+}
+
+.previewInfoMetrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 22px;
+  align-content: center;
+  grid-auto-rows: minmax(34px, auto);
+}
+
+.previewMetricItem {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: center;
+  gap: 3px;
+  min-width: 0;
+  min-height: 36px;
+}
+
+.previewMetricItem .metaLabel {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1;
+}
+
+.previewMetricItem strong {
+  display: block;
+  line-height: 1.15;
+  color: #ffffff;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.previewMetricSelection {
+  color: #d8d9df;
+}
+
+.previewInfoSettings {
+  display: grid;
+  grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr) auto;
+  align-items: end;
+  align-content: center;
+  gap: 10px 12px;
+  padding-left: 16px;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.previewInfoField {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  align-content: center;
+}
+
+.previewInfoField .metaLabel {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.previewInlineSelectShell {
+  position: relative;
+  width: 100%;
+}
+
+.previewInlineSelect {
+  min-height: 36px;
+  width: 100%;
+  padding: 6px 30px 6px 10px;
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: #09090b;
+  color: #ffffff;
+  white-space: nowrap;
+}
+
+.previewInlineSelect:disabled {
+  background: #12141b;
+  color: #7b8191;
+  border-color: rgba(255, 255, 255, 0.06);
+  cursor: not-allowed;
+}
+
+.previewInlineSelect:disabled + .previewInlineChevron {
+  color: #5b6170;
+}
+
+.previewInlineChevron {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #71717a;
+  pointer-events: none;
+}
+
+.previewInfoAction,
+.previewInfoPrimaryAction {
+  min-height: 36px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  white-space: nowrap;
+  flex-wrap: nowrap;
+}
+
+.previewInfoPrimaryAction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.previewInfoResetAction {
+  justify-self: start;
+  align-self: end;
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 1320px) {
+  .previewInfoSettings {
+    grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr);
+  }
+
+  .previewInfoResetAction {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+}
+
+.previewControlBar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: rgba(14, 15, 20, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.previewTransportBar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 360px;
+}
+
+.previewTransportPlayButton {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 9px;
+  background: #5865F2;
+  color: #ffffff;
+}
+
+.previewTransportRailBlock {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 280px;
+}
+
+.previewTransportMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #8f93a0;
+  font-size: 0.74rem;
+}
+
+.previewTimelineRail {
+  min-height: 18px;
+}
+
+.previewZoomBar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+}
+
+.previewZoomDockButton,
+.previewZoomDockStepButton {
+  min-height: 28px;
+  padding: 4px 10px;
+  border-radius: 9px;
+}
+
+.previewZoomDockButton.is-active,
+.previewZoomDockStepButton.is-active {
+  background: rgba(88, 101, 242, 0.2);
+  border-color: rgba(88, 101, 242, 0.4);
+  color: #dfe3ff;
+}
+
+.previewZoomDockStepButton {
+  min-width: 28px;
+  padding-inline: 6px;
+}
+
+.previewZoomDockReadout {
+  min-width: 2.8rem;
+  text-align: center;
+  color: #e5e7eb;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 0.82rem;
+}
+
+.previewZoomDockSlider {
+  width: 88px;
+  min-width: 88px;
+  max-width: 88px;
+  flex: 0 0 88px;
+}
+
+.previewInlineMessage {
+  padding: 10px 12px;
+}
+
+.editorOverlayShell {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+}
+
+.editorOverlayBackdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  border-radius: 18px;
+  background: rgba(8, 10, 14, 0.16);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  pointer-events: auto;
+}
+
+.editorDockPanel {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  container-type: inline-size;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  background: rgba(14, 15, 20, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.32);
+  width: min(560px, calc(100% - 28px));
+  max-height: min(44vh, calc(100% - 28px));
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.editorDockPanel--settings {
+  width: min(360px, calc(100% - 28px));
+  max-height: min(280px, calc(100% - 28px));
+}
+
+.editorDockPanel--preview {
+  width: min(640px, calc(100% - 28px));
+  max-height: min(50vh, calc(100% - 28px));
+}
+
+.editorDockPanel--results {
+  width: min(1040px, calc(100% - 28px));
+  max-height: min(68vh, calc(100% - 28px));
+}
+
+.editorDockPanelHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.editorDockPanelBody {
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  padding-right: 4px;
+}
+
+.editorDockPanelBody > * {
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+}
+
+.editorDockCloseButton {
+  min-height: 28px;
+  min-width: 28px;
+  padding: 4px;
+  border-radius: 9px;
+}
+
+.previewUtilityStrip {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.previewUtilityArea {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.previewUtilityAreaStatic {
+  justify-content: flex-end;
+}
+
+.previewUtilityButton {
+  min-height: 30px;
+  padding: 4px 10px;
+  border-radius: 10px;
+}
+
+.previewUtilityPrimaryAction {
+  min-height: 34px;
+  padding: 6px 14px;
+  border-radius: 12px;
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.previewIntroBlock {
+  display: grid;
+  gap: 4px;
+}
+
+.previewSectionIntro {
+  align-items: flex-start;
+}
+
+.previewSectionIntro h2 {
+  font-size: 1.22rem;
+  line-height: 1.12;
+}
+
+.previewSectionIntro .summaryText {
+  font-size: 0.9rem;
+  color: #8b8d97;
+}
+
+.frameRail {
+  grid-area: rail;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.frameRailCard {
+  flex: 1;
+  min-height: 100%;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  align-content: start;
+  gap: 12px;
+}
+
+.timelineDock {
+  grid-area: timeline;
+  min-width: 0;
+}
+
+.sectionIntro {
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.sectionIntroActions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.selectionSummaryBlock {
+  display: grid;
+  gap: 4px;
+  text-align: right;
+}
+
+.settingsColumn {
+  grid-area: inspector;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-height: 0;
+}
+
+.settingsCard {
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.advancedOptimizerPanelInline {
+  position: static;
+  top: auto;
+  right: auto;
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  background: transparent;
+  backdrop-filter: none;
+}
+
+.advancedOptimizerPanelInline .advancedOptimizerGrid {
+  gap: 10px;
+}
+
+.cardHeading h3,
+.withSubcopy h3 {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #ffffff;
+}
+
+.cardHeadingIcon {
+  color: #a1a1aa;
+}
+
+.withSubcopy {
+  align-items: flex-start;
+}
+
+.timelineHeading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+}
+
+.timelineHeadingCopy {
+  min-width: 0;
+}
+
+.settingsList {
+  display: grid;
+  gap: 8px;
+}
+
+.settingRow {
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.settingRow:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.settingLabel {
+  color: #71717a;
+  font-size: 0.82rem;
+}
+
+.settingValue {
+  text-align: right;
+  color: #f5f5f5;
+}
+
+.successValue {
+  color: #86efac;
+}
+
+.warnValue {
+  color: #fbbf24;
+}
+
+.settingChip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(88, 101, 242, 0.16);
+  color: #5865F2;
+  font-size: 0.85rem;
+}
+
+.quickStatsGrid,
+.resultMetaGrid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.statTile {
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(17, 18, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  display: grid;
+  gap: 4px;
+}
+
+.statTile strong {
+  font-size: 1.08rem;
+  line-height: 1.1;
+  color: #ffffff;
+}
+
+.settingsColumn .settingLabel,
+.settingsColumn .metaLabel,
+.settingsColumn .statTile strong {
+  white-space: nowrap;
+}
+
+.settingsColumn .secondaryCta,
+.settingsColumn .primaryCta {
+  white-space: normal;
+  text-align: center;
+}
+
+.statSuffix {
+  margin-left: 6px;
+  font-size: 0.78rem;
+  color: #71717a;
+  font-weight: 400;
+}
+
+.selectShell {
+  position: relative;
+}
+
+.fitModeSelect,
+.fieldInput {
+  width: 100%;
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: #09090b;
+  color: #ffffff;
+}
+
+.fitModeSelect {
+  min-height: 36px;
+  padding: 7px 34px 7px 10px;
+}
+
+.selectChevron {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #71717a;
+  pointer-events: none;
+}
+
+.noticeCard {
+  padding: 10px 12px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.16);
+}
+
+.noticeIcon {
+  color: #f59e0b;
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.ctaRow {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ctaRowSingle {
+  grid-template-columns: 1fr;
+}
+
+.ctaStack {
+  display: grid;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.primaryCta,
+.secondaryCta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 44px;
+  font-weight: 700;
+}
+
+.ctaButton {
+  padding-inline: 14px;
+  justify-content: space-between;
+}
+
+.ctaSlot {
+  flex: 0 0 18px;
+}
+
+.ctaLabel {
+  flex: 1;
+  text-align: center;
+}
+
+.secondaryCta {
+  background: #1f2028;
+}
+
+.secondaryCtaCompact {
+  min-height: 38px;
+}
+
+.ctaIcon {
+  opacity: 0.8;
+}
+
+.resultCardInline {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+}
+
+.editorDockPanelBody .bottomPanelsStack,
+.editorDockPanelBody .figmaCandidatesSection,
+.editorDockPanelBody .resultSummarySection {
+  gap: 12px;
+}
+
+.editorDockPanelBody .resultCardInline {
+  gap: 12px;
+  padding: 14px;
+  overflow: hidden;
+}
+
+.editorDockPanelBody .metricPill {
+  padding: 12px;
+}
+
+.editorDockPanelBody .pathCode {
+  padding: 10px 12px;
+  border-radius: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editorDockPanelBody .outputPathRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+}
+
+.editorDockPanelBody .outputPathRow .secondaryAction {
+  justify-self: end;
+}
+
+.editorDockPanelBody .bottomPanelsStack {
+  align-content: start;
+}
+
+.editorResultsOverlay {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  width: 100%;
+  align-content: start;
+}
+
+.editorResultsSection {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.editorResultsCard,
+.editorResultsAttemptCard {
+  display: grid;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  padding: 16px;
+  border-radius: 18px;
+  background: rgba(17, 18, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.editorResultsCardSelected {
+  border-color: rgba(34, 197, 94, 0.22);
+}
+
+.editorResultsMetrics,
+.editorResultsAttemptMeta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.editorResultsAttemptHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.editorResultsAttempts {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.editorResultsPathRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.editorResultsAttemptPathRow {
+  min-width: 0;
+}
+
+.editorResultsOverlay .pathCode {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@container (max-width: 760px) {
+  .editorDockPanelBody .resultMetaGrid,
+  .editorDockPanelBody .candidateMetaGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .editorDockPanelBody .outputPathRow {
+    grid-template-columns: 1fr;
+  }
+
+  .editorDockPanelBody .outputPathRow .secondaryAction {
+    justify-self: start;
+  }
+
+  .editorResultsMetrics,
+  .editorResultsAttemptMeta,
+  .editorResultsPathRow {
+    grid-template-columns: 1fr;
+  }
+}
+
+.resultOk {
+  border-color: rgba(34, 197, 94, 0.22);
+}
+
+.resultSelectionReason {
+  display: grid;
+  gap: 6px;
+}
+
+.metricPill {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 16px;
+  background: #09090b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.pathCode {
+  display: block;
+  width: 100%;
+  overflow-wrap: anywhere;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #09090b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #d4d4d8;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 0.85rem;
+}
+
+.warningBox {
+  display: grid;
+  gap: 10px;
+  padding: 16px 18px;
+  border-radius: 18px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.16);
+}
+
+.warningList {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  color: #f4d29a;
+}
+
+.compactSurface {
+  gap: 10px;
+}
+
+.outputPathRow {
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+@media (max-width: 940px) {
+  .previewInfoBar {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .previewInfoSettings {
+    grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr) auto;
+    padding-left: 0;
+    padding-top: 8px;
+    border-left: 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .previewZoomBar {
+    justify-content: flex-start;
+  }
+
+  .previewTransportMeta {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .previewUtilityArea {
+    justify-content: flex-start;
+  }
+
+  .previewUtilityPrimaryAction {
+    justify-self: auto;
+  }
+
+}
+
+@media (max-width: 760px) {
+  .previewInfoSettings {
+    grid-template-columns: 1fr;
+  }
+
+  .previewInfoResetAction {
+    width: 100%;
+    min-width: 0;
+    justify-self: stretch;
+  }
+
+  .previewUtilityPrimaryAction {
+    width: 100%;
+    justify-content: center;
+  }
+
+}
+
+@media (max-width: 1040px) {
+  .pickerControlRow {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .desktopSelectButton {
+    align-self: flex-end;
+  }
+
+  .desktopPickerActions {
+    justify-content: flex-start;
+  }
+}

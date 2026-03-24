@@ -1,0 +1,235 @@
+.bottomPanelsStack {
+  display: grid;
+  gap: 24px;
+}
+
+.resultSummarySection {
+  gap: 14px;
+}
+
+.figmaCandidatesSection {
+  display: grid;
+  gap: 18px;
+}
+
+.figmaSectionHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.figmaSectionBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #cbd5e1;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.figmaCandidateGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.figmaCandidateCard,
+.figmaAttemptCard,
+.figmaEmptyPanel {
+  padding: 20px;
+  border-radius: 22px;
+  background: rgba(17, 18, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+}
+
+.figmaCandidateCard,
+.figmaAttemptCard {
+  display: grid;
+  gap: 16px;
+}
+
+.figmaCandidateTop,
+.figmaAttemptMetaRow,
+.figmaAttemptLead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.figmaCandidateBody {
+  display: grid;
+  gap: 8px;
+}
+
+.figmaRankBubble {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: rgba(88, 101, 242, 0.2);
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.figmaScoreChip,
+.figmaAttemptScore {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 11px;
+  border-radius: 10px;
+  background: #09090b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #e4e4e7;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 0.9rem;
+}
+
+.figmaSpecGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.figmaSpecCard {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border-radius: 14px;
+  background: #09090b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.figmaSpecCardWide {
+  grid-column: 1 / -1;
+}
+
+.figmaAttemptStack {
+  display: none;
+}
+
+.figmaAttemptGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.figmaAttemptLead {
+  align-items: flex-start;
+}
+
+.figmaAttemptLead > div:first-child {
+  display: grid;
+  gap: 10px;
+}
+
+.figmaAttemptState {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.figmaAttemptState.is-success {
+  background: rgba(34, 197, 94, 0.12);
+  color: #86efac;
+}
+
+.figmaAttemptState.is-warn {
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+}
+
+.figmaAttemptState.is-error {
+  background: rgba(239, 68, 68, 0.14);
+  color: #fca5a5;
+}
+
+.figmaAttemptState.is-neutral {
+  background: rgba(255, 255, 255, 0.08);
+  color: #d4d4d8;
+}
+
+@media (max-width: 900px) {
+  .figmaSectionHeader,
+  .figmaAttemptLead,
+  .figmaAttemptMetaRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .figmaSpecGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .figmaSpecCardWide {
+    grid-column: auto;
+  }
+
+  .figmaAttemptGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.previewCardMinimal {
+  padding: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.previewCardMinimal .previewStage {
+  position: relative;
+}
+
+.previewHoverHint {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #f5f5f5;
+  font-size: 0.8rem;
+  backdrop-filter: blur(10px);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.previewStage:hover .previewHoverHint {
+  opacity: 1;
+}
+
+.previewFailureText {
+  padding-inline: 4px;
+}
+
+.previewCardStageOnly {
+  padding: 0;
+  gap: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.previewCardStageOnly .previewStage {
+  padding: 0;
+  background: transparent;
+  border: 0;
+}

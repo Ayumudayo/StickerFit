@@ -1,0 +1,595 @@
+.frameCard {
+  padding: 20px;
+  display: grid;
+  gap: 18px;
+}
+
+.frameRailCard .frameTableBody {
+  max-height: none;
+  min-height: 0;
+  align-content: start;
+}
+
+.frameRailEmptyState {
+  display: grid;
+  align-content: center;
+  gap: 12px;
+  min-height: 0;
+}
+
+.transportRow {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.transportControls {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.transportButton,
+.playButton,
+.timelineHandle,
+.dangerAction {
+  border: 0;
+  cursor: pointer;
+}
+
+.transportButton {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  background: transparent;
+  color: #a1a1aa;
+}
+
+.playButton {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: #5865F2;
+  color: #ffffff;
+}
+
+.timelinePanelBody {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.timelineRail {
+  --timeline-progress: 0;
+  position: relative;
+  min-height: 28px;
+  border-radius: 0;
+  overflow: hidden;
+  background: #09090b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.timelineSegments {
+  position: absolute;
+  inset: 0;
+  display: flex;
+}
+
+.timelineSegment {
+  flex: 1;
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.timelineSegment.is-dimmed {
+  opacity: 0.28;
+}
+
+.timelineTrimRange {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(88, 101, 242, 0.14);
+  border-left: 2px solid #5865F2;
+  border-right: 2px solid #5865F2;
+}
+
+.timelinePlayhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc((100% - 2px) * var(--timeline-progress));
+  width: 2px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.timelineHandle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 14px;
+  margin-left: -7px;
+  background: transparent;
+}
+
+.timelineHandle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 12px;
+  bottom: 12px;
+  width: 4px;
+  border-radius: 999px;
+  background: #5865F2;
+  transform: translateX(-50%);
+}
+
+.timelineNotches {
+  color: #71717a;
+  font-size: 0.8rem;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+}
+
+.timelineInputGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.frameTable,
+.frameRow {
+  display: grid;
+  grid-template-columns: 0.8fr 1fr;
+  gap: 12px;
+  align-items: center;
+}
+
+.frameTableHeader {
+  color: #71717a;
+  font-size: 0.78rem;
+  padding: 0 6px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.frameTableBody {
+  display: grid;
+  gap: 2px;
+  max-height: min(58vh, 640px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.frameRow {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: default;
+  position: relative;
+  transition:
+    box-shadow 120ms ease,
+    border-color 120ms ease,
+    background 120ms ease,
+    opacity 120ms ease;
+  will-change: transform;
+}
+
+.frameRow::before,
+.frameRow::after {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  height: 2px;
+  border-radius: 0;
+  background: #5865f2;
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+  pointer-events: none;
+}
+
+.frameRow::before {
+  top: -8px;
+}
+
+.frameRow::after {
+  bottom: -8px;
+}
+
+.frameRow:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.frameRow:focus-visible {
+  outline: 2px solid #5865F2;
+  outline-offset: -2px;
+}
+
+.frameRow.is-selected {
+  background: rgba(88, 101, 242, 0.25);
+  border-color: rgba(88, 101, 242, 0.5);
+  cursor: grab;
+}
+
+.frameRow.is-selected:hover {
+  background: rgba(88, 101, 242, 0.35);
+}
+
+.frameRow.is-selected .frameMono {
+  color: #e4e4e7;
+}
+
+.frameRow.is-current {
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+.frameRow.is-dragged {
+  opacity: 0.96;
+  cursor: grabbing;
+  z-index: 3;
+  pointer-events: none;
+  transform: translateY(var(--frame-row-drag-y, 0px)) scale(1.02);
+  box-shadow: 0 18px 32px rgba(15, 23, 42, 0.42);
+  transition: none;
+}
+
+.frameRow.is-drop-above {
+  box-shadow: none;
+}
+
+.frameRow.is-drop-below {
+  box-shadow: none;
+}
+
+.frameRow.is-drop-above::before,
+.frameRow.is-drop-below::after {
+  opacity: 1;
+  transform: scaleX(1);
+}
+
+.frameCell {
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.frameIdCell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.frameIdCell {
+  justify-content: center;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+}
+
+.frameTimeCell {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.frameCellLabel {
+  display: none;
+  color: #71717a;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.frameValueGroup {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.frameMono {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  color: #a1a1aa;
+}
+
+.frameDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #5865F2;
+}
+
+.frameQuickActions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px;
+  align-items: stretch;
+}
+
+.frameQuickActionsSingle {
+  grid-template-columns: 1fr;
+}
+
+.frameQuickActionsWrap {
+  display: grid;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.frameQuickAction {
+  min-height: 38px;
+  padding: 0 12px;
+  border-radius: 10px;
+  justify-content: center;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.frameQuickAction.dangerAction {
+  padding: 0 12px;
+  min-height: 38px;
+  border-radius: 10px;
+}
+
+.frameQuickHint {
+  color: #8b8d97;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dangerAction {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(239, 68, 68, 0.12);
+  color: #fca5a5;
+}
+
+.errorText {
+  color: #fca5a5;
+}
+
+.previewCard {
+  display: grid;
+  padding: 20px;
+  gap: 18px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
+  height: 100%;
+}
+
+.previewCardStageOnly {
+  min-height: 0;
+  height: 100%;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+@media (max-height: 900px) and (min-width: 761px) {
+  .editorWorkspace,
+  .editorWorkspaceStatic {
+    gap: 18px;
+  }
+
+  .stageColumn,
+  .previewWorkspaceColumn {
+    gap: 12px;
+  }
+}
+
+.previewStage {
+  border-radius: 0;
+  background: #101116;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  height: 100%;
+  overflow: auto;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  scrollbar-width: none;
+}
+
+.previewStage::-webkit-scrollbar {
+  display: none;
+}
+
+.previewMediaFrame {
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.detailsPanel {
+  padding: 24px;
+}
+
+@media (max-width: 940px) {
+  .desktopPickerGrid,
+  .ctaRow,
+  .timelineInputGrid,
+  .quickStatsGrid,
+  .resultMetaGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .editorWorkspaceStatic {
+    grid-template-columns: 1fr;
+    grid-template-areas: none;
+  }
+
+  .editorWorkspaceStatic .stageColumn,
+  .editorWorkspaceStatic .timelineDock {
+    grid-area: auto;
+  }
+
+  .previewZoomBar {
+    justify-content: flex-start;
+  }
+
+  .desktopShell {
+    width: min(100%, calc(100% - 24px));
+    gap: 20px;
+  }
+
+  .pickerControlRow,
+  .desktopPickerActions,
+  .sectionIntro,
+  .sectionIntroActions {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .transportRow {
+    grid-template-columns: 1fr;
+  }
+
+  .transportControls {
+    justify-content: flex-start;
+  }
+
+  .outputPathRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .selectionSummaryBlock {
+    text-align: left;
+  }
+
+  .previewStage {
+    padding: 0;
+  }
+}
+
+@media (max-width: 860px) {
+  .desktopHeader {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .desktopHeaderActions {
+    justify-self: stretch;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .desktopStatus {
+    padding: 8px 12px;
+    font-size: 0.78rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .localeButton {
+    padding: 7px 10px;
+  }
+
+  .compactAction {
+    min-width: 0;
+    white-space: normal;
+    text-align: center;
+    line-height: 1.2;
+  }
+}
+
+@media (max-width: 760px) {
+
+  .editorWorkspace,
+  .editorWorkspaceStatic {
+    grid-template-columns: 1fr;
+    grid-template-areas: none;
+  }
+
+  .frameRail,
+  .stageColumn,
+  .timelineDock {
+    grid-area: auto;
+  }
+
+  .frameRailCard {
+    min-height: auto;
+  }
+
+  .pickerControlRow,
+  .desktopPickerActions,
+  .sectionIntro,
+  .sectionIntroActions,
+  .outputPathRow,
+  .timelineHeading,
+  .transportRow {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .timelineClock {
+    justify-self: start;
+  }
+
+  .transportControls {
+    justify-content: flex-start;
+  }
+
+  .frameTableHeader {
+    display: none;
+  }
+
+  .frameTableBody {
+    gap: 8px;
+    padding-right: 0;
+  }
+
+  .frameRow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 14px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  .frameIdCell,
+  .frameTimeCell {
+    display: grid;
+    gap: 4px;
+    justify-content: stretch;
+  }
+
+  .frameIdCell {
+    justify-content: stretch;
+  }
+
+  .frameCellLabel {
+    display: block;
+  }
+
+  .frameValueGroup {
+    justify-content: flex-start;
+  }
+
+  .frameCell,
+  .frameMono {
+    white-space: nowrap;
+  }
+
+  .frameQuickActions {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+}
