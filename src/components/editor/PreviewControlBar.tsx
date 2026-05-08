@@ -1,4 +1,5 @@
 import type { CSSProperties, PointerEventHandler, RefObject } from "react";
+import { useMemo } from "react";
 
 import type { MessagesForLocale, Locale } from "../../locales/messages";
 import type { EditorText } from "../../locales/editorText";
@@ -6,6 +7,35 @@ import type { PreviewZoomMode } from "../../components/MediaSelectionPreview";
 import type { FrameSelectionModel, TimelineFrameView } from "../../types/editor";
 import { formatTimelineTime } from "../../utils/timelineFrames";
 import { PauseIcon, PlayIcon } from "../AppIcons";
+
+const LARGE_TIMELINE_SEGMENT_THRESHOLD = 160;
+const TIMELINE_SEGMENT_FILL = "rgba(255, 255, 255, 0.05)";
+const TIMELINE_SEGMENT_DIMMED_FILL = "rgba(255, 255, 255, 0.014)";
+
+function formatPercent(value: number) {
+  return `${value.toFixed(4)}%`;
+}
+
+function buildTimelineSegmentBackground(
+  timelineFrameViews: TimelineFrameView[],
+  selectedInstanceIdSet: ReadonlySet<string>,
+) {
+  if (timelineFrameViews.length === 0) {
+    return "none";
+  }
+
+  const frameCount = timelineFrameViews.length;
+  return `linear-gradient(to right, ${timelineFrameViews
+    .map((frame, index) => {
+      const startPercent = formatPercent((index / frameCount) * 100);
+      const endPercent = formatPercent(((index + 1) / frameCount) * 100);
+      const fill = selectedInstanceIdSet.has(frame.instanceId)
+        ? TIMELINE_SEGMENT_FILL
+        : TIMELINE_SEGMENT_DIMMED_FILL;
+      return `${fill} ${startPercent} ${endPercent}`;
+    })
+    .join(", ")})`;
+}
 
 type PreviewControlBarProps = {
   copy: MessagesForLocale;
@@ -58,6 +88,21 @@ export function PreviewControlBar({
   onPreviewZoomStep,
   onPreviewZoomChange,
 }: PreviewControlBarProps) {
+  const useDenseTimelineSegments =
+    timelineFrameViews.length >= LARGE_TIMELINE_SEGMENT_THRESHOLD;
+  const timelineSegmentsStyle = useMemo<CSSProperties | undefined>(() => {
+    if (!useDenseTimelineSegments) {
+      return undefined;
+    }
+
+    return {
+      "--timeline-segment-background": buildTimelineSegmentBackground(
+        timelineFrameViews,
+        selection.selectedInstanceIdSet,
+      ),
+    } as CSSProperties;
+  }, [selection.selectedInstanceIdSet, timelineFrameViews, useDenseTimelineSegments]);
+
   return (
     <section className="previewControlBar">
       {!isStaticImage ? (
@@ -81,17 +126,27 @@ export function PreviewControlBar({
               onPointerUp={onPointerUp}
               onPointerCancel={onPointerCancel}
             >
-              <div className="timelineSegments" aria-hidden="true">
-                {timelineFrameViews.map((frame) => (
-                  <div
-                    key={frame.instanceId}
-                    className={
-                      selection.selectedInstanceIdSet.has(frame.instanceId)
-                        ? "timelineSegment"
-                        : "timelineSegment is-dimmed"
-                    }
-                  />
-                ))}
+              <div
+                className={
+                  useDenseTimelineSegments
+                    ? "timelineSegments timelineSegmentsDense"
+                    : "timelineSegments"
+                }
+                style={timelineSegmentsStyle}
+                aria-hidden="true"
+              >
+                {!useDenseTimelineSegments
+                  ? timelineFrameViews.map((frame) => (
+                      <div
+                        key={frame.instanceId}
+                        className={
+                          selection.selectedInstanceIdSet.has(frame.instanceId)
+                            ? "timelineSegment"
+                            : "timelineSegment is-dimmed"
+                        }
+                      />
+                    ))
+                  : null}
               </div>
 
               <div className="timelinePlayhead" aria-hidden="true" />

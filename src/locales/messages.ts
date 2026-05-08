@@ -86,6 +86,13 @@ export type MessagesForLocale = {
   hideResults: string;
   closePanel: string;
   advancedOptimizeFocus: string;
+  optimizerGoal: string;
+  optimizerGoalBalanced: string;
+  optimizerGoalMotion: string;
+  optimizerGoalQuality: string;
+  qualityFrameDropInterval: string;
+  frameDropDisabled: string;
+  frameDropEvery: (interval: number) => string;
   advancedSearchDepth: string;
   optimizeFocusAuto: string;
   optimizeFocusQuality: string;
@@ -212,6 +219,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     hideResults: "Hide results",
     closePanel: "Close panel",
     advancedOptimizeFocus: "Optimization focus",
+    optimizerGoal: "Optimization goal",
+    optimizerGoalBalanced: "Balanced",
+    optimizerGoalMotion: "Motion first",
+    optimizerGoalQuality: "Quality first",
+    qualityFrameDropInterval: "Frame removal",
+    frameDropDisabled: "Disabled",
+    frameDropEvery: (interval) => `Remove every ${interval}th frame`,
     advancedSearchDepth: "Search depth",
     optimizeFocusAuto: "Auto",
     optimizeFocusQuality: "Quality first",
@@ -340,6 +354,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     hideResults: "결과 숨기기",
     closePanel: "패널 닫기",
     advancedOptimizeFocus: "최적화 초점",
+    optimizerGoal: "최적화 목표",
+    optimizerGoalBalanced: "균형",
+    optimizerGoalMotion: "움직임 우선",
+    optimizerGoalQuality: "화질 우선",
+    qualityFrameDropInterval: "프레임 자동 제거",
+    frameDropDisabled: "비활성화",
+    frameDropEvery: (interval) => `${interval}번째마다 제거`,
     advancedSearchDepth: "탐색 강도",
     optimizeFocusAuto: "자동",
     optimizeFocusQuality: "품질 우선",

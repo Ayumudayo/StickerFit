@@ -3,9 +3,155 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { TimelineDragState, TimelineFrameView } from "../types/editor";
 import type { MediaInspection } from "../types/workflow";
+import {
+  lastSelectedFrameView,
+  selectedPlaybackFrames,
+} from "../utils/frameSelection";
+
+const PLAYBACK_TICK_EPSILON_SECONDS = 0.01;
+const PLAYBACK_FRAME_EPSILON_SECONDS = 0.001;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+export type PlaybackTimelineLookup = {
+  frames: TimelineFrameView[];
+  startTimes: number[];
+};
+
+export function createPlaybackTimelineLookup(
+  frames: TimelineFrameView[],
+): PlaybackTimelineLookup {
+  return {
+    frames,
+    startTimes: frames.map((frame) => frame.startTimeSeconds),
+  };
+}
+
+function findFirstFrameIndexAtOrAfter(startTimes: number[], timeSeconds: number) {
+  let low = 0;
+  let high = startTimes.length;
+
+  while (low < high) {
+    const midpoint = Math.floor((low + high) / 2);
+    if (startTimes[midpoint] < timeSeconds) {
+      low = midpoint + 1;
+    } else {
+      high = midpoint;
+    }
+  }
+
+  return low < startTimes.length ? low : -1;
+}
+
+function findLastFrameIndexAtOrBefore(startTimes: number[], timeSeconds: number) {
+  let low = 0;
+  let high = startTimes.length;
+
+  while (low < high) {
+    const midpoint = Math.floor((low + high) / 2);
+    if (startTimes[midpoint] <= timeSeconds) {
+      low = midpoint + 1;
+    } else {
+      high = midpoint;
+    }
+  }
+
+  return low - 1;
+}
+
+export function findPlaybackFrameIndexAtOrAfter(
+  lookup: PlaybackTimelineLookup,
+  currentTime: number,
+) {
+  return findFirstFrameIndexAtOrAfter(
+    lookup.startTimes,
+    currentTime - PLAYBACK_TICK_EPSILON_SECONDS,
+  );
+}
+
+export function resolvePlaybackTickIndex(
+  lookup: PlaybackTimelineLookup,
+  currentTime: number,
+) {
+  if (lookup.frames.length === 0) {
+    return 0;
+  }
+
+  const nextFrameIndex = findPlaybackFrameIndexAtOrAfter(lookup, currentTime);
+  return nextFrameIndex === -1 ? 0 : nextFrameIndex;
+}
+
+export function resolvePlaybackFrameAtTime(
+  lookup: PlaybackTimelineLookup,
+  currentTime: number,
+) {
+  if (lookup.frames.length === 0) {
+    return null;
+  }
+
+  const frameIndex = findLastFrameIndexAtOrBefore(
+    lookup.startTimes,
+    currentTime + PLAYBACK_FRAME_EPSILON_SECONDS,
+  );
+
+  return frameIndex === -1 ? lookup.frames[0] ?? null : lookup.frames[frameIndex] ?? null;
+}
+
+export function resolveNearestFrameInstanceIdAtTime(
+  lookup: PlaybackTimelineLookup,
+  currentTime: number,
+) {
+  if (lookup.frames.length === 0) {
+    return null;
+  }
+
+  const nextFrameIndex = findFirstFrameIndexAtOrAfter(lookup.startTimes, currentTime);
+  if (nextFrameIndex === -1) {
+    return lookup.frames[lookup.frames.length - 1]?.instanceId ?? null;
+  }
+
+  if (nextFrameIndex === 0) {
+    return lookup.frames[0]?.instanceId ?? null;
+  }
+
+  const previousFrame = lookup.frames[nextFrameIndex - 1];
+  const nextFrame = lookup.frames[nextFrameIndex];
+  if (!previousFrame) {
+    return nextFrame?.instanceId ?? null;
+  }
+
+  if (!nextFrame) {
+    return previousFrame.instanceId;
+  }
+
+  const previousDistance = Math.abs(previousFrame.startTimeSeconds - currentTime);
+  const nextDistance = Math.abs(nextFrame.startTimeSeconds - currentTime);
+  return nextDistance < previousDistance ? nextFrame.instanceId : previousFrame.instanceId;
+}
+
+export function resolvePlaybackStartTime(
+  lookup: PlaybackTimelineLookup,
+  currentTime: number,
+) {
+  if (lookup.frames.length === 0) {
+    return currentTime;
+  }
+
+  const currentFrame = resolvePlaybackFrameAtTime(lookup, currentTime);
+  if (
+    currentFrame &&
+    currentTime >= currentFrame.startTimeSeconds &&
+    currentTime < currentFrame.startTimeSeconds + currentFrame.durationSeconds
+  ) {
+    return currentTime;
+  }
+
+  const nextFrameIndex = findPlaybackFrameIndexAtOrAfter(lookup, currentTime);
+  return nextFrameIndex === -1
+    ? lookup.frames[0]?.startTimeSeconds ?? currentTime
+    : lookup.frames[nextFrameIndex]?.startTimeSeconds ?? currentTime;
 }
 
 type UsePlaybackTimelineControllerParams = {
@@ -121,7 +267,30 @@ export function usePlaybackTimelineController({
     setTimelineDrag(null);
   }
 
-  const playbackTimelineFrames = timelineFrameViews;
+  const playbackTimelineFrames = useMemo(
+    () => selectedPlaybackFrames(timelineFrameViews, selectedInstanceIds),
+    [selectedInstanceIds, timelineFrameViews],
+  );
+  const playbackTimelineLookup = useMemo(
+    () => createPlaybackTimelineLookup(playbackTimelineFrames),
+    [playbackTimelineFrames],
+  );
+  const focusedSelectedFrame = useMemo(
+    () => lastSelectedFrameView(timelineFrameViews, selectedInstanceIds),
+    [selectedInstanceIds, timelineFrameViews],
+  );
+
+  useEffect(() => {
+    if (!focusedSelectedFrame) {
+      return;
+    }
+
+    if (isPlaying) {
+      return;
+    }
+
+    setCurrentTime(focusedSelectedFrame.startTimeSeconds);
+  }, [focusedSelectedFrame?.instanceId, focusedSelectedFrame?.startTimeSeconds, isPlaying]);
 
   function togglePlayback() {
     if (!inspection?.ok || inspection.isStaticImage || totalDuration <= 0 || playbackTimelineFrames.length === 0) {
@@ -133,13 +302,9 @@ export function usePlaybackTimelineController({
       return;
     }
 
-    const firstSelectedFrame = playbackTimelineFrames[0];
-    const nextSelectedFrame = playbackTimelineFrames.find(
-      (frame) => frame.startTimeSeconds >= currentTime - 0.01,
-    );
-
-    if (!nextSelectedFrame) {
-      setCurrentTime(firstSelectedFrame.startTimeSeconds);
+    const normalizedStartTime = resolvePlaybackStartTime(playbackTimelineLookup, currentTime);
+    if (normalizedStartTime !== currentTime) {
+      setCurrentTime(normalizedStartTime);
     }
 
     setIsPlaying(true);
@@ -155,14 +320,10 @@ export function usePlaybackTimelineController({
 
     let timeoutId: number;
 
-    const currentFrameIndex = playbackTimelineFrames.findIndex(
-      (frame) => Math.abs(frame.startTimeSeconds - currentTime) < 0.01,
+    const normalizedCurrentIndex = resolvePlaybackTickIndex(
+      playbackTimelineLookup,
+      currentTime,
     );
-    const resolvedCurrentIndex =
-      currentFrameIndex !== -1
-        ? currentFrameIndex
-        : playbackTimelineFrames.findIndex((frame) => frame.startTimeSeconds >= currentTime - 0.01);
-    const normalizedCurrentIndex = resolvedCurrentIndex === -1 ? 0 : resolvedCurrentIndex;
     const currentFrame = playbackTimelineFrames[normalizedCurrentIndex];
 
     timeoutId = window.setTimeout(() => {
@@ -171,33 +332,21 @@ export function usePlaybackTimelineController({
     }, currentFrame.durationSeconds * 1000);
 
     return () => window.clearTimeout(timeoutId);
-  }, [currentTime, isPlaying, playbackTimelineFrames]);
+  }, [currentTime, isPlaying, playbackTimelineFrames, playbackTimelineLookup]);
 
   const timelineProgress = totalDuration > 0 ? clamp(currentTime / totalDuration, 0, 1) : 0;
   const timelineRailStyle = {
     "--timeline-progress": String(timelineProgress),
   } as React.CSSProperties;
-  const currentPlaybackFrame =
-    [...playbackTimelineFrames]
-      .reverse()
-      .find((frame) => frame.startTimeSeconds <= currentTime + 0.001) ??
-    playbackTimelineFrames[0] ??
-    null;
-  const previewCurrentTime = currentPlaybackFrame?.sourceStartTimeSeconds ?? 0;
-  const selectedTimelineFrames = timelineFrameViews.filter((frame) =>
-    selectedInstanceIds.includes(frame.instanceId),
+  const currentPlaybackFrame = resolvePlaybackFrameAtTime(
+    playbackTimelineLookup,
+    currentTime,
   );
-  const currentFrameCandidates =
-    selectedTimelineFrames.length > 0 ? selectedTimelineFrames : timelineFrameViews;
-  const currentFrameInstanceId =
-    currentFrameCandidates.length > 0
-      ? currentFrameCandidates.reduce((closest, candidate) =>
-          Math.abs(candidate.startTimeSeconds - currentTime) <
-          Math.abs(closest.startTimeSeconds - currentTime)
-            ? candidate
-            : closest,
-        ).instanceId
-      : null;
+  const previewCurrentTime = currentPlaybackFrame?.sourceStartTimeSeconds ?? 0;
+  const currentFrameInstanceId = resolveNearestFrameInstanceIdAtTime(
+    playbackTimelineLookup,
+    currentTime,
+  );
 
   return {
     currentTime,

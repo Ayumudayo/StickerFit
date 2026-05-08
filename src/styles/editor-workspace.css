@@ -78,6 +78,10 @@
   display: flex;
 }
 
+.timelineSegmentsDense {
+  background-image: var(--timeline-segment-background, none);
+}
+
 .timelineSegment {
   flex: 1;
   border-right: 1px solid rgba(255, 255, 255, 0.06);
@@ -156,11 +160,17 @@
 }
 
 .frameTableBody {
+  --frame-row-intrinsic-size: 42px;
   display: grid;
   gap: 2px;
   max-height: min(58vh, 640px);
   overflow-y: auto;
   padding-right: 4px;
+}
+
+.frameTableBody.is-large .frameRow {
+  content-visibility: auto;
+  contain-intrinsic-size: var(--frame-row-intrinsic-size);
 }
 
 .frameRow {
@@ -178,7 +188,6 @@
     border-color 120ms ease,
     background 120ms ease,
     opacity 120ms ease;
-  will-change: transform;
 }
 
 .frameRow::before,
@@ -209,9 +218,9 @@
   background: rgba(255, 255, 255, 0.04);
 }
 
+.frameRow:focus,
 .frameRow:focus-visible {
-  outline: 2px solid #5865F2;
-  outline-offset: -2px;
+  outline: none;
 }
 
 .frameRow.is-selected {
@@ -228,11 +237,8 @@
   color: #e4e4e7;
 }
 
-.frameRow.is-current {
-  border-color: rgba(255, 255, 255, 0.5);
-}
-
 .frameRow.is-dragged {
+  will-change: transform;
   opacity: 0.96;
   cursor: grabbing;
   z-index: 3;
@@ -298,13 +304,6 @@
 .frameMono {
   font-family: "Cascadia Mono", "Consolas", monospace;
   color: #a1a1aa;
-}
-
-.frameDot {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: #5865F2;
 }
 
 .frameQuickActions {
@@ -552,6 +551,7 @@
   }
 
   .frameTableBody {
+    --frame-row-intrinsic-size: 68px;
     gap: 8px;
     padding-right: 0;
   }

@@ -1,6 +1,6 @@
 import type { MessagesForLocale } from "../../locales/messages";
 import type {
-  OptimizerPresetStrategy,
+  OptimizerGoal,
   OptimizerSearchDepth,
 } from "../../types/workflow";
 
@@ -10,9 +10,11 @@ type AdvancedOptimizerSettingsPanelProps = {
   panelId: string;
   copy: MessagesForLocale;
   layout?: "floating" | "dock";
-  optimizerPresetStrategy: OptimizerPresetStrategy;
+  optimizerGoal: OptimizerGoal;
+  qualityFrameDropInterval: number;
   optimizerSearchDepth: OptimizerSearchDepth;
-  onOptimizerPresetStrategyChange: (value: OptimizerPresetStrategy) => void;
+  onOptimizerGoalChange: (value: OptimizerGoal) => void;
+  onQualityFrameDropIntervalChange: (value: number) => void;
   onOptimizerSearchDepthChange: (value: OptimizerSearchDepth) => void;
 };
 
@@ -20,9 +22,11 @@ export function AdvancedOptimizerSettingsPanel({
   panelId,
   copy,
   layout = "floating",
-  optimizerPresetStrategy,
+  optimizerGoal,
+  qualityFrameDropInterval,
   optimizerSearchDepth,
-  onOptimizerPresetStrategyChange,
+  onOptimizerGoalChange,
+  onQualityFrameDropIntervalChange,
   onOptimizerSearchDepthChange,
 }: AdvancedOptimizerSettingsPanelProps) {
   const panelClassName =
@@ -41,22 +45,44 @@ export function AdvancedOptimizerSettingsPanel({
 
       <div className="advancedOptimizerGrid">
         <label className="field">
-          <span className="metaLabel">{copy.advancedOptimizeFocus}</span>
+          <span className="metaLabel">{copy.optimizerGoal}</span>
           <div className="selectShell">
             <select
               className="fitModeSelect"
-              value={optimizerPresetStrategy}
+              value={optimizerGoal}
               onChange={(event) =>
-                onOptimizerPresetStrategyChange(event.target.value as OptimizerPresetStrategy)
+                onOptimizerGoalChange(event.target.value as OptimizerGoal)
               }
             >
-              <option value="auto">{copy.optimizeFocusAuto}</option>
-              <option value="quality">{copy.optimizeFocusQuality}</option>
-              <option value="size">{copy.optimizeFocusSize}</option>
+              <option value="balanced">{copy.optimizerGoalBalanced}</option>
+              <option value="motion">{copy.optimizerGoalMotion}</option>
+              <option value="quality">{copy.optimizerGoalQuality}</option>
             </select>
             <ChevronDownIcon size={16} className="selectChevron" />
           </div>
         </label>
+
+        {optimizerGoal === "quality" ? (
+          <label className="field">
+            <span className="metaLabel">{copy.qualityFrameDropInterval}</span>
+            <div className="selectShell">
+              <select
+                className="fitModeSelect"
+                value={qualityFrameDropInterval}
+                onChange={(event) =>
+                  onQualityFrameDropIntervalChange(Number(event.target.value))
+                }
+              >
+                <option value={0}>{copy.frameDropDisabled}</option>
+                <option value={2}>{copy.frameDropEvery(2)}</option>
+                <option value={3}>{copy.frameDropEvery(3)}</option>
+                <option value={4}>{copy.frameDropEvery(4)}</option>
+                <option value={5}>{copy.frameDropEvery(5)}</option>
+              </select>
+              <ChevronDownIcon size={16} className="selectChevron" />
+            </div>
+          </label>
+        ) : null}
 
         <label className="field">
           <span className="metaLabel">{copy.advancedSearchDepth}</span>

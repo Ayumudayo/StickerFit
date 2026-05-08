@@ -1,5 +1,6 @@
 mod locale;
 
+use base64::{engine::general_purpose, Engine as _};
 use image::codecs::gif::GifDecoder as ImageGifDecoder;
 use image::codecs::png::PngDecoder as ImagePngDecoder;
 use image::imageops::{self, FilterType};
@@ -18,13 +19,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
@@ -32,9 +34,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 #[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
-    MF_PD_DURATION, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_VERSION, MFCreateSourceReaderFromURL, MFShutdown,
-    MFStartup, MFSTARTUP_FULL,
+    MFCreateSourceReaderFromURL, MFShutdown, MFStartup, MFSTARTUP_FULL, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_PD_DURATION, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
@@ -88,6 +90,35 @@ struct MediaInspection {
     error_message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FramePreviewResponse {
+    ok: bool,
+    data_url: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FramePreviewItem {
+    source_frame_id: u32,
+    data_url: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FramePreviewsResponse {
+    ok: bool,
+    previews: Vec<FramePreviewItem>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CropRegion {
@@ -107,6 +138,8 @@ struct OptimizerPlanRequest {
     avg_fps: Option<f64>,
     fit_mode: String,
     preset_strategy: Option<String>,
+    optimizer_goal: Option<String>,
+    quality_frame_drop_interval: Option<u32>,
     search_depth: Option<String>,
     crop_region: Option<CropRegion>,
     selected_frames: Option<Vec<u32>>,
@@ -134,6 +167,8 @@ struct CandidatePreview {
     score: f64,
     source_similarity_score: f64,
     summary: String,
+    #[serde(skip_serializing)]
+    frame_sample_step: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +221,8 @@ struct OptimizerSearchRequest {
     avg_fps: Option<f64>,
     fit_mode: String,
     preset_strategy: Option<String>,
+    optimizer_goal: Option<String>,
+    quality_frame_drop_interval: Option<u32>,
     search_depth: Option<String>,
     crop_region: Option<CropRegion>,
     selected_frames: Option<Vec<u32>>,
@@ -310,6 +347,22 @@ struct StickerFrame {
     duration_seconds: f64,
 }
 
+#[derive(Clone, Copy)]
+struct FrameRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug)]
+struct PngAnimationMetadata {
+    width: u32,
+    height: u32,
+    frame_count: Option<u64>,
+    frame_durations: Vec<f64>,
+}
+
 const RECOMMENDED_MAX_DURATION_SECONDS: f64 = 3.0;
 const DISCORD_MAX_DURATION_SECONDS: f64 = 5.0;
 const DISCORD_MAX_STICKER_BYTES: u64 = 512 * 1024;
@@ -372,6 +425,15 @@ fn expected_sidecar_name(tool: &str) -> String {
     format!("{}-{}{}", tool, current_target_triple(), extension)
 }
 
+fn packaged_sidecar_name(tool: &str) -> String {
+    let extension = if cfg!(target_os = "windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    format!("{tool}{extension}")
+}
+
 fn first_output_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
     let stdout_line = String::from_utf8_lossy(stdout)
         .lines()
@@ -397,6 +459,7 @@ fn preset_similarity_score(preset: &str) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn source_similarity_score(
     source_fps: f64,
     candidate_fps: u32,
@@ -409,9 +472,8 @@ fn source_similarity_score(
     let fps_score = ((candidate_fps as f64) / normalized_source_fps).clamp(0.0, 1.0);
     let scale_score = content_scale.clamp(0.0, 1.0);
     let duration_score = if source_duration_seconds.is_finite() && source_duration_seconds > 0.0 {
-        (1.0
-            - ((candidate_duration_seconds - source_duration_seconds).abs()
-                / source_duration_seconds))
+        (1.0 - ((candidate_duration_seconds - source_duration_seconds).abs()
+            / source_duration_seconds))
             .clamp(0.0, 1.0)
     } else {
         1.0
@@ -421,6 +483,54 @@ fn source_similarity_score(
         + (scale_score * 0.35)
         + (preset_similarity_score(preset) * 0.15)
         + (duration_score * 0.05)
+}
+
+fn optimizer_goal_score(
+    optimizer_goal: &str,
+    source_fps: f64,
+    candidate_fps: u32,
+    content_scale: f64,
+    preset: &str,
+    source_duration_seconds: f64,
+    candidate_duration_seconds: f64,
+    frame_retention_score: f64,
+) -> f64 {
+    let normalized_source_fps = source_fps.clamp(1.0, 30.0);
+    let fps_score = ((candidate_fps as f64) / normalized_source_fps).clamp(0.0, 1.0);
+    let scale_score = content_scale.clamp(0.0, 1.0);
+    let preset_score = preset_similarity_score(preset);
+    let duration_score = if source_duration_seconds.is_finite() && source_duration_seconds > 0.0 {
+        (1.0 - ((candidate_duration_seconds - source_duration_seconds).abs()
+            / source_duration_seconds))
+            .clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let frame_score = frame_retention_score.clamp(0.0, 1.0);
+
+    match optimizer_goal {
+        "motion" => {
+            (frame_score * 0.45)
+                + (fps_score * 0.20)
+                + (duration_score * 0.15)
+                + (scale_score * 0.15)
+                + (preset_score * 0.05)
+        }
+        "quality" => {
+            (scale_score * 0.45)
+                + (preset_score * 0.20)
+                + (frame_score * 0.15)
+                + (fps_score * 0.10)
+                + (duration_score * 0.10)
+        }
+        _ => {
+            (frame_score * 0.30)
+                + (scale_score * 0.30)
+                + (preset_score * 0.15)
+                + (fps_score * 0.15)
+                + (duration_score * 0.10)
+        }
+    }
 }
 
 fn is_better_within_limit_candidate(
@@ -457,12 +567,22 @@ fn is_better_oversize_candidate(
             return true;
         }
 
-        if (contender.source_similarity_score - current.source_similarity_score).abs() <= 0.000_001 {
+        if (contender.source_similarity_score - current.source_similarity_score).abs() <= 0.000_001
+        {
             return contender.rank < current.rank;
         }
     }
 
     false
+}
+
+fn remaining_candidate_cannot_beat_within_limit(
+    best_within_limit_output: Option<&SelectedEncodeOutput>,
+    candidate: &CandidatePreview,
+) -> bool {
+    best_within_limit_output
+        .map(|best| candidate.source_similarity_score + 0.000_001 < best.source_similarity_score)
+        .unwrap_or(false)
 }
 
 fn clear_attempt_output_path(attempts: &mut [SearchAttemptResult], candidate_id: &str) {
@@ -500,6 +620,28 @@ fn normalized_preset_strategy(raw: Option<&str>) -> &'static str {
     }
 }
 
+fn normalized_optimizer_goal(
+    raw: Option<&str>,
+    legacy_preset_strategy: Option<&str>,
+) -> &'static str {
+    match raw {
+        Some("motion") => "motion",
+        Some("quality") => "quality",
+        Some("balanced") => "balanced",
+        _ => match legacy_preset_strategy {
+            Some("quality") => "quality",
+            _ => "balanced",
+        },
+    }
+}
+
+fn normalized_quality_frame_drop_interval(raw: Option<u32>) -> u32 {
+    match raw.unwrap_or(3) {
+        0 | 1 => 0,
+        value => value.min(12),
+    }
+}
+
 fn normalized_search_depth(raw: Option<&str>) -> &'static str {
     match raw {
         Some("thorough") => "thorough",
@@ -526,6 +668,101 @@ fn preset_ladder_for_strategy(duration_seconds: f64, preset_strategy: &str) -> V
             }
         }
     }
+}
+
+fn preset_size_factor(preset: &str) -> f64 {
+    match preset {
+        "compactPlus" => 0.82,
+        "compact" => 0.9,
+        _ => 1.0,
+    }
+}
+
+fn candidate_estimated_size_factor(candidate: &CandidatePreview) -> f64 {
+    let frame_factor = 1.0 / candidate.frame_sample_step.max(1) as f64;
+    let scale_factor = candidate.content_scale.clamp(0.01, 1.0).powi(2);
+    frame_factor * scale_factor * preset_size_factor(&candidate.preset)
+}
+
+fn push_unique_candidate(
+    selected: &mut Vec<CandidatePreview>,
+    candidate: &CandidatePreview,
+    limit: usize,
+) {
+    if selected.len() >= limit {
+        return;
+    }
+
+    if selected.iter().any(|existing| existing.id == candidate.id) {
+        return;
+    }
+
+    selected.push(candidate.clone());
+}
+
+fn select_ranked_candidate_subset(
+    mut candidates: Vec<CandidatePreview>,
+    search_budget: usize,
+) -> Vec<CandidatePreview> {
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| right.fps.cmp(&left.fps))
+            .then_with(|| {
+                right
+                    .content_scale
+                    .partial_cmp(&left.content_scale)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    let quality_budget = (search_budget / 2).max(1);
+    let mut selected = Vec::with_capacity(search_budget.min(candidates.len()));
+    for candidate in candidates.iter().take(quality_budget) {
+        push_unique_candidate(&mut selected, candidate, search_budget);
+    }
+
+    let mut smallest_candidates = candidates.clone();
+    smallest_candidates.sort_by(|left, right| {
+        candidate_estimated_size_factor(left)
+            .partial_cmp(&candidate_estimated_size_factor(right))
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    for candidate in &smallest_candidates {
+        push_unique_candidate(&mut selected, candidate, search_budget);
+    }
+
+    for candidate in &candidates {
+        push_unique_candidate(&mut selected, candidate, search_budget);
+    }
+
+    selected.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| right.fps.cmp(&left.fps))
+            .then_with(|| {
+                right
+                    .content_scale
+                    .partial_cmp(&left.content_scale)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    for (index, candidate) in selected.iter_mut().enumerate() {
+        candidate.rank = index + 1;
+    }
+
+    selected
 }
 
 fn sanitize_path_fragment(value: &str, fallback: &str) -> String {
@@ -591,8 +828,9 @@ fn resolve_output_directory(
     }
 }
 
-fn sidecar_candidate_paths(tool: &str) -> Vec<PathBuf> {
+fn sidecar_candidate_paths_for_exe(tool: &str, current_exe: Option<&Path>) -> Vec<PathBuf> {
     let expected = expected_sidecar_name(tool);
+    let packaged = packaged_sidecar_name(tool);
     let mut paths = Vec::new();
 
     paths.push(
@@ -601,14 +839,20 @@ fn sidecar_candidate_paths(tool: &str) -> Vec<PathBuf> {
             .join(&expected),
     );
 
-    if let Ok(current_exe) = std::env::current_exe() {
+    if let Some(current_exe) = current_exe {
         if let Some(exe_dir) = current_exe.parent() {
+            paths.push(exe_dir.join(&packaged));
             paths.push(exe_dir.join(&expected));
+            paths.push(exe_dir.join("binaries").join(&packaged));
             paths.push(exe_dir.join("binaries").join(&expected));
         }
     }
 
     paths
+}
+
+fn sidecar_candidate_paths(tool: &str) -> Vec<PathBuf> {
+    sidecar_candidate_paths_for_exe(tool, std::env::current_exe().ok().as_deref())
 }
 
 fn resolve_tool(tool: &str, locale: UiLocale) -> Result<ToolResolution, String> {
@@ -925,12 +1169,14 @@ fn derive_source_fps(
 ) -> f64 {
     avg_fps
         .filter(|fps| fps.is_finite() && *fps > 0.0)
-        .or_else(|| match (
-            source_duration_seconds.filter(|duration| duration.is_finite() && *duration > 0.0),
-            base_frame_count.filter(|count| *count > 0),
-        ) {
-            (Some(duration), Some(frame_count)) => Some(frame_count as f64 / duration),
-            _ => None,
+        .or_else(|| {
+            match (
+                source_duration_seconds.filter(|duration| duration.is_finite() && *duration > 0.0),
+                base_frame_count.filter(|count| *count > 0),
+            ) {
+                (Some(duration), Some(frame_count)) => Some(frame_count as f64 / duration),
+                _ => None,
+            }
         })
         .unwrap_or(30.0)
 }
@@ -939,12 +1185,147 @@ fn candidate_duration_seconds(selected_frame_count: usize, fps: u32) -> f64 {
     selected_frame_count as f64 / fps.max(1) as f64
 }
 
+fn sampled_frame_count(frame_count: usize, sample_step: u32) -> usize {
+    let step = sample_step.max(1) as usize;
+    frame_count.div_ceil(step)
+}
+
+fn frame_sample_steps_for_selection(selected_frame_count: usize) -> Vec<u32> {
+    let mut steps = vec![1];
+    if selected_frame_count > 40 {
+        steps.push(2);
+    }
+    if selected_frame_count > 120 {
+        steps.push(3);
+    }
+    if selected_frame_count > 180 {
+        steps.push(4);
+    }
+
+    let required_step =
+        (selected_frame_count as f64 / (DISCORD_MAX_DURATION_SECONDS * 30.0)).ceil() as u32;
+    if required_step > 1 {
+        steps.push(required_step);
+    }
+
+    steps.sort_unstable();
+    steps.dedup();
+    steps
+}
+
+fn frame_sample_steps_for_goal(selected_frame_count: usize, optimizer_goal: &str) -> Vec<u32> {
+    match optimizer_goal {
+        "quality" => vec![1],
+        "motion" => {
+            if candidate_duration_seconds(selected_frame_count, 30) <= DISCORD_MAX_DURATION_SECONDS
+            {
+                vec![1]
+            } else {
+                frame_sample_steps_for_selection(selected_frame_count)
+            }
+        }
+        _ => frame_sample_steps_for_selection(selected_frame_count),
+    }
+}
+
+fn remove_every_nth_frame_indexes(frame_indexes: Vec<u32>, interval: u32) -> Vec<u32> {
+    if interval < 2 {
+        return frame_indexes;
+    }
+
+    frame_indexes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            if (index + 1) % interval as usize == 0 {
+                None
+            } else {
+                Some(frame)
+            }
+        })
+        .collect()
+}
+
+fn apply_quality_frame_drop_to_selection(
+    selection: ResolvedFrameSelection,
+    interval: u32,
+) -> Result<ResolvedFrameSelection, &'static str> {
+    if interval < 2 {
+        return Ok(selection);
+    }
+
+    let frame_indexes = selection.selected_frames.clone().unwrap_or_else(|| {
+        selection
+            .base_frame_count
+            .map(|count| (0..count).collect())
+            .unwrap_or_default()
+    });
+    let filtered = remove_every_nth_frame_indexes(frame_indexes, interval);
+
+    if filtered.is_empty() {
+        return Err("no-frames-selected");
+    }
+
+    Ok(ResolvedFrameSelection {
+        selected_frame_count: filtered.len(),
+        selected_frames: Some(filtered),
+        base_frame_count: selection.base_frame_count,
+    })
+}
+
+fn apply_quality_frame_drop_to_timeline_frames(
+    timeline_frames: Vec<ResolvedTimelineFrame>,
+    interval: u32,
+) -> Result<Vec<ResolvedTimelineFrame>, &'static str> {
+    if interval < 2 {
+        return Ok(timeline_frames);
+    }
+
+    let filtered = timeline_frames
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            if (index + 1) % interval as usize == 0 {
+                None
+            } else {
+                Some(frame)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if filtered.is_empty() {
+        Err("no-frames-selected")
+    } else {
+        Ok(filtered)
+    }
+}
+
+fn sampled_frame_indexes(
+    selected_frames: Option<&[u32]>,
+    base_frame_count: Option<u32>,
+    sample_step: u32,
+) -> Option<Vec<u32>> {
+    if sample_step <= 1 {
+        return selected_frames.map(|frames| frames.to_vec());
+    }
+
+    let frame_indexes = selected_frames
+        .map(|frames| frames.to_vec())
+        .or_else(|| base_frame_count.map(|count| (0..count).collect::<Vec<_>>()))?;
+
+    let step = sample_step as usize;
+    Some(frame_indexes.into_iter().step_by(step).collect())
+}
+
 fn natural_selection_duration_seconds(selected_frame_count: usize, source_fps: f64) -> f64 {
     selected_frame_count as f64 / source_fps.max(1.0)
 }
 
 fn timeline_duration_seconds(timeline_frames: &[ResolvedTimelineFrame]) -> f64 {
-    timeline_frames.iter().map(|frame| frame.duration_seconds).sum()
+    timeline_frames
+        .iter()
+        .map(|frame| frame.duration_seconds)
+        .sum()
 }
 
 fn timeline_average_fps(timeline_frames: &[ResolvedTimelineFrame]) -> f64 {
@@ -963,13 +1344,22 @@ fn build_candidate_ladder_fixed_duration(
     input_height: Option<u32>,
     fit_mode: &str,
     preset_strategy: &str,
+    optimizer_goal: &str,
     search_budget: usize,
     locale: UiLocale,
 ) -> Vec<CandidatePreview> {
     let scale_ladder: Vec<f64> = match (input_width.unwrap_or(0), input_height.unwrap_or(0)) {
-        (w, h) if w >= 640 || h >= 640 => vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.8, 0.76, 0.72],
-        (w, h) if w >= 400 || h >= 400 => vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.8],
-        _ => vec![1.0, 0.96, 0.92, 0.88],
+        (w, h) if optimizer_goal == "motion" && (w >= 640 || h >= 640) => {
+            vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44]
+        }
+        (w, h) if optimizer_goal == "motion" && (w >= 400 || h >= 400) => {
+            vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60]
+        }
+        _ if optimizer_goal == "motion" => vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44],
+        _ if optimizer_goal == "quality" => vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.80, 0.76],
+        (w, h) if w >= 640 || h >= 640 => vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44],
+        (w, h) if w >= 400 || h >= 400 => vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60],
+        _ => vec![1.0, 0.92, 0.84, 0.76, 0.68],
     };
 
     let preset_ladder = preset_ladder_for_strategy(duration_seconds, preset_strategy);
@@ -979,13 +1369,15 @@ fn build_candidate_ladder_fixed_duration(
     for scale in &scale_ladder {
         for preset in &preset_ladder {
             let summary = locale::candidate_summary(locale, fps, *scale, preset, duration_seconds);
-            let score = source_similarity_score(
+            let score = optimizer_goal_score(
+                optimizer_goal,
                 fps as f64,
                 fps,
                 *scale,
                 preset,
                 duration_seconds,
                 duration_seconds,
+                1.0,
             );
 
             candidates.push(CandidatePreview {
@@ -1006,29 +1398,12 @@ fn build_candidate_ladder_fixed_duration(
                 score,
                 source_similarity_score: score,
                 summary,
+                frame_sample_step: 1,
             });
         }
     }
 
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                right
-                    .content_scale
-                    .partial_cmp(&left.content_scale)
-                    .unwrap_or(Ordering::Equal)
-            })
-    });
-
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        candidate.rank = index + 1;
-    }
-
-    candidates.truncate(search_budget);
-    candidates
+    select_ranked_candidate_subset(candidates, search_budget)
 }
 
 fn build_filter_graph(
@@ -1051,7 +1426,10 @@ fn build_filter_graph(
     let selection_prefix = selected_frames
         .filter(|frames| !frames.is_empty())
         .map(|frames| {
-            let eq_exprs: Vec<String> = frames.iter().map(|frame| format!("eq(n,{frame})")).collect();
+            let eq_exprs: Vec<String> = frames
+                .iter()
+                .map(|frame| format!("eq(n,{frame})"))
+                .collect();
             format!("select='{}',setpts=N/({fps}*TB),", eq_exprs.join("+"))
         })
         .unwrap_or_else(|| "setpts=PTS-STARTPTS,".into());
@@ -1067,6 +1445,14 @@ fn build_filter_graph(
             "{crop_prefix}{selection_prefix}fps={fps},scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,format=rgba,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black@0.0,setsar=1"
         ),
     }
+}
+
+fn build_source_frame_select_filter(frame_indexes: &BTreeSet<u32>) -> String {
+    let eq_exprs = frame_indexes
+        .iter()
+        .map(|frame| format!("eq(n,{frame})"))
+        .collect::<Vec<_>>();
+    format!("select='{}',format=rgba", eq_exprs.join("+"))
 }
 
 fn scaled_output_dimensions(
@@ -1126,13 +1512,17 @@ fn frame_delay_seconds(delay_ms: u32, delay_den_ms: u32) -> f64 {
 }
 
 fn sticker_frame_delay(duration_seconds: f64) -> (u16, u16) {
-    let duration_ms = (duration_seconds * 1000.0).round().clamp(1.0, u16::MAX as f64) as u16;
+    let duration_ms = (duration_seconds * 1000.0)
+        .round()
+        .clamp(1.0, u16::MAX as f64) as u16;
     (duration_ms, 1000)
 }
 
 fn crop_rgba_image(source: &RgbaImage, crop_region: Option<ResolvedCropRegion>) -> RgbaImage {
     match crop_region {
-        Some(crop) => imageops::crop_imm(source, crop.x, crop.y, crop.width, crop.height).to_image(),
+        Some(crop) => {
+            imageops::crop_imm(source, crop.x, crop.y, crop.width, crop.height).to_image()
+        }
         None => source.clone(),
     }
 }
@@ -1145,7 +1535,9 @@ fn fit_contain_rgba_image(source: &RgbaImage, target_width: u32, target_height: 
     let width_scale = target_width as f64 / source.width() as f64;
     let height_scale = target_height as f64 / source.height() as f64;
     let scale = width_scale.min(height_scale);
-    let resized_width = (source.width() as f64 * scale).round().clamp(1.0, target_width as f64) as u32;
+    let resized_width = (source.width() as f64 * scale)
+        .round()
+        .clamp(1.0, target_width as f64) as u32;
     let resized_height = (source.height() as f64 * scale)
         .round()
         .clamp(1.0, target_height as f64) as u32;
@@ -1165,7 +1557,9 @@ fn fit_cover_rgba_image(source: &RgbaImage, target_width: u32, target_height: u3
     let width_scale = target_width as f64 / source.width() as f64;
     let height_scale = target_height as f64 / source.height() as f64;
     let scale = width_scale.max(height_scale);
-    let resized_width = (source.width() as f64 * scale).round().max(target_width as f64) as u32;
+    let resized_width = (source.width() as f64 * scale)
+        .round()
+        .max(target_width as f64) as u32;
     let resized_height = (source.height() as f64 * scale)
         .round()
         .max(target_height as f64) as u32;
@@ -1230,6 +1624,29 @@ fn decode_gif_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, St
         .collect())
 }
 
+fn image_frame_to_sticker_frame(frame: image::Frame) -> StickerFrame {
+    let (delay_ms, delay_den_ms) = frame.delay().numer_denom_ms();
+    StickerFrame {
+        pixels: frame.into_buffer(),
+        duration_seconds: frame_delay_seconds(delay_ms, delay_den_ms),
+    }
+}
+
+fn decode_gif_animation_frame(
+    input_path: &str,
+    frame_index: usize,
+) -> Result<StickerFrame, String> {
+    let file = File::open(input_path).map_err(|error| error.to_string())?;
+    let decoder = ImageGifDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
+    let frame = decoder
+        .into_frames()
+        .nth(frame_index)
+        .ok_or_else(|| "source frame id is out of range".to_string())?
+        .map_err(|error| error.to_string())?;
+
+    Ok(image_frame_to_sticker_frame(frame))
+}
+
 fn decode_apng_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, String> {
     let file = File::open(input_path).map_err(|error| error.to_string())?;
     let decoder = ImagePngDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
@@ -1251,10 +1668,42 @@ fn decode_apng_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, S
         .collect())
 }
 
+fn decode_apng_animation_frame(
+    input_path: &str,
+    frame_index: usize,
+) -> Result<StickerFrame, String> {
+    let file = File::open(input_path).map_err(|error| error.to_string())?;
+    let decoder = ImagePngDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
+    let apng_decoder = decoder.apng().map_err(|error| error.to_string())?;
+    let frame = apng_decoder
+        .into_frames()
+        .nth(frame_index)
+        .ok_or_else(|| "source frame id is out of range".to_string())?
+        .map_err(|error| error.to_string())?;
+
+    Ok(image_frame_to_sticker_frame(frame))
+}
+
 fn decode_native_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, String> {
     match lowercase_source_extension(input_path).as_deref() {
         Some("gif") => decode_gif_animation_frames(input_path),
         Some("apng") | Some("png") => decode_apng_animation_frames(input_path),
+        _ => Err("unsupported native animation source".into()),
+    }
+}
+
+fn decode_native_animation_frame(
+    input_path: &str,
+    source_frame_id: u32,
+) -> Result<StickerFrame, String> {
+    if source_frame_id == 0 {
+        return Err("source frame id must be one-based".into());
+    }
+
+    let frame_index = (source_frame_id - 1) as usize;
+    match lowercase_source_extension(input_path).as_deref() {
+        Some("gif") => decode_gif_animation_frame(input_path, frame_index),
+        Some("apng") | Some("png") => decode_apng_animation_frame(input_path, frame_index),
         _ => Err("unsupported native animation source".into()),
     }
 }
@@ -1272,6 +1721,241 @@ fn write_native_png(output_path: &Path, pixels: &RgbaImage) -> Result<(), String
         .write_image_data(pixels.as_raw())
         .map_err(|error| error.to_string())?;
     png_writer.finish().map_err(|error| error.to_string())
+}
+
+fn encode_native_png_bytes(pixels: &RgbaImage) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = NativePngEncoder::new(&mut bytes, pixels.width(), pixels.height());
+        encoder.set_color(PngColorType::Rgba);
+        encoder.set_depth(PngBitDepth::Eight);
+        encoder.set_deflate_compression(PngDeflateCompression::Level(9));
+        encoder.set_filter(PngFilter::Adaptive);
+        let mut png_writer = encoder.write_header().map_err(|error| error.to_string())?;
+        png_writer
+            .write_image_data(pixels.as_raw())
+            .map_err(|error| error.to_string())?;
+        png_writer.finish().map_err(|error| error.to_string())?;
+    }
+
+    Ok(bytes)
+}
+
+fn encode_native_png_data_url(pixels: &RgbaImage) -> Result<String, String> {
+    let bytes = encode_native_png_bytes(pixels)?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn extract_frame_preview_internal(
+    input_path: &str,
+    source_frame_id: u32,
+    locale: UiLocale,
+) -> FramePreviewResponse {
+    let Some(extension) = lowercase_source_extension(input_path) else {
+        return FramePreviewResponse {
+            ok: false,
+            data_url: None,
+            width: None,
+            height: None,
+            error_code: Some("unsupported-source-format".into()),
+            error_message: Some(locale::unsupported_still_image_error(locale)),
+        };
+    };
+
+    if source_frame_id == 0 {
+        return FramePreviewResponse {
+            ok: false,
+            data_url: None,
+            width: None,
+            height: None,
+            error_code: Some("invalid-frame-selection".into()),
+            error_message: Some("source frame id must be one-based".into()),
+        };
+    }
+
+    if !matches!(extension.as_str(), "gif" | "apng" | "png") {
+        return FramePreviewResponse {
+            ok: false,
+            data_url: None,
+            width: None,
+            height: None,
+            error_code: Some("unsupported-frame-preview".into()),
+            error_message: Some(
+                "frame preview extraction is available for native animation sources".into(),
+            ),
+        };
+    }
+
+    let frame = match decode_native_animation_frame(input_path, source_frame_id) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return FramePreviewResponse {
+                ok: false,
+                data_url: None,
+                width: None,
+                height: None,
+                error_code: Some("frame-preview-decode-failed".into()),
+                error_message: Some(error),
+            };
+        }
+    };
+
+    match encode_native_png_data_url(&frame.pixels) {
+        Ok(data_url) => FramePreviewResponse {
+            ok: true,
+            data_url: Some(data_url),
+            width: Some(frame.pixels.width()),
+            height: Some(frame.pixels.height()),
+            error_code: None,
+            error_message: None,
+        },
+        Err(error) => FramePreviewResponse {
+            ok: false,
+            data_url: None,
+            width: None,
+            height: None,
+            error_code: Some("frame-preview-encode-failed".into()),
+            error_message: Some(error),
+        },
+    }
+}
+
+fn frame_previews_error(error_code: &str, error_message: String) -> FramePreviewsResponse {
+    FramePreviewsResponse {
+        ok: false,
+        previews: Vec::new(),
+        error_code: Some(error_code.into()),
+        error_message: Some(error_message),
+    }
+}
+
+fn extract_frame_previews_internal(
+    input_path: &str,
+    source_frame_ids: &[u32],
+    locale: UiLocale,
+) -> FramePreviewsResponse {
+    let Some(extension) = lowercase_source_extension(input_path) else {
+        return frame_previews_error(
+            "unsupported-source-format",
+            locale::unsupported_still_image_error(locale),
+        );
+    };
+
+    if !matches!(extension.as_str(), "gif" | "apng" | "png") {
+        return frame_previews_error(
+            "unsupported-frame-preview",
+            "frame preview extraction is available for native animation sources".into(),
+        );
+    }
+
+    let requested_frame_ids = source_frame_ids
+        .iter()
+        .copied()
+        .filter(|source_frame_id| *source_frame_id > 0)
+        .collect::<BTreeSet<_>>();
+    if requested_frame_ids.is_empty() {
+        return frame_previews_error(
+            "invalid-frame-selection",
+            "at least one source frame id is required".into(),
+        );
+    }
+
+    let frames = match decode_native_animation_frames(input_path) {
+        Ok(frames) => frames,
+        Err(error) => return frame_previews_error("frame-preview-decode-failed", error),
+    };
+
+    let mut previews = Vec::with_capacity(requested_frame_ids.len());
+    for source_frame_id in requested_frame_ids {
+        let Some(frame) = frames.get((source_frame_id - 1) as usize) else {
+            return frame_previews_error(
+                "invalid-frame-selection",
+                "source frame id is out of range".into(),
+            );
+        };
+
+        let data_url = match encode_native_png_data_url(&frame.pixels) {
+            Ok(data_url) => data_url,
+            Err(error) => return frame_previews_error("frame-preview-encode-failed", error),
+        };
+
+        previews.push(FramePreviewItem {
+            source_frame_id,
+            data_url,
+            width: frame.pixels.width(),
+            height: frame.pixels.height(),
+        });
+    }
+
+    FramePreviewsResponse {
+        ok: true,
+        previews,
+        error_code: None,
+        error_message: None,
+    }
+}
+
+fn full_frame_region(pixels: &RgbaImage) -> FrameRegion {
+    FrameRegion {
+        x: 0,
+        y: 0,
+        width: pixels.width(),
+        height: pixels.height(),
+    }
+}
+
+fn changed_frame_region(previous: &RgbaImage, current: &RgbaImage) -> FrameRegion {
+    if previous.dimensions() != current.dimensions() {
+        return full_frame_region(current);
+    }
+
+    let mut min_x = current.width();
+    let mut min_y = current.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut changed = false;
+
+    for y in 0..current.height() {
+        for x in 0..current.width() {
+            if previous.get_pixel(x, y) != current.get_pixel(x, y) {
+                changed = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if changed {
+        FrameRegion {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+        }
+    } else {
+        FrameRegion {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }
+    }
+}
+
+fn frame_region_pixels(pixels: &RgbaImage, region: FrameRegion) -> Vec<u8> {
+    let mut data = Vec::with_capacity((region.width * region.height * 4) as usize);
+    for y in region.y..region.y + region.height {
+        for x in region.x..region.x + region.width {
+            data.extend_from_slice(&pixels.get_pixel(x, y).0);
+        }
+    }
+
+    data
 }
 
 fn write_native_apng(
@@ -1297,12 +1981,20 @@ fn write_native_apng(
     let mut encoder = NativePngEncoder::new(writer, width, height);
     encoder.set_color(PngColorType::Rgba);
     encoder.set_depth(PngBitDepth::Eight);
-    encoder.set_animated(frames.len() as u32, 0).map_err(|error| error.to_string())?;
-    encoder.set_sep_def_img(false).map_err(|error| error.to_string())?;
+    encoder
+        .set_animated(frames.len() as u32, 0)
+        .map_err(|error| error.to_string())?;
+    encoder
+        .set_sep_def_img(false)
+        .map_err(|error| error.to_string())?;
     encoder.set_deflate_compression(native_png_deflate_for_preset(preset));
     encoder.set_filter(native_png_filter_for_preset(preset));
-    encoder.set_blend_op(PngBlendOp::Source).map_err(|error| error.to_string())?;
-    encoder.set_dispose_op(PngDisposeOp::None).map_err(|error| error.to_string())?;
+    encoder
+        .set_blend_op(PngBlendOp::Source)
+        .map_err(|error| error.to_string())?;
+    encoder
+        .set_dispose_op(PngDisposeOp::None)
+        .map_err(|error| error.to_string())?;
     let (delay_num, delay_den) = sticker_frame_delay(frames[0].duration_seconds);
     encoder
         .set_frame_delay(delay_num, delay_den)
@@ -1314,8 +2006,19 @@ fn write_native_apng(
         .write_image_data(frames[0].pixels.as_raw())
         .map_err(|error| error.to_string())?;
 
+    let mut previous_frame = frames[0].pixels.clone();
     for frame in &frames[1..] {
         let (delay_num, delay_den) = sticker_frame_delay(frame.duration_seconds);
+        let region = changed_frame_region(&previous_frame, &frame.pixels);
+        png_writer
+            .reset_frame_position()
+            .map_err(|error| error.to_string())?;
+        png_writer
+            .set_frame_dimension(region.width, region.height)
+            .map_err(|error| error.to_string())?;
+        png_writer
+            .set_frame_position(region.x, region.y)
+            .map_err(|error| error.to_string())?;
         png_writer
             .set_frame_delay(delay_num, delay_den)
             .map_err(|error| error.to_string())?;
@@ -1325,9 +2028,11 @@ fn write_native_apng(
         png_writer
             .set_dispose_op(PngDisposeOp::None)
             .map_err(|error| error.to_string())?;
+        let region_pixels = frame_region_pixels(&frame.pixels, region);
         png_writer
-            .write_image_data(frame.pixels.as_raw())
+            .write_image_data(&region_pixels)
             .map_err(|error| error.to_string())?;
+        previous_frame = frame.pixels.clone();
     }
 
     png_writer.finish().map_err(|error| error.to_string())
@@ -1416,8 +2121,7 @@ fn decode_video_frames_with_ffmpeg(
         "-",
     ];
 
-    let output =
-        run_with_fallback("ffmpeg", &args, locale).map_err(|error| error.system_error)?;
+    let output = run_with_fallback("ffmpeg", &args, locale).map_err(|error| error.system_error)?;
     let frame_size = raw_rgba_frame_size(frame_width, frame_height)?;
     if frame_size == 0 || output.stdout.is_empty() || output.stdout.len() % frame_size != 0 {
         return Err("ffmpeg did not return a whole sequence of RGBA frames".into());
@@ -1432,14 +2136,18 @@ fn decode_video_frames_with_ffmpeg(
     Ok((frames, output.resolution))
 }
 
-fn extract_video_source_frame_rgba(
+fn extract_video_source_frames_rgba(
     input_path: &str,
-    frame_index: u32,
+    frame_indexes: &BTreeSet<u32>,
     frame_width: u32,
     frame_height: u32,
     locale: UiLocale,
-) -> Result<(RgbaImage, ToolResolution), String> {
-    let select_filter = format!("select='eq(n,{frame_index})',format=rgba");
+) -> Result<(BTreeMap<u32, RgbaImage>, ToolResolution), String> {
+    if frame_indexes.is_empty() {
+        return Err("no timeline frames requested for extraction".into());
+    }
+
+    let select_filter = build_source_frame_select_filter(frame_indexes);
     let args = [
         "-v",
         "error",
@@ -1447,8 +2155,6 @@ fn extract_video_source_frame_rgba(
         input_path,
         "-vf",
         select_filter.as_str(),
-        "-frames:v",
-        "1",
         "-pix_fmt",
         "rgba",
         "-f",
@@ -1457,17 +2163,23 @@ fn extract_video_source_frame_rgba(
         "-",
     ];
 
-    let output =
-        run_with_fallback("ffmpeg", &args, locale).map_err(|error| error.system_error)?;
+    let output = run_with_fallback("ffmpeg", &args, locale).map_err(|error| error.system_error)?;
     let frame_size = raw_rgba_frame_size(frame_width, frame_height)?;
-    if output.stdout.len() != frame_size {
-        return Err("ffmpeg did not return a complete RGBA frame".into());
+    if frame_size == 0 || output.stdout.len() != frame_size * frame_indexes.len() {
+        return Err("ffmpeg did not return the requested RGBA source frames".into());
     }
 
-    Ok((
-        rgba_frame_from_bytes(frame_width, frame_height, output.stdout)?,
-        output.resolution,
-    ))
+    let frames = frame_indexes
+        .iter()
+        .copied()
+        .zip(output.stdout.chunks(frame_size))
+        .map(|(frame_index, chunk)| {
+            rgba_frame_from_bytes(frame_width, frame_height, chunk.to_vec())
+                .map(|pixels| (frame_index, pixels))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+    Ok((frames, output.resolution))
 }
 
 fn normalized_fit_mode(raw: &str, locale: UiLocale) -> (&'static str, Option<String>) {
@@ -1489,92 +2201,86 @@ fn build_candidate_ladder(
     input_height: Option<u32>,
     fit_mode: &str,
     preset_strategy: &str,
+    optimizer_goal: &str,
     search_budget: usize,
     locale: UiLocale,
 ) -> Vec<CandidatePreview> {
-    let max_fps = source_fps.floor().clamp(1.0, 30.0) as u32;
-    let mut fps_ladder: Vec<u32> = [30, 27, 24, 21, 18, 15, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
-        .into_iter()
-        .filter(|fps| *fps <= max_fps)
-        .collect();
-
-    if fps_ladder.is_empty() {
-        fps_ladder.push(max_fps.max(1));
-    }
-
     let largest_input = input_width.unwrap_or(320).max(input_height.unwrap_or(320));
-    let scale_ladder: Vec<f64> = if largest_input <= 320 {
-        vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.80]
-    } else if largest_input > 1080 {
-        vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.80, 0.76, 0.72, 0.68, 0.64]
-    } else {
-        vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.80, 0.76, 0.72]
+    let scale_ladder: Vec<f64> = match optimizer_goal {
+        "motion" => vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44, 0.36],
+        "quality" if largest_input <= 320 => vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.80, 0.76],
+        "quality" => vec![1.0, 0.96, 0.92, 0.88, 0.84, 0.80, 0.76, 0.68],
+        _ => vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44],
     };
 
     let mut candidates = Vec::new();
-    let source_duration_seconds = natural_selection_duration_seconds(selected_frame_count, source_fps);
+    let source_duration_seconds =
+        natural_selection_duration_seconds(selected_frame_count, source_fps);
+    let frame_sample_steps = frame_sample_steps_for_goal(selected_frame_count, optimizer_goal);
 
-    for fps in fps_ladder {
-        let duration_seconds = candidate_duration_seconds(selected_frame_count, fps);
-        let preset_ladder = preset_ladder_for_strategy(duration_seconds, preset_strategy);
+    for frame_sample_step in frame_sample_steps {
+        let encoded_frame_count = sampled_frame_count(selected_frame_count, frame_sample_step);
+        let fps_ladder: Vec<u32> = [30, 27, 24, 21, 18, 15, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+            .into_iter()
+            .filter(|fps| {
+                candidate_duration_seconds(encoded_frame_count, *fps)
+                    <= DISCORD_MAX_DURATION_SECONDS
+            })
+            .collect();
 
-        for scale in &scale_ladder {
-            for preset in &preset_ladder {
-                let summary =
-                    locale::candidate_summary(locale, fps, *scale, preset, duration_seconds);
+        for fps in fps_ladder {
+            let duration_seconds = candidate_duration_seconds(encoded_frame_count, fps);
+            let preset_ladder = preset_ladder_for_strategy(duration_seconds, preset_strategy);
 
-                let score = source_similarity_score(
-                    source_fps,
-                    fps,
-                    *scale,
-                    preset,
-                    source_duration_seconds,
-                    duration_seconds,
-                );
-
-                candidates.push(CandidatePreview {
-                    id: format!(
-                        "{}-{}-{}fps-{}scale-{}ms",
-                        fit_mode,
-                        preset,
+            for scale in &scale_ladder {
+                for preset in &preset_ladder {
+                    let summary =
+                        locale::candidate_summary(locale, fps, *scale, preset, duration_seconds);
+                    let frame_retention_score =
+                        encoded_frame_count as f64 / selected_frame_count.max(1) as f64;
+                    let score = optimizer_goal_score(
+                        optimizer_goal,
+                        source_fps,
                         fps,
-                        (scale * 100.0).round() as u32,
-                        (duration_seconds * 1000.0).round() as u64
-                    ),
-                    rank: 0,
-                    duration_seconds,
-                    fps,
-                    content_scale: *scale,
-                    preset: (*preset).into(),
-                    fit_mode: fit_mode.into(),
-                    score,
-                    source_similarity_score: score,
-                    summary,
-                });
+                        *scale,
+                        preset,
+                        source_duration_seconds,
+                        duration_seconds,
+                        frame_retention_score,
+                    );
+                    let sample_suffix = if frame_sample_step > 1 {
+                        format!("-every{frame_sample_step}")
+                    } else {
+                        String::new()
+                    };
+
+                    candidates.push(CandidatePreview {
+                        id: format!(
+                            "{}-{}-{}fps-{}scale{}-{}ms",
+                            fit_mode,
+                            preset,
+                            fps,
+                            (scale * 100.0).round() as u32,
+                            sample_suffix,
+                            (duration_seconds * 1000.0).round() as u64
+                        ),
+                        rank: 0,
+                        duration_seconds,
+                        fps,
+                        content_scale: *scale,
+                        preset: (*preset).into(),
+                        fit_mode: fit_mode.into(),
+                        score,
+                        source_similarity_score: score,
+                        summary,
+                        frame_sample_step,
+                    });
+                }
             }
         }
     }
 
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| right.fps.cmp(&left.fps))
-            .then_with(|| {
-                right
-                    .content_scale
-                    .partial_cmp(&left.content_scale)
-                    .unwrap_or(Ordering::Equal)
-            })
-    });
-
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        candidate.rank = index + 1;
-    }
-
-    candidates.truncate(search_budget);
-    candidates
+    select_ranked_candidate_subset(candidates, search_budget)
 }
 
 fn prepare_optimizer_plan(
@@ -1582,6 +2288,12 @@ fn prepare_optimizer_plan(
     locale: UiLocale,
 ) -> OptimizerPlanResponse {
     let (fit_mode, fit_warning) = normalized_fit_mode(&request.fit_mode, locale);
+    let optimizer_goal = normalized_optimizer_goal(
+        request.optimizer_goal.as_deref(),
+        request.preset_strategy.as_deref(),
+    );
+    let quality_frame_drop_interval =
+        normalized_quality_frame_drop_interval(request.quality_frame_drop_interval);
     let preset_strategy = normalized_preset_strategy(request.preset_strategy.as_deref());
     let search_depth = normalized_search_depth(request.search_depth.as_deref());
     let search_budget = search_budget_for_depth(search_depth);
@@ -1620,38 +2332,60 @@ fn prepare_optimizer_plan(
     let effective_input_width = request.input_width;
     let effective_input_height = request.input_height;
 
-    if let Some(timeline_frames) = match resolve_timeline_frames(
-        request.timeline_frames.as_ref(),
-        request.base_frame_count,
-    ) {
-        Ok(timeline_frames) => timeline_frames,
-        Err("no-frames-selected") => {
-            return OptimizerPlanResponse {
-                ok: false,
-                fit_mode: fit_mode.into(),
-                selected_duration_seconds: None,
-                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
-                search_budget,
-                warnings,
-                candidates: Vec::new(),
-                error_code: Some("no-frames-selected".into()),
-                error_message: Some(locale::frame_selection_required_error(locale)),
-            };
+    if let Some(timeline_frames) =
+        match resolve_timeline_frames(request.timeline_frames.as_ref(), request.base_frame_count) {
+            Ok(timeline_frames) => match (timeline_frames, optimizer_goal) {
+                (Some(timeline_frames), "quality") => {
+                    match apply_quality_frame_drop_to_timeline_frames(
+                        timeline_frames,
+                        quality_frame_drop_interval,
+                    ) {
+                        Ok(timeline_frames) => Some(timeline_frames),
+                        Err(error) => {
+                            return OptimizerPlanResponse {
+                                ok: false,
+                                fit_mode: fit_mode.into(),
+                                selected_duration_seconds: None,
+                                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                                search_budget,
+                                warnings,
+                                candidates: Vec::new(),
+                                error_code: Some(error.into()),
+                                error_message: Some(locale::frame_selection_required_error(locale)),
+                            }
+                        }
+                    }
+                }
+                (timeline_frames, _) => timeline_frames,
+            },
+            Err("no-frames-selected") => {
+                return OptimizerPlanResponse {
+                    ok: false,
+                    fit_mode: fit_mode.into(),
+                    selected_duration_seconds: None,
+                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    search_budget,
+                    warnings,
+                    candidates: Vec::new(),
+                    error_code: Some("no-frames-selected".into()),
+                    error_message: Some(locale::frame_selection_required_error(locale)),
+                };
+            }
+            Err(_) => {
+                return OptimizerPlanResponse {
+                    ok: false,
+                    fit_mode: fit_mode.into(),
+                    selected_duration_seconds: None,
+                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    search_budget,
+                    warnings,
+                    candidates: Vec::new(),
+                    error_code: Some("invalid-frame-selection".into()),
+                    error_message: Some(locale::invalid_frame_selection_error(locale)),
+                };
+            }
         }
-        Err(_) => {
-            return OptimizerPlanResponse {
-                ok: false,
-                fit_mode: fit_mode.into(),
-                selected_duration_seconds: None,
-                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
-                search_budget,
-                warnings,
-                candidates: Vec::new(),
-                error_code: Some("invalid-frame-selection".into()),
-                error_message: Some(locale::invalid_frame_selection_error(locale)),
-            };
-        }
-    } {
+    {
         let total_duration_seconds = timeline_duration_seconds(&timeline_frames);
 
         if total_duration_seconds > DISCORD_MAX_DURATION_SECONDS {
@@ -1672,7 +2406,9 @@ fn prepare_optimizer_plan(
             warnings.push(locale::recommended_duration_warning(locale));
         }
 
-        let effective_fps = timeline_average_fps(&timeline_frames).round().clamp(1.0, 30.0) as u32;
+        let effective_fps = timeline_average_fps(&timeline_frames)
+            .round()
+            .clamp(1.0, 30.0) as u32;
 
         return OptimizerPlanResponse {
             ok: true,
@@ -1688,6 +2424,7 @@ fn prepare_optimizer_plan(
                 effective_input_height,
                 fit_mode,
                 preset_strategy,
+                optimizer_goal,
                 search_budget,
                 locale,
             ),
@@ -1696,37 +2433,55 @@ fn prepare_optimizer_plan(
         };
     }
 
-    let frame_selection = match resolve_frame_selection(
-        request.selected_frames.as_ref(),
-        request.base_frame_count,
-    ) {
-        Ok(selection) => selection,
-        Err("no-frames-selected") => {
-            return OptimizerPlanResponse {
-                ok: false,
-                fit_mode: fit_mode.into(),
-                selected_duration_seconds: None,
-                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
-                search_budget,
-                warnings,
-                candidates: Vec::new(),
-                error_code: Some("no-frames-selected".into()),
-                error_message: Some(locale::frame_selection_required_error(locale)),
-            };
+    let frame_selection =
+        match resolve_frame_selection(request.selected_frames.as_ref(), request.base_frame_count) {
+            Ok(selection) => selection,
+            Err("no-frames-selected") => {
+                return OptimizerPlanResponse {
+                    ok: false,
+                    fit_mode: fit_mode.into(),
+                    selected_duration_seconds: None,
+                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    search_budget,
+                    warnings,
+                    candidates: Vec::new(),
+                    error_code: Some("no-frames-selected".into()),
+                    error_message: Some(locale::frame_selection_required_error(locale)),
+                };
+            }
+            Err(_) => {
+                return OptimizerPlanResponse {
+                    ok: false,
+                    fit_mode: fit_mode.into(),
+                    selected_duration_seconds: None,
+                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    search_budget,
+                    warnings,
+                    candidates: Vec::new(),
+                    error_code: Some("invalid-frame-selection".into()),
+                    error_message: Some(locale::invalid_frame_selection_error(locale)),
+                };
+            }
+        };
+    let frame_selection = if optimizer_goal == "quality" {
+        match apply_quality_frame_drop_to_selection(frame_selection, quality_frame_drop_interval) {
+            Ok(selection) => selection,
+            Err(error) => {
+                return OptimizerPlanResponse {
+                    ok: false,
+                    fit_mode: fit_mode.into(),
+                    selected_duration_seconds: None,
+                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    search_budget,
+                    warnings,
+                    candidates: Vec::new(),
+                    error_code: Some(error.into()),
+                    error_message: Some(locale::frame_selection_required_error(locale)),
+                }
+            }
         }
-        Err(_) => {
-            return OptimizerPlanResponse {
-                ok: false,
-                fit_mode: fit_mode.into(),
-                selected_duration_seconds: None,
-                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
-                search_budget,
-                warnings,
-                candidates: Vec::new(),
-                error_code: Some("invalid-frame-selection".into()),
-                error_message: Some(locale::invalid_frame_selection_error(locale)),
-            };
-        }
+    } else {
+        frame_selection
     };
 
     let source_fps = derive_source_fps(
@@ -1736,8 +2491,13 @@ fn prepare_optimizer_plan(
     );
     let natural_duration_seconds =
         natural_selection_duration_seconds(frame_selection.selected_frame_count, source_fps);
-    let shortest_duration_seconds =
-        candidate_duration_seconds(frame_selection.selected_frame_count, source_fps.floor().clamp(1.0, 30.0) as u32);
+    let shortest_frame_count =
+        frame_sample_steps_for_goal(frame_selection.selected_frame_count, optimizer_goal)
+            .into_iter()
+            .map(|step| sampled_frame_count(frame_selection.selected_frame_count, step))
+            .min()
+            .unwrap_or(frame_selection.selected_frame_count);
+    let shortest_duration_seconds = candidate_duration_seconds(shortest_frame_count, 30);
 
     if shortest_duration_seconds > DISCORD_MAX_DURATION_SECONDS {
         return OptimizerPlanResponse {
@@ -1771,6 +2531,7 @@ fn prepare_optimizer_plan(
             effective_input_height,
             fit_mode,
             preset_strategy,
+            optimizer_goal,
             search_budget,
             locale,
         ),
@@ -1861,15 +2622,13 @@ fn encode_candidate_from_video_timeline_internal(
         .iter()
         .map(|frame| frame.source_frame_index)
         .collect::<BTreeSet<_>>();
-    let mut source_frames = BTreeMap::new();
-    let mut tool_resolution = None;
-
-    for frame_index in unique_frame_indexes {
-        let (pixels, resolution) =
-            extract_video_source_frame_rgba(input_path, frame_index, source_width, source_height, locale)?;
-        tool_resolution.get_or_insert(resolution);
-        source_frames.insert(frame_index, pixels);
-    }
+    let (source_frames, resolution) = extract_video_source_frames_rgba(
+        input_path,
+        &unique_frame_indexes,
+        source_width,
+        source_height,
+        locale,
+    )?;
 
     let frames = timeline_frames
         .iter()
@@ -1891,7 +2650,6 @@ fn encode_candidate_from_video_timeline_internal(
     let started = Instant::now();
     write_native_apng(&output_path, &frames, &candidate.preset)?;
     let metadata = fs::metadata(&output_path).map_err(|error| error.to_string())?;
-    let resolution = tool_resolution.ok_or_else(|| "ffmpeg did not extract any timeline frames".to_string())?;
 
     Ok(EncodeResult {
         output_path,
@@ -1926,11 +2684,18 @@ fn encode_candidate_with_ffmpeg_frames_internal(
         selected_frames,
     );
     let effective_width = resolved_crop_region.map(|crop| crop.width).or(input_width);
-    let effective_height = resolved_crop_region.map(|crop| crop.height).or(input_height);
+    let effective_height = resolved_crop_region
+        .map(|crop| crop.height)
+        .or(input_height);
     let (frame_width, frame_height) =
         scaled_output_dimensions(effective_width, effective_height, candidate.content_scale);
-    let (pixels, resolution) =
-        decode_video_frames_with_ffmpeg(input_path, &filter_graph, frame_width, frame_height, locale)?;
+    let (pixels, resolution) = decode_video_frames_with_ffmpeg(
+        input_path,
+        &filter_graph,
+        frame_width,
+        frame_height,
+        locale,
+    )?;
     let frames = pixels
         .into_iter()
         .map(|pixels| StickerFrame {
@@ -1993,20 +2758,22 @@ fn encode_candidate_internal(
     if matches!(extension.as_str(), "gif" | "apng") {
         let output_directory = resolve_output_directory(output_directory, input_path, locale)?;
         let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
-        let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)?;
+        let resolved_crop_region =
+            resolve_crop_region(crop_region, input_width, input_height, locale)?;
         let source_frames = decode_native_animation_frames(input_path)?;
-        let frames = build_native_selected_animation_frames(&source_frames, selected_frames, candidate.fps)?
-            .into_iter()
-            .map(|frame| StickerFrame {
-                pixels: transform_frame_for_candidate(
-                    &frame.pixels,
-                    &candidate.fit_mode,
-                    candidate.content_scale,
-                    resolved_crop_region,
-                ),
-                duration_seconds: frame.duration_seconds,
-            })
-            .collect::<Vec<_>>();
+        let frames =
+            build_native_selected_animation_frames(&source_frames, selected_frames, candidate.fps)?
+                .into_iter()
+                .map(|frame| StickerFrame {
+                    pixels: transform_frame_for_candidate(
+                        &frame.pixels,
+                        &candidate.fit_mode,
+                        candidate.content_scale,
+                        resolved_crop_region,
+                    ),
+                    duration_seconds: frame.duration_seconds,
+                })
+                .collect::<Vec<_>>();
         let started = Instant::now();
         write_native_apng(&output_path, &frames, &candidate.preset)?;
         let metadata = fs::metadata(&output_path).map_err(|error| error.to_string())?;
@@ -2209,50 +2976,111 @@ fn inspection_error(
     }
 }
 
-fn parse_png_chunks(bytes: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
-    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    if bytes.len() < 8 || &bytes[0..8] != PNG_SIGNATURE {
-        return Vec::new();
-    }
-
-    let mut cursor = 8usize;
-    let mut chunks = Vec::new();
-
-    while cursor + 12 <= bytes.len() {
-        let length = u32::from_be_bytes([
-            bytes[cursor],
-            bytes[cursor + 1],
-            bytes[cursor + 2],
-            bytes[cursor + 3],
-        ]) as usize;
-        let chunk_type = [
-            bytes[cursor + 4],
-            bytes[cursor + 5],
-            bytes[cursor + 6],
-            bytes[cursor + 7],
-        ];
-        let data_start = cursor + 8;
-        let data_end = data_start + length;
-        let crc_end = data_end + 4;
-        if crc_end > bytes.len() {
-            break;
-        }
-
-        chunks.push((chunk_type, bytes[data_start..data_end].to_vec()));
-        cursor = crc_end;
-
-        if &chunk_type == b"IEND" {
-            break;
-        }
-    }
-
-    chunks
+fn skip_png_chunk_payload<R: Seek>(reader: &mut R, length: u32) -> Result<(), String> {
+    reader
+        .seek(SeekFrom::Current(i64::from(length) + 4))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
-fn png_contains_apng_chunks(bytes: &[u8]) -> bool {
-    parse_png_chunks(bytes)
-        .into_iter()
-        .any(|(chunk_type, _)| chunk_type == *b"acTL")
+fn read_png_chunk_payload<R: Read>(reader: &mut R, length: u32) -> Result<Vec<u8>, String> {
+    let mut data = vec![0u8; length as usize];
+    reader
+        .read_exact(&mut data)
+        .map_err(|error| error.to_string())?;
+    let mut crc = [0u8; 4];
+    reader
+        .read_exact(&mut crc)
+        .map_err(|error| error.to_string())?;
+    Ok(data)
+}
+
+fn read_png_animation_metadata(input_path: &Path) -> Result<Option<PngAnimationMetadata>, String> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+    let file = File::open(input_path).map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut signature = [0u8; 8];
+    reader
+        .read_exact(&mut signature)
+        .map_err(|error| error.to_string())?;
+    if &signature != PNG_SIGNATURE {
+        return Ok(None);
+    }
+
+    let mut width = None;
+    let mut height = None;
+    let mut frame_count = None;
+    let mut frame_durations = Vec::new();
+    let mut saw_animation_control = false;
+
+    loop {
+        let mut length_bytes = [0u8; 4];
+        match reader.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.to_string()),
+        }
+
+        let length = u32::from_be_bytes(length_bytes);
+        let mut chunk_type = [0u8; 4];
+        reader
+            .read_exact(&mut chunk_type)
+            .map_err(|error| error.to_string())?;
+
+        match &chunk_type {
+            b"IHDR" => {
+                let data = read_png_chunk_payload(&mut reader, length)?;
+                if data.len() >= 8 {
+                    width = Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+                    height = Some(u32::from_be_bytes([data[4], data[5], data[6], data[7]]));
+                }
+            }
+            b"acTL" => {
+                let data = read_png_chunk_payload(&mut reader, length)?;
+                saw_animation_control = true;
+                if data.len() >= 4 {
+                    frame_count =
+                        Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64);
+                }
+            }
+            b"fcTL" => {
+                let data = read_png_chunk_payload(&mut reader, length)?;
+                if data.len() >= 26 {
+                    let delay_num = u16::from_be_bytes([data[20], data[21]]);
+                    let delay_den = u16::from_be_bytes([data[22], data[23]]);
+                    let denominator = if delay_den == 0 { 100 } else { delay_den };
+                    let delay = if delay_num == 0 {
+                        0.01
+                    } else {
+                        f64::from(delay_num) / f64::from(denominator)
+                    };
+                    frame_durations.push(delay);
+                }
+            }
+            b"IDAT" if !saw_animation_control => {
+                return Ok(None);
+            }
+            b"IEND" => {
+                skip_png_chunk_payload(&mut reader, length)?;
+                break;
+            }
+            _ => {
+                skip_png_chunk_payload(&mut reader, length)?;
+            }
+        }
+    }
+
+    if !saw_animation_control {
+        return Ok(None);
+    }
+
+    Ok(Some(PngAnimationMetadata {
+        width: width.unwrap_or(0),
+        height: height.unwrap_or(0),
+        frame_count,
+        frame_durations,
+    }))
 }
 
 fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
@@ -2353,8 +3181,14 @@ fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIns
         }
     };
 
-    let width = frames.first().map(|frame| frame.pixels.width()).unwrap_or(0);
-    let height = frames.first().map(|frame| frame.pixels.height()).unwrap_or(0);
+    let width = frames
+        .first()
+        .map(|frame| frame.pixels.width())
+        .unwrap_or(0);
+    let height = frames
+        .first()
+        .map(|frame| frame.pixels.height())
+        .unwrap_or(0);
     let frame_durations = frames
         .iter()
         .map(|frame| frame.duration_seconds)
@@ -2406,8 +3240,18 @@ fn inspect_apng_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIn
         }
     };
 
-    let bytes = match fs::read(input_path) {
-        Ok(bytes) => bytes,
+    let animation_metadata = match read_png_animation_metadata(Path::new(input_path)) {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            return inspection_error(
+                input_path,
+                Some("native".into()),
+                None,
+                Some(locale::native_animation_detail(locale, "apng")),
+                "inspect-failed",
+                locale::invalid_apng_error(locale),
+            );
+        }
         Err(error) => {
             return inspection_error(
                 input_path,
@@ -2420,64 +3264,30 @@ fn inspect_apng_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIn
         }
     };
 
-    let chunks = parse_png_chunks(&bytes);
-    let mut width = None;
-    let mut height = None;
-    let mut frame_durations = Vec::new();
-    let mut frame_count = None;
-
-    for (chunk_type, data) in chunks {
-        match &chunk_type {
-            b"IHDR" if data.len() >= 8 => {
-                width = Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
-                height = Some(u32::from_be_bytes([data[4], data[5], data[6], data[7]]));
-            }
-            b"acTL" if data.len() >= 4 => {
-                frame_count = Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64);
-            }
-            b"fcTL" if data.len() >= 26 => {
-                let delay_num = u16::from_be_bytes([data[20], data[21]]);
-                let delay_den = u16::from_be_bytes([data[22], data[23]]);
-                let denominator = if delay_den == 0 { 100 } else { delay_den };
-                let delay = if delay_num == 0 {
-                    0.01
-                } else {
-                    f64::from(delay_num) / f64::from(denominator)
-                };
-                frame_durations.push(delay);
-            }
-            _ => {}
-        }
+    let width = animation_metadata.width;
+    let height = animation_metadata.height;
+    if width == 0 {
+        return inspection_error(
+            input_path,
+            Some("native".into()),
+            None,
+            Some(locale::native_animation_detail(locale, "apng")),
+            "inspect-failed",
+            locale::invalid_png_header_error(locale),
+        );
+    }
+    if height == 0 {
+        return inspection_error(
+            input_path,
+            Some("native".into()),
+            None,
+            Some(locale::native_animation_detail(locale, "apng")),
+            "inspect-failed",
+            locale::invalid_png_header_error(locale),
+        );
     }
 
-    let width = match width {
-        Some(width) => width,
-        None => {
-            return inspection_error(
-                input_path,
-                Some("native".into()),
-                None,
-                Some(locale::native_animation_detail(locale, "apng")),
-                "inspect-failed",
-                locale::invalid_png_header_error(locale),
-            );
-        }
-    };
-    let height = match height {
-        Some(height) => height,
-        None => {
-            return inspection_error(
-                input_path,
-                Some("native".into()),
-                None,
-                Some(locale::native_animation_detail(locale, "apng")),
-                "inspect-failed",
-                locale::invalid_png_header_error(locale),
-            );
-        }
-    };
-
-    if frame_durations.is_empty() {
+    if animation_metadata.frame_durations.is_empty() {
         return inspection_error(
             input_path,
             Some("native".into()),
@@ -2488,8 +3298,10 @@ fn inspect_apng_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIn
         );
     }
 
-    let estimated_frames = frame_count.unwrap_or(frame_durations.len() as u64);
-    let duration_seconds = frame_durations.iter().sum::<f64>();
+    let estimated_frames = animation_metadata
+        .frame_count
+        .unwrap_or(animation_metadata.frame_durations.len() as u64);
+    let duration_seconds = animation_metadata.frame_durations.iter().sum::<f64>();
     let avg_fps = if duration_seconds > 0.0 {
         Some(estimated_frames as f64 / duration_seconds)
     } else {
@@ -2512,7 +3324,7 @@ fn inspect_apng_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIn
         avg_fps,
         frame_rate_label: avg_fps.map(|fps| format!("{fps:.2}")),
         estimated_frames: Some(estimated_frames),
-        frame_durations_seconds: Some(frame_durations),
+        frame_durations_seconds: Some(animation_metadata.frame_durations),
         is_static_image: false,
         can_convert_to_png: false,
         error_code: None,
@@ -2569,20 +3381,25 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
                 .map_err(|error| error.to_string())?;
             let (width, height) = unpack_media_foundation_pair(frame_size);
 
-            let avg_fps = media_type.GetUINT64(&MF_MT_FRAME_RATE).ok().and_then(|packed_rate| {
-                let (numerator, denominator) = unpack_media_foundation_pair(packed_rate);
-                if numerator > 0 && denominator > 0 {
-                    Some(numerator as f64 / denominator as f64)
-                } else {
-                    None
-                }
-            });
+            let avg_fps = media_type
+                .GetUINT64(&MF_MT_FRAME_RATE)
+                .ok()
+                .and_then(|packed_rate| {
+                    let (numerator, denominator) = unpack_media_foundation_pair(packed_rate);
+                    if numerator > 0 && denominator > 0 {
+                        Some(numerator as f64 / denominator as f64)
+                    } else {
+                        None
+                    }
+                });
 
             let duration_value = reader
                 .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
                 .map_err(|error| error.to_string())?;
-            let duration_100ns = u64::try_from(&duration_value).map_err(|error| error.to_string())?;
-            let duration_seconds = (duration_100ns > 0).then_some(duration_100ns as f64 / 10_000_000.0);
+            let duration_100ns =
+                u64::try_from(&duration_value).map_err(|error| error.to_string())?;
+            let duration_seconds =
+                (duration_100ns > 0).then_some(duration_100ns as f64 / 10_000_000.0);
             let estimated_frames = duration_seconds
                 .zip(avg_fps)
                 .map(|(duration, fps)| (duration * fps).round().max(1.0) as u64);
@@ -2684,14 +3501,19 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
         }
     };
 
+    static FORMAT_REGEX: OnceLock<Regex> = OnceLock::new();
+    static DURATION_REGEX: OnceLock<Regex> = OnceLock::new();
+    static STREAM_REGEX: OnceLock<Regex> = OnceLock::new();
+
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let format_regex = Regex::new(r"Input #0, ([^,]+(?:,[^,]+)*), from").expect("format regex");
-    let duration_regex =
-        Regex::new(r"Duration:\s*([0-9:.]+)").expect("duration regex");
-    let stream_regex = Regex::new(
-        r"Video:\s*([^,]+),\s*(.+?),\s*(\d+)x(\d+).*?([0-9]+(?:\.[0-9]+)?)\s+fps",
-    )
-    .expect("stream regex");
+    let format_regex = FORMAT_REGEX
+        .get_or_init(|| Regex::new(r"Input #0, ([^,]+(?:,[^,]+)*), from").expect("format regex"));
+    let duration_regex = DURATION_REGEX
+        .get_or_init(|| Regex::new(r"Duration:\s*([0-9:.]+)").expect("duration regex"));
+    let stream_regex = STREAM_REGEX.get_or_init(|| {
+        Regex::new(r"Video:\s*([^,]+),\s*(.+?),\s*(\d+)x(\d+).*?([0-9]+(?:\.[0-9]+)?)\s+fps")
+            .expect("stream regex")
+    });
 
     let format_name = format_regex
         .captures(&stderr)
@@ -2722,8 +3544,12 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
         }
     };
 
-    let codec_name = stream_captures.get(1).map(|value| value.as_str().trim().to_string());
-    let pixel_format = stream_captures.get(2).map(|value| value.as_str().trim().to_string());
+    let codec_name = stream_captures
+        .get(1)
+        .map(|value| value.as_str().trim().to_string());
+    let pixel_format = stream_captures
+        .get(2)
+        .map(|value| value.as_str().trim().to_string());
     let width = stream_captures
         .get(3)
         .and_then(|value| value.as_str().parse::<u32>().ok());
@@ -2775,10 +3601,11 @@ fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInsp
     };
 
     if extension == "png" {
-        if let Ok(bytes) = fs::read(input_path) {
-            if png_contains_apng_chunks(&bytes) {
-                return inspect_apng_metadata_internal(input_path, locale);
-            }
+        if matches!(
+            read_png_animation_metadata(Path::new(input_path)),
+            Ok(Some(_))
+        ) {
+            return inspect_apng_metadata_internal(input_path, locale);
         }
 
         return inspect_still_image_metadata_internal(input_path, locale);
@@ -2941,61 +3768,137 @@ fn run_optimizer_search_internal(
     request: OptimizerSearchRequest,
     locale: UiLocale,
 ) -> OptimizerSearchResponse {
-    let resolved_timeline_frames = match resolve_timeline_frames(
-        request.timeline_frames.as_ref(),
-        request.base_frame_count,
-    ) {
-        Ok(timeline_frames) => timeline_frames,
-        Err("no-frames-selected") => {
-            return OptimizerSearchResponse {
-                ok: false,
-                fit_mode: request.fit_mode.clone(),
-                selected_duration_seconds: None,
-                limit_bytes: DISCORD_MAX_STICKER_BYTES,
-                search_budget: MAX_SEARCH_BUDGET,
-                real_attempt_count: 0,
-                stop_reason: Some("no-frames-selected".into()),
-                selection_reason: "no_fit_found".into(),
-                summary: locale::plan_failed_message(locale),
-                warnings: Vec::new(),
-                attempts: Vec::new(),
-                winning_candidate_id: None,
-                closest_candidate_id: None,
-                best_output_path: None,
-                best_size_bytes: None,
-                best_within_limit: false,
-                error_code: Some("no-frames-selected".into()),
-                error_message: Some(locale::frame_selection_required_error(locale)),
-            };
-        }
-        Err(_) => {
-            return OptimizerSearchResponse {
-                ok: false,
-                fit_mode: request.fit_mode.clone(),
-                selected_duration_seconds: None,
-                limit_bytes: DISCORD_MAX_STICKER_BYTES,
-                search_budget: MAX_SEARCH_BUDGET,
-                real_attempt_count: 0,
-                stop_reason: Some("invalid-frame-selection".into()),
-                selection_reason: "no_fit_found".into(),
-                summary: locale::plan_failed_message(locale),
-                warnings: Vec::new(),
-                attempts: Vec::new(),
-                winning_candidate_id: None,
-                closest_candidate_id: None,
-                best_output_path: None,
-                best_size_bytes: None,
-                best_within_limit: false,
-                error_code: Some("invalid-frame-selection".into()),
-                error_message: Some(locale::invalid_frame_selection_error(locale)),
-            };
-        }
-    };
+    let optimizer_goal = normalized_optimizer_goal(
+        request.optimizer_goal.as_deref(),
+        request.preset_strategy.as_deref(),
+    );
+    let quality_frame_drop_interval =
+        normalized_quality_frame_drop_interval(request.quality_frame_drop_interval);
+    let resolved_timeline_frames =
+        match resolve_timeline_frames(request.timeline_frames.as_ref(), request.base_frame_count) {
+            Ok(timeline_frames) => match (timeline_frames, optimizer_goal) {
+                (Some(timeline_frames), "quality") => {
+                    match apply_quality_frame_drop_to_timeline_frames(
+                        timeline_frames,
+                        quality_frame_drop_interval,
+                    ) {
+                        Ok(timeline_frames) => Some(timeline_frames),
+                        Err(error) => {
+                            return OptimizerSearchResponse {
+                                ok: false,
+                                fit_mode: request.fit_mode.clone(),
+                                selected_duration_seconds: None,
+                                limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                                search_budget: MAX_SEARCH_BUDGET,
+                                real_attempt_count: 0,
+                                stop_reason: Some(error.into()),
+                                selection_reason: "no_fit_found".into(),
+                                summary: locale::plan_failed_message(locale),
+                                warnings: Vec::new(),
+                                attempts: Vec::new(),
+                                winning_candidate_id: None,
+                                closest_candidate_id: None,
+                                best_output_path: None,
+                                best_size_bytes: None,
+                                best_within_limit: false,
+                                error_code: Some(error.into()),
+                                error_message: Some(locale::frame_selection_required_error(locale)),
+                            };
+                        }
+                    }
+                }
+                (timeline_frames, _) => timeline_frames,
+            },
+            Err("no-frames-selected") => {
+                return OptimizerSearchResponse {
+                    ok: false,
+                    fit_mode: request.fit_mode.clone(),
+                    selected_duration_seconds: None,
+                    limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                    search_budget: MAX_SEARCH_BUDGET,
+                    real_attempt_count: 0,
+                    stop_reason: Some("no-frames-selected".into()),
+                    selection_reason: "no_fit_found".into(),
+                    summary: locale::plan_failed_message(locale),
+                    warnings: Vec::new(),
+                    attempts: Vec::new(),
+                    winning_candidate_id: None,
+                    closest_candidate_id: None,
+                    best_output_path: None,
+                    best_size_bytes: None,
+                    best_within_limit: false,
+                    error_code: Some("no-frames-selected".into()),
+                    error_message: Some(locale::frame_selection_required_error(locale)),
+                };
+            }
+            Err(_) => {
+                return OptimizerSearchResponse {
+                    ok: false,
+                    fit_mode: request.fit_mode.clone(),
+                    selected_duration_seconds: None,
+                    limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                    search_budget: MAX_SEARCH_BUDGET,
+                    real_attempt_count: 0,
+                    stop_reason: Some("invalid-frame-selection".into()),
+                    selection_reason: "no_fit_found".into(),
+                    summary: locale::plan_failed_message(locale),
+                    warnings: Vec::new(),
+                    attempts: Vec::new(),
+                    winning_candidate_id: None,
+                    closest_candidate_id: None,
+                    best_output_path: None,
+                    best_size_bytes: None,
+                    best_within_limit: false,
+                    error_code: Some("invalid-frame-selection".into()),
+                    error_message: Some(locale::invalid_frame_selection_error(locale)),
+                };
+            }
+        };
 
     let legacy_selected_frames = if resolved_timeline_frames.is_none() {
         Some(
-            match resolve_frame_selection(request.selected_frames.as_ref(), request.base_frame_count) {
-                Ok(selection) => selection.selected_frames,
+            match resolve_frame_selection(
+                request.selected_frames.as_ref(),
+                request.base_frame_count,
+            ) {
+                Ok(selection) => {
+                    let selection = if optimizer_goal == "quality" {
+                        match apply_quality_frame_drop_to_selection(
+                            selection,
+                            quality_frame_drop_interval,
+                        ) {
+                            Ok(selection) => selection,
+                            Err(error) => {
+                                return OptimizerSearchResponse {
+                                    ok: false,
+                                    fit_mode: request.fit_mode.clone(),
+                                    selected_duration_seconds: None,
+                                    limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                                    search_budget: MAX_SEARCH_BUDGET,
+                                    real_attempt_count: 0,
+                                    stop_reason: Some(error.into()),
+                                    selection_reason: "no_fit_found".into(),
+                                    summary: locale::plan_failed_message(locale),
+                                    warnings: Vec::new(),
+                                    attempts: Vec::new(),
+                                    winning_candidate_id: None,
+                                    closest_candidate_id: None,
+                                    best_output_path: None,
+                                    best_size_bytes: None,
+                                    best_within_limit: false,
+                                    error_code: Some(error.into()),
+                                    error_message: Some(locale::frame_selection_required_error(
+                                        locale,
+                                    )),
+                                };
+                            }
+                        }
+                    } else {
+                        selection
+                    };
+
+                    selection.selected_frames
+                }
                 Err("no-frames-selected") => {
                     return OptimizerSearchResponse {
                         ok: false,
@@ -3055,6 +3958,8 @@ fn run_optimizer_search_internal(
             avg_fps: request.avg_fps,
             fit_mode: request.fit_mode.clone(),
             preset_strategy: request.preset_strategy.clone(),
+            optimizer_goal: request.optimizer_goal.clone(),
+            quality_frame_drop_interval: request.quality_frame_drop_interval,
             search_depth: request.search_depth.clone(),
             crop_region: request.crop_region.clone(),
             selected_frames: request.selected_frames.clone(),
@@ -3093,7 +3998,28 @@ fn run_optimizer_search_internal(
     let mut attempts = Vec::new();
     let mut best_within_limit_output: Option<SelectedEncodeOutput> = None;
     let mut smallest_oversize_output: Option<SelectedEncodeOutput> = None;
+    let mut stopped_after_best_within_limit = false;
     for candidate in &plan.candidates {
+        if remaining_candidate_cannot_beat_within_limit(
+            best_within_limit_output.as_ref(),
+            candidate,
+        ) {
+            stopped_after_best_within_limit = true;
+            break;
+        }
+
+        let sampled_legacy_frames = if resolved_timeline_frames.is_none() {
+            sampled_frame_indexes(
+                legacy_selected_frames
+                    .as_ref()
+                    .and_then(|frames| frames.as_deref()),
+                request.base_frame_count,
+                candidate.frame_sample_step,
+            )
+        } else {
+            None
+        };
+
         let encode_result = if let Some(timeline_frames) = resolved_timeline_frames.as_deref() {
             encode_candidate_internal(
                 &request.input_path,
@@ -3115,7 +4041,11 @@ fn run_optimizer_search_internal(
                 request.input_width,
                 request.input_height,
                 candidate,
-                legacy_selected_frames.as_ref().and_then(|frames| frames.as_deref()),
+                sampled_legacy_frames.as_deref().or_else(|| {
+                    legacy_selected_frames
+                        .as_ref()
+                        .and_then(|frames| frames.as_deref())
+                }),
                 None,
             )
         };
@@ -3226,7 +4156,9 @@ fn run_optimizer_search_internal(
         }
     }
 
-    let stop_reason = if attempts.iter().any(|attempt| attempt.output_path.is_some()) {
+    let stop_reason = if stopped_after_best_within_limit {
+        "found-best-ranked-within-limit"
+    } else if attempts.iter().any(|attempt| attempt.output_path.is_some()) {
         "exhausted-ranked-candidates"
     } else {
         "no-successful-encodes"
@@ -3238,7 +4170,9 @@ fn run_optimizer_search_internal(
     } else {
         "no_fit_found"
     };
-    let selected_output = best_within_limit_output.as_ref().or(smallest_oversize_output.as_ref());
+    let selected_output = best_within_limit_output
+        .as_ref()
+        .or(smallest_oversize_output.as_ref());
     let winning_candidate_id = best_within_limit_output
         .as_ref()
         .map(|output| output.candidate_id.clone());
@@ -3288,7 +4222,10 @@ mod tests {
     impl TestDir {
         fn new(prefix: &str) -> Self {
             let suffix = TEST_DIR_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            let path = std::env::temp_dir().join(format!("stickerfit-{prefix}-{}-{suffix}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "stickerfit-{prefix}-{}-{suffix}",
+                std::process::id()
+            ));
             fs::create_dir_all(&path).expect("test temp directory should be created");
             Self { path }
         }
@@ -3319,6 +4256,7 @@ mod tests {
             score: 1.0,
             source_similarity_score: 1.0,
             summary: "test candidate".into(),
+            frame_sample_step: 1,
         }
     }
 
@@ -3379,7 +4317,11 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     fn create_three_frame_animation(test_dir: &TestDir) -> String {
-        create_animation(test_dir, "three-frame-input.apng", &["red", "green", "blue"])
+        create_animation(
+            test_dir,
+            "three-frame-input.apng",
+            &["red", "green", "blue"],
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -3436,6 +4378,23 @@ mod tests {
         output_path
     }
 
+    #[cfg(target_os = "windows")]
+    fn sparse_sprite_frame(
+        width: u32,
+        height: u32,
+        sprite_origin: Option<(u32, u32)>,
+    ) -> RgbaImage {
+        let mut pixels = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+        if let Some((origin_x, origin_y)) = sprite_origin {
+            for y in origin_y..origin_y + 3 {
+                for x in origin_x..origin_x + 3 {
+                    pixels.put_pixel(x, y, Rgba([255, 32, 64, 255]));
+                }
+            }
+        }
+        pixels
+    }
+
     fn approx_eq(left: f64, right: f64) -> bool {
         (left - right).abs() <= 0.03
     }
@@ -3467,6 +4426,27 @@ mod tests {
     }
 
     #[test]
+    fn search_stops_after_within_limit_when_remaining_similarity_is_lower() {
+        let best = build_selected_output("best", 1, 500_000, 0.93);
+        let mut candidate = build_test_candidate("lower", 12);
+        candidate.source_similarity_score = 0.92;
+
+        assert!(remaining_candidate_cannot_beat_within_limit(
+            Some(&best),
+            &candidate
+        ));
+
+        candidate.source_similarity_score = 0.93;
+        assert!(!remaining_candidate_cannot_beat_within_limit(
+            Some(&best),
+            &candidate
+        ));
+        assert!(!remaining_candidate_cannot_beat_within_limit(
+            None, &candidate
+        ));
+    }
+
+    #[test]
     fn normalize_selected_frame_indexes_converts_ui_ids_to_zero_based_indexes() {
         assert_eq!(
             normalize_selected_frame_indexes(Some(&vec![7, 1, 3, 7])),
@@ -3476,22 +4456,52 @@ mod tests {
 
     #[test]
     fn build_filter_graph_retimes_selected_frames_before_fps_resampling() {
-        let graph = build_filter_graph("contain", 12, 1.0, Some(320), Some(320), None, Some(&[0, 6]));
+        let graph = build_filter_graph(
+            "contain",
+            12,
+            1.0,
+            Some(320),
+            Some(320),
+            None,
+            Some(&[0, 6]),
+        );
 
         assert!(graph.contains("select='eq(n,0)+eq(n,6)',setpts=N/(12*TB),fps=12"));
         assert!(!graph.contains("select='eq(n,0)+eq(n,6)',fps=12"));
     }
 
     #[test]
+    fn build_source_frame_select_filter_orders_unique_frame_indexes() {
+        let frame_indexes = BTreeSet::from([4, 0, 2]);
+
+        assert_eq!(
+            build_source_frame_select_filter(&frame_indexes),
+            "select='eq(n,0)+eq(n,2)+eq(n,4)',format=rgba"
+        );
+    }
+
+    #[test]
     fn scaled_output_dimensions_preserve_smaller_sources() {
-        assert_eq!(scaled_output_dimensions(Some(200), Some(120), 1.0), (200, 120));
-        assert_eq!(scaled_output_dimensions(Some(200), Some(120), 0.5), (100, 60));
+        assert_eq!(
+            scaled_output_dimensions(Some(200), Some(120), 1.0),
+            (200, 120)
+        );
+        assert_eq!(
+            scaled_output_dimensions(Some(200), Some(120), 0.5),
+            (100, 60)
+        );
     }
 
     #[test]
     fn scaled_output_dimensions_cap_larger_sources_to_max_320() {
-        assert_eq!(scaled_output_dimensions(Some(640), Some(320), 1.0), (320, 160));
-        assert_eq!(scaled_output_dimensions(Some(200), Some(500), 1.0), (128, 320));
+        assert_eq!(
+            scaled_output_dimensions(Some(640), Some(320), 1.0),
+            (320, 160)
+        );
+        assert_eq!(
+            scaled_output_dimensions(Some(200), Some(500), 1.0),
+            (128, 320)
+        );
     }
 
     #[test]
@@ -3503,6 +4513,113 @@ mod tests {
         assert_eq!(apng_prediction_for_preset("standard"), "paeth");
         assert_eq!(apng_prediction_for_preset("compact"), "mixed");
         assert_eq!(apng_prediction_for_preset("compactPlus"), "mixed");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sidecar_candidate_paths_include_packaged_windows_binary_name() {
+        let exe_path = Path::new("C:/StickerFit/StickerFit.exe");
+        let paths = sidecar_candidate_paths_for_exe("ffmpeg", Some(exe_path));
+        let normalized = paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            normalized.iter().any(|path| path.ends_with("/ffmpeg.exe")),
+            "packaged Tauri sidecars are copied beside the executable as ffmpeg.exe"
+        );
+        assert!(
+            normalized
+                .iter()
+                .any(|path| path.ends_with("/ffmpeg-x86_64-pc-windows-msvc.exe")),
+            "development sidecar name should remain available"
+        );
+    }
+
+    fn png_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(chunk_type);
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn read_png_animation_metadata_does_not_require_decodable_pixels() {
+        let test_dir = TestDir::new("apng-metadata-only");
+        let input_path = test_dir.path.join("metadata-only.png");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes.extend_from_slice(&png_chunk(
+            b"IHDR",
+            &[0, 0, 0, 48, 0, 0, 0, 32, 8, 6, 0, 0, 0],
+        ));
+        bytes.extend_from_slice(&png_chunk(b"acTL", &[0, 0, 0, 2, 0, 0, 0, 0]));
+
+        let mut first_frame = [0u8; 26];
+        first_frame[20..22].copy_from_slice(&12u16.to_be_bytes());
+        first_frame[22..24].copy_from_slice(&100u16.to_be_bytes());
+        bytes.extend_from_slice(&png_chunk(b"fcTL", &first_frame));
+
+        let mut second_frame = [0u8; 26];
+        second_frame[20..22].copy_from_slice(&24u16.to_be_bytes());
+        second_frame[22..24].copy_from_slice(&100u16.to_be_bytes());
+        bytes.extend_from_slice(&png_chunk(b"fcTL", &second_frame));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        fs::write(&input_path, bytes).expect("metadata-only png should be written");
+
+        let metadata = read_png_animation_metadata(&input_path)
+            .expect("metadata parser should read valid chunks")
+            .expect("acTL should mark this as APNG metadata");
+
+        assert_eq!(metadata.width, 48);
+        assert_eq!(metadata.height, 32);
+        assert_eq!(metadata.frame_count, Some(2));
+        assert_eq!(metadata.frame_durations.len(), 2);
+        assert!(approx_eq(metadata.frame_durations[0], 0.12));
+        assert!(approx_eq(metadata.frame_durations[1], 0.24));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn write_native_apng_preserves_sparse_changed_regions() {
+        let test_dir = TestDir::new("apng-sparse-delta");
+        let output_path = test_dir.path.join("sparse-delta.png");
+        let expected_frames = vec![
+            StickerFrame {
+                pixels: sparse_sprite_frame(16, 16, Some((2, 2))),
+                duration_seconds: 0.10,
+            },
+            StickerFrame {
+                pixels: sparse_sprite_frame(16, 16, Some((9, 2))),
+                duration_seconds: 0.12,
+            },
+            StickerFrame {
+                pixels: sparse_sprite_frame(16, 16, None),
+                duration_seconds: 0.14,
+            },
+            StickerFrame {
+                pixels: sparse_sprite_frame(16, 16, Some((4, 10))),
+                duration_seconds: 0.16,
+            },
+        ];
+
+        write_native_apng(&output_path, &expected_frames, "compact")
+            .expect("sparse APNG should be written");
+
+        let decoded_frames = decode_apng_animation_frames(output_path.to_string_lossy().as_ref())
+            .expect("sparse APNG should decode");
+
+        assert_eq!(decoded_frames.len(), expected_frames.len());
+        for (decoded, expected) in decoded_frames.iter().zip(expected_frames.iter()) {
+            assert_eq!(decoded.pixels.as_raw(), expected.pixels.as_raw());
+            assert!(approx_eq(
+                decoded.duration_seconds,
+                expected.duration_seconds
+            ));
+        }
     }
 
     #[test]
@@ -3590,6 +4707,95 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn extract_frame_preview_internal_returns_static_png_data_url_for_animation_frame() {
+        let test_dir = TestDir::new("frame-preview");
+        let input_path = create_three_frame_animation(&test_dir);
+
+        let first = extract_frame_preview_internal(&input_path, 1, UiLocale::En);
+        let second = extract_frame_preview_internal(&input_path, 2, UiLocale::En);
+
+        assert!(first.ok, "first frame preview should succeed");
+        assert!(second.ok, "second frame preview should succeed");
+        assert_eq!(first.width, Some(48));
+        assert_eq!(first.height, Some(48));
+        assert!(
+            first
+                .data_url
+                .as_deref()
+                .is_some_and(|value| value.starts_with("data:image/png;base64,")),
+            "frame preview should be a PNG data URL"
+        );
+        assert_ne!(first.data_url, second.data_url);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn extract_frame_previews_internal_batches_static_png_data_urls() {
+        let test_dir = TestDir::new("frame-preview-batch");
+        let input_path = create_three_frame_animation(&test_dir);
+
+        let response = extract_frame_previews_internal(&input_path, &[1, 2, 3], UiLocale::En);
+
+        assert!(response.ok, "batch frame preview should succeed");
+        assert_eq!(response.previews.len(), 3);
+        assert_eq!(response.previews[0].source_frame_id, 1);
+        assert_eq!(response.previews[1].source_frame_id, 2);
+        assert_eq!(response.previews[2].source_frame_id, 3);
+        assert!(
+            response
+                .previews
+                .iter()
+                .all(|preview| preview.data_url.starts_with("data:image/png;base64,")),
+            "all frame previews should be PNG data URLs"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn configured_sample_gif_extracts_static_frame_preview() {
+        let Some(sample_dir) = std::env::var_os("STICKERFIT_SAMPLE_GIF_DIR").map(PathBuf::from)
+        else {
+            return;
+        };
+
+        let mut gif_paths = fs::read_dir(&sample_dir)
+            .expect("sample GIF directory should be readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+            })
+            .collect::<Vec<_>>();
+        gif_paths.sort();
+        let sample_path = gif_paths
+            .first()
+            .expect("sample GIF directory should contain at least one GIF");
+        let input_path = sample_path.to_string_lossy();
+
+        let inspection = inspect_input_media_internal(&input_path, UiLocale::En);
+        assert!(inspection.ok, "sample GIF inspection should succeed");
+        assert_eq!(inspection.format_name.as_deref(), Some("gif"));
+        assert!(
+            inspection.estimated_frames.unwrap_or_default() > 0,
+            "sample GIF should expose at least one frame"
+        );
+
+        let preview = extract_frame_preview_internal(&input_path, 1, UiLocale::En);
+        assert!(preview.ok, "sample GIF frame preview should succeed");
+        assert_eq!(preview.width, inspection.width);
+        assert_eq!(preview.height, inspection.height);
+        assert!(
+            preview
+                .data_url
+                .as_deref()
+                .is_some_and(|value| value.starts_with("data:image/png;base64,")),
+            "sample GIF frame preview should be a PNG data URL"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn inspect_input_media_internal_prefers_native_mp4_metadata_when_sample_exists() {
         let sample_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -3602,7 +4808,10 @@ mod tests {
         let inspection =
             inspect_input_media_internal(sample_path.to_string_lossy().as_ref(), UiLocale::En);
 
-        assert!(inspection.ok, "inspection should succeed for the repository mp4 sample");
+        assert!(
+            inspection.ok,
+            "inspection should succeed for the repository mp4 sample"
+        );
         assert_eq!(inspection.tool_source.as_deref(), Some("native"));
         assert_eq!(inspection.format_name.as_deref(), Some("mp4"));
         assert!(inspection.width.unwrap_or_default() > 0);
@@ -3628,7 +4837,10 @@ mod tests {
         let inspection =
             inspect_input_media_internal(sample_path.to_string_lossy().as_ref(), UiLocale::En);
 
-        assert!(inspection.ok, "inspection should succeed for the repository webm sample");
+        assert!(
+            inspection.ok,
+            "inspection should succeed for the repository webm sample"
+        );
         assert_eq!(inspection.tool_source.as_deref(), Some("sidecar"));
         assert_eq!(inspection.format_name.as_deref(), Some("matroska,webm"));
         assert!(inspection.width.unwrap_or_default() > 0);
@@ -3641,6 +4853,176 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "set STICKERFIT_SAMPLE_GIF_DIR to run local GIF sample optimization"]
+    fn sample_gif_folder_optimizes_to_discord_limit() {
+        let sample_dir = std::env::var_os("STICKERFIT_SAMPLE_GIF_DIR")
+            .map(PathBuf::from)
+            .expect("STICKERFIT_SAMPLE_GIF_DIR must point at a folder of GIF samples");
+        let output_root = std::env::var_os("STICKERFIT_SAMPLE_GIF_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("stickerfit-sample-gif-output")
+            });
+        let preset_strategy =
+            std::env::var("STICKERFIT_SAMPLE_GIF_PRESET").unwrap_or_else(|_| "auto".into());
+        let search_depth = std::env::var("STICKERFIT_SAMPLE_GIF_SEARCH_DEPTH")
+            .unwrap_or_else(|_| "standard".into());
+        let run_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let output_dir = output_root.join(format!("{}-{}", std::process::id(), run_id));
+        fs::create_dir_all(&output_dir).expect("sample output directory should be created");
+
+        let mut gif_paths = fs::read_dir(&sample_dir)
+            .expect("sample GIF directory should be readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+            })
+            .collect::<Vec<_>>();
+        gif_paths.sort();
+        assert!(
+            !gif_paths.is_empty(),
+            "sample GIF directory should contain at least one .gif file"
+        );
+
+        println!("SAMPLE_GIF_OUTPUT_DIR\t{}", output_dir.display());
+        println!("SAMPLE_GIF_SETTINGS\tpreset={preset_strategy}\tsearch_depth={search_depth}");
+        let mut failures = Vec::new();
+
+        for path in gif_paths {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<non-utf8>");
+            let input_path = path.to_string_lossy().into_owned();
+            let input_size = fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+
+            let inspect_started = Instant::now();
+            let inspection = inspect_input_media_internal(&input_path, UiLocale::En);
+            let inspect_elapsed_ms = inspect_started.elapsed().as_millis();
+
+            println!(
+                "INSPECT\t{}\tok={}\tinput_bytes={}\t{}x{}\tduration={:.3}\tframes={}\tfps={:.3}\telapsed_ms={}",
+                file_name,
+                inspection.ok,
+                input_size,
+                inspection.width.unwrap_or_default(),
+                inspection.height.unwrap_or_default(),
+                inspection.duration_seconds.unwrap_or_default(),
+                inspection.estimated_frames.unwrap_or_default(),
+                inspection.avg_fps.unwrap_or_default(),
+                inspect_elapsed_ms
+            );
+
+            if !inspection.ok {
+                failures.push(format!(
+                    "{file_name}: inspect failed: {}",
+                    inspection.error_message.unwrap_or_default()
+                ));
+                continue;
+            }
+
+            let optimize_started = Instant::now();
+            let response = run_optimizer_search_internal(
+                OptimizerSearchRequest {
+                    input_path: input_path.clone(),
+                    output_directory: Some(output_dir.to_string_lossy().into_owned()),
+                    locale: Some("en".into()),
+                    source_duration_seconds: inspection.duration_seconds,
+                    input_width: inspection.width,
+                    input_height: inspection.height,
+                    avg_fps: inspection.avg_fps,
+                    fit_mode: "contain".into(),
+                    preset_strategy: Some(preset_strategy.clone()),
+                    optimizer_goal: None,
+                    quality_frame_drop_interval: None,
+                    search_depth: Some(search_depth.clone()),
+                    crop_region: None,
+                    selected_frames: None,
+                    base_frame_count: inspection
+                        .estimated_frames
+                        .and_then(|frame_count| u32::try_from(frame_count).ok()),
+                    timeline_frames: None,
+                },
+                UiLocale::En,
+            );
+            let optimize_elapsed_ms = optimize_started.elapsed().as_millis();
+
+            println!(
+                "OPTIMIZE\t{}\tok={}\tbest_within_limit={}\tbest_bytes={}\tattempts={}\tstop={}\tselected={:.3}\telapsed_ms={}\toutput={}",
+                file_name,
+                response.ok,
+                response.best_within_limit,
+                response.best_size_bytes.unwrap_or_default(),
+                response.real_attempt_count,
+                response.stop_reason.as_deref().unwrap_or("-"),
+                response.selected_duration_seconds.unwrap_or_default(),
+                optimize_elapsed_ms,
+                response.best_output_path.as_deref().unwrap_or("-")
+            );
+
+            if !response.ok || !response.best_within_limit {
+                failures.push(format!(
+                    "{file_name}: optimizer failed: {}",
+                    response
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| response.summary.clone())
+                ));
+                continue;
+            }
+
+            let Some(best_output_path) = response.best_output_path.as_deref() else {
+                failures.push(format!(
+                    "{file_name}: optimizer did not keep an output path"
+                ));
+                continue;
+            };
+            let Some(best_size_bytes) = response.best_size_bytes else {
+                failures.push(format!("{file_name}: optimizer did not report output size"));
+                continue;
+            };
+
+            if best_size_bytes > DISCORD_MAX_STICKER_BYTES {
+                failures.push(format!(
+                    "{file_name}: output exceeded Discord limit: {best_size_bytes} bytes"
+                ));
+                continue;
+            }
+
+            let output_inspection = inspect_input_media_internal(best_output_path, UiLocale::En);
+            if !output_inspection.ok {
+                failures.push(format!(
+                    "{file_name}: output inspection failed: {}",
+                    output_inspection.error_message.unwrap_or_default()
+                ));
+                continue;
+            }
+
+            if output_inspection.width.unwrap_or_default() > 320
+                || output_inspection.height.unwrap_or_default() > 320
+            {
+                failures.push(format!(
+                    "{file_name}: output dimensions exceeded 320x320: {}x{}",
+                    output_inspection.width.unwrap_or_default(),
+                    output_inspection.height.unwrap_or_default()
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn inspect_input_media_internal_marks_png_as_convertible_static_image() {
         let test_dir = TestDir::new("static-png-inspection");
         let input_path = create_static_image(&test_dir, "input.png", "red");
@@ -3648,7 +5030,10 @@ mod tests {
         let inspection = inspect_input_media_internal(&input_path, UiLocale::En);
 
         assert!(inspection.ok, "inspection should succeed");
-        assert!(inspection.is_static_image, "png should be treated as a static image");
+        assert!(
+            inspection.is_static_image,
+            "png should be treated as a static image"
+        );
         assert!(
             inspection.can_convert_to_png,
             "png sources should still expose the conversion path for cropped export"
@@ -3693,7 +5078,10 @@ mod tests {
             .output_path
             .clone()
             .expect("conversion should produce an output path");
-        assert!(Path::new(&output_path).is_file(), "converted png should exist");
+        assert!(
+            Path::new(&output_path).is_file(),
+            "converted png should exist"
+        );
         assert!(
             output_path.ends_with(".png"),
             "converted output should be a png file"
@@ -3753,7 +5141,10 @@ mod tests {
             .output_path
             .clone()
             .expect("conversion should produce an output path");
-        assert!(Path::new(&output_path).is_file(), "converted png should exist");
+        assert!(
+            Path::new(&output_path).is_file(),
+            "converted png should exist"
+        );
         assert_ne!(
             output_path.replace('\\', "/"),
             input_path.replace('\\', "/"),
@@ -3797,7 +5188,10 @@ mod tests {
         assert_eq!(result.tool_source, "native");
         assert_eq!(result.tool_command, None);
 
-        let inspection = inspect_input_media_internal(result.output_path.to_string_lossy().as_ref(), UiLocale::En);
+        let inspection = inspect_input_media_internal(
+            result.output_path.to_string_lossy().as_ref(),
+            UiLocale::En,
+        );
         let frame_durations = inspection
             .frame_durations_seconds
             .expect("encoded timeline should report frame durations");
@@ -3828,6 +5222,8 @@ mod tests {
                 avg_fps: Some(7.0),
                 fit_mode: "contain".into(),
                 preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
                 search_depth: None,
                 crop_region: None,
                 selected_frames: None,
@@ -3850,9 +5246,15 @@ mod tests {
             UiLocale::En,
         );
 
-        assert!(!response.attempts.is_empty(), "search should try at least one candidate");
         assert!(
-            response.attempts.iter().any(|attempt| attempt.output_path.is_some()),
+            !response.attempts.is_empty(),
+            "search should try at least one candidate"
+        );
+        assert!(
+            response
+                .attempts
+                .iter()
+                .any(|attempt| attempt.output_path.is_some()),
             "timeline search should produce at least one encoded output",
         );
     }
@@ -3870,6 +5272,8 @@ mod tests {
                 avg_fps: Some(7.0),
                 fit_mode: "contain".into(),
                 preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
                 search_depth: None,
                 crop_region: None,
                 selected_frames: Some(Vec::new()),
@@ -3900,6 +5304,8 @@ mod tests {
                 avg_fps: Some(7.0),
                 fit_mode: "contain".into(),
                 preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
                 search_depth: None,
                 crop_region: None,
                 selected_frames: Some(vec![8]),
@@ -3910,7 +5316,10 @@ mod tests {
         );
 
         assert!(!response.ok);
-        assert_eq!(response.error_code.as_deref(), Some("invalid-frame-selection"));
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some("invalid-frame-selection")
+        );
         assert_eq!(
             response.error_message.as_deref(),
             Some("The selected frame list does not match the available frame markers.")
@@ -3928,6 +5337,8 @@ mod tests {
                 avg_fps: Some(7.0),
                 fit_mode: "contain".into(),
                 preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
                 search_depth: None,
                 crop_region: None,
                 selected_frames: Some(vec![1, 3, 7]),
@@ -3940,13 +5351,16 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.selected_duration_seconds, Some(3.0 / 7.0));
         assert_eq!(
-            response.candidates.first().map(|candidate| candidate.duration_seconds),
+            response
+                .candidates
+                .first()
+                .map(|candidate| candidate.duration_seconds),
             Some(3.0 / 7.0)
         );
     }
 
     #[test]
-    fn prepare_optimizer_plan_rejects_frame_selection_that_cannot_fit_five_seconds() {
+    fn prepare_optimizer_plan_samples_long_frame_selection_to_fit_five_seconds() {
         let response = prepare_optimizer_plan(
             &OptimizerPlanRequest {
                 locale: Some("en".into()),
@@ -3956,10 +5370,72 @@ mod tests {
                 avg_fps: Some(24.0),
                 fit_mode: "contain".into(),
                 preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
                 search_depth: None,
                 crop_region: None,
-                selected_frames: Some((1..=121).collect()),
-                base_frame_count: Some(121),
+                selected_frames: Some((1..=189).collect()),
+                base_frame_count: Some(189),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+        );
+
+        assert!(response.ok);
+        assert!(response
+            .candidates
+            .iter()
+            .any(|candidate| candidate.frame_sample_step > 1
+                && candidate.duration_seconds <= DISCORD_MAX_DURATION_SECONDS));
+    }
+
+    #[test]
+    fn quality_goal_removes_every_nth_frame_from_selection() {
+        let response = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: Some("en".into()),
+                source_duration_seconds: Some(1.0),
+                input_width: Some(48),
+                input_height: Some(48),
+                avg_fps: Some(9.0),
+                fit_mode: "contain".into(),
+                preset_strategy: None,
+                optimizer_goal: Some("quality".into()),
+                quality_frame_drop_interval: Some(3),
+                search_depth: None,
+                crop_region: None,
+                selected_frames: Some((1..=9).collect()),
+                base_frame_count: Some(9),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+        );
+
+        assert!(response.ok);
+        assert_eq!(response.selected_duration_seconds, Some(6.0 / 9.0));
+        assert!(response
+            .candidates
+            .iter()
+            .all(|candidate| candidate.frame_sample_step == 1));
+    }
+
+    #[test]
+    fn quality_goal_zero_frame_drop_disables_automatic_sampling() {
+        let response = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: Some("en".into()),
+                source_duration_seconds: Some(8.0),
+                input_width: Some(48),
+                input_height: Some(48),
+                avg_fps: Some(24.0),
+                fit_mode: "contain".into(),
+                preset_strategy: None,
+                optimizer_goal: Some("quality".into()),
+                quality_frame_drop_interval: Some(0),
+                search_depth: None,
+                crop_region: None,
+                selected_frames: Some((1..=189).collect()),
+                base_frame_count: Some(189),
                 timeline_frames: None,
             },
             UiLocale::En,
@@ -3967,6 +5443,35 @@ mod tests {
 
         assert!(!response.ok);
         assert_eq!(response.error_code.as_deref(), Some("duration-too-long"));
+    }
+
+    #[test]
+    fn motion_goal_keeps_frames_when_duration_can_fit() {
+        let response = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: Some("en".into()),
+                source_duration_seconds: Some(5.88),
+                input_width: Some(100),
+                input_height: Some(100),
+                avg_fps: Some(8.333),
+                fit_mode: "contain".into(),
+                preset_strategy: None,
+                optimizer_goal: Some("motion".into()),
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: Some((1..=49).collect()),
+                base_frame_count: Some(49),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+        );
+
+        assert!(response.ok);
+        assert!(response
+            .candidates
+            .iter()
+            .all(|candidate| candidate.frame_sample_step == 1));
     }
 
     #[test]
@@ -4011,6 +5516,8 @@ mod tests {
                 avg_fps: Some(7.0),
                 fit_mode: "contain".into(),
                 preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
                 search_depth: None,
                 crop_region: None,
                 selected_frames: None,
@@ -4035,7 +5542,10 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.selected_duration_seconds, Some(0.72));
-        assert!(response.candidates.iter().all(|candidate| approx_eq(candidate.duration_seconds, 0.72)));
+        assert!(response
+            .candidates
+            .iter()
+            .all(|candidate| approx_eq(candidate.duration_seconds, 0.72)));
     }
 }
 
@@ -4063,6 +5573,60 @@ async fn run_optimizer_search(request: OptimizerSearchRequest) -> OptimizerSearc
             best_output_path: None,
             best_size_bytes: None,
             best_within_limit: false,
+            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
+            error_message: Some(format!(
+                "{} ({error})",
+                locale::internal_task_error_message(locale)
+            )),
+        },
+    }
+}
+
+#[tauri::command]
+async fn extract_frame_preview(
+    input_path: String,
+    source_frame_id: u32,
+    locale: Option<String>,
+) -> FramePreviewResponse {
+    let locale = parse_ui_locale(locale.as_deref());
+
+    match run_blocking_task(move || {
+        extract_frame_preview_internal(&input_path, source_frame_id, locale)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => FramePreviewResponse {
+            ok: false,
+            data_url: None,
+            width: None,
+            height: None,
+            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
+            error_message: Some(format!(
+                "{} ({error})",
+                locale::internal_task_error_message(locale)
+            )),
+        },
+    }
+}
+
+#[tauri::command]
+async fn extract_frame_previews(
+    input_path: String,
+    source_frame_ids: Vec<u32>,
+    locale: Option<String>,
+) -> FramePreviewsResponse {
+    let locale = parse_ui_locale(locale.as_deref());
+
+    match run_blocking_task(move || {
+        extract_frame_previews_internal(&input_path, &source_frame_ids, locale)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => FramePreviewsResponse {
+            ok: false,
+            previews: Vec::new(),
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
             error_message: Some(format!(
                 "{} ({error})",
@@ -4131,9 +5695,10 @@ pub fn run() {
             build_optimizer_plan,
             run_optimizer_search,
             convert_static_image_to_png,
+            extract_frame_preview,
+            extract_frame_previews,
             open_folder_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running StickerFit");
 }
-

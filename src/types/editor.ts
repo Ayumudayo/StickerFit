@@ -31,13 +31,6 @@ export type TimelineDragState = {
   pointerId: number;
 };
 
-export type DragSelectionState = {
-  startInstanceId: string;
-  willSelect: boolean;
-  preDragIds: string[];
-  applyOnPointerUp: boolean;
-};
-
 export type FrameContextMenuState = {
   x: number;
   y: number;
@@ -52,6 +45,7 @@ export type FrameDropTargetState = {
 export type FrameReorderState = {
   pointerId: number;
   draggedInstanceIds: string[];
+  collapseToInstanceIdOnClick?: string;
   startY: number;
   currentY: number;
   active: boolean;

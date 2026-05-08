@@ -5,19 +5,18 @@ import {
   type SetStateAction,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 
 import { releasePointerCaptureIfHeld, resolveFrameDropTargetFromList } from "../../utils/frameDnD";
-import {
-  moveSelectedFramesAroundAnchor,
-} from "../../utils/frameEditing";
+import { buildFramePointerSelection } from "../../utils/frameSelection";
+import { moveSelectedFramesAroundAnchor } from "../../utils/frameEditing";
 import { useFrameContextMenuState } from "./useFrameContextMenuState";
 import { useFrameSelectionCommands } from "./useFrameSelectionCommands";
 import type {
-  DragSelectionState,
   FrameDropTargetState,
   FrameReorderState,
   FrameSelectionModel,
@@ -31,6 +30,21 @@ type UseFrameSelectionInteractionsParams = {
   setTimelineFrames: Dispatch<SetStateAction<TimelineFrame[]>>;
 };
 
+type SingleFrameSelectionOptions = {
+  focus?: boolean;
+};
+
+function findFrameRowElement(container: HTMLDivElement | null, instanceId: string) {
+  if (!container) {
+    return null;
+  }
+
+  return (
+    Array.from(container.querySelectorAll<HTMLButtonElement>("[data-instance-id]"))
+      .find((element) => element.dataset.instanceId === instanceId) ?? null
+  );
+}
+
 export function useFrameSelectionInteractions({
   timelineFrames,
   timelineFrameViews,
@@ -40,15 +54,17 @@ export function useFrameSelectionInteractions({
   const [frameDropTarget, setFrameDropTarget] = useState<FrameDropTargetState | null>(null);
   const [frameReorderState, setFrameReorderState] = useState<FrameReorderState | null>(null);
 
-  const dragSelectionActionRef = useRef<DragSelectionState | null>(null);
   const frameTableBodyRef = useRef<HTMLDivElement | null>(null);
   const selectionAnchorInstanceIdRef = useRef<string | null>(null);
-  const didDragSelectRef = useRef(false);
   const frameReorderStateRef = useRef<FrameReorderState | null>(null);
   const frameDropTargetRef = useRef<FrameDropTargetState | null>(null);
   const selectedInstanceIdSet = useMemo(
     () => new Set(selectedInstanceIds),
     [selectedInstanceIds],
+  );
+  const orderedFrameIds = useMemo(
+    () => timelineFrameViews.map((frame) => frame.instanceId),
+    [timelineFrameViews],
   );
 
   const selectedTimelineFrames = useMemo(
@@ -88,9 +104,7 @@ export function useFrameSelectionInteractions({
     frameReorderStateRef.current = null;
     setFrameDropTarget(null);
     setFrameReorderState(null);
-    dragSelectionActionRef.current = null;
     selectionAnchorInstanceIdRef.current = null;
-    didDragSelectRef.current = false;
   }, [setFrameContextMenu]);
 
   const updateFrameDropTarget = useCallback((nextTarget: FrameDropTargetState | null) => {
@@ -111,90 +125,119 @@ export function useFrameSelectionInteractions({
     setFrameReorderState(nextState);
   }, []);
 
-  const frameIdsInRange = useCallback(
-    (startInstanceId: string, endInstanceId: string) => {
-      const startIndex = timelineFrameViews.findIndex(
-        (frame) => frame.instanceId === startInstanceId,
-      );
-      const endIndex = timelineFrameViews.findIndex(
-        (frame) => frame.instanceId === endInstanceId,
-      );
-      if (startIndex === -1 || endIndex === -1) {
-        return [] as string[];
+  const scrollFrameIntoView = useCallback((instanceId: string) => {
+    findFrameRowElement(frameTableBodyRef.current, instanceId)?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+    });
+  }, []);
+
+  const focusFrame = useCallback((instanceId: string) => {
+    const targetElement = findFrameRowElement(frameTableBodyRef.current, instanceId);
+    targetElement?.focus({ preventScroll: true });
+    scrollFrameIntoView(instanceId);
+  }, [scrollFrameIntoView]);
+
+  const selectSingleFrame = useCallback(
+    (instanceId: string, options: SingleFrameSelectionOptions = {}) => {
+      if (!orderedFrameIds.includes(instanceId)) {
+        return false;
       }
 
-      const minIndex = Math.min(startIndex, endIndex);
-      const maxIndex = Math.max(startIndex, endIndex);
-      return timelineFrameViews
-        .slice(minIndex, maxIndex + 1)
-        .map((frame) => frame.instanceId);
-    },
-    [timelineFrameViews],
-  );
+      setSelectedInstanceIds((current) =>
+        current.length === 1 && current[0] === instanceId ? current : [instanceId],
+      );
+      selectionAnchorInstanceIdRef.current = instanceId;
+      updateFrameReorderState(null);
+      updateFrameDropTarget(null);
 
-  const applyFrameSelectionRange = useCallback(
-    (
-      startInstanceId: string,
-      endInstanceId: string,
-      preDragIds: string[],
-      willSelect: boolean,
-    ) => {
-      const nextSelectedIds = new Set<string>(preDragIds);
-
-      for (const instanceId of frameIdsInRange(startInstanceId, endInstanceId)) {
-        if (willSelect) {
-          nextSelectedIds.add(instanceId);
-        } else {
-          nextSelectedIds.delete(instanceId);
-        }
+      if (options.focus) {
+        focusFrame(instanceId);
+      } else {
+        scrollFrameIntoView(instanceId);
       }
 
-      return Array.from(nextSelectedIds);
+      return true;
     },
-    [frameIdsInRange],
+    [
+      focusFrame,
+      orderedFrameIds,
+      scrollFrameIntoView,
+      updateFrameDropTarget,
+      updateFrameReorderState,
+    ],
   );
 
-  const commitPendingFrameSelection = useCallback(() => {
-    const pendingSelection = dragSelectionActionRef.current;
-    if (!pendingSelection) {
-      didDragSelectRef.current = false;
+  const selectAdjacentFrame = useCallback(
+    (direction: -1 | 1, anchorInstanceId?: string | null) => {
+      if (orderedFrameIds.length === 0) {
+        return false;
+      }
+
+      const selectedAnchorInstanceId = selectedInstanceIds[selectedInstanceIds.length - 1];
+      const resolvedAnchorInstanceId =
+        anchorInstanceId && orderedFrameIds.includes(anchorInstanceId)
+          ? anchorInstanceId
+          : selectedAnchorInstanceId && orderedFrameIds.includes(selectedAnchorInstanceId)
+            ? selectedAnchorInstanceId
+            : null;
+      const currentIndex = resolvedAnchorInstanceId
+        ? orderedFrameIds.indexOf(resolvedAnchorInstanceId)
+        : direction > 0
+          ? -1
+          : 0;
+      const nextIndex = (currentIndex + direction + orderedFrameIds.length) % orderedFrameIds.length;
+      const nextInstanceId = orderedFrameIds[nextIndex];
+      if (!nextInstanceId) {
+        return false;
+      }
+
+      return selectSingleFrame(nextInstanceId, { focus: true });
+    },
+    [
+      orderedFrameIds,
+      selectSingleFrame,
+      selectedInstanceIds,
+    ],
+  );
+
+  useLayoutEffect(() => {
+    const focusedSelectionId = selectedInstanceIds[selectedInstanceIds.length - 1];
+    if (!focusedSelectionId) {
       return;
     }
 
-    if (pendingSelection.applyOnPointerUp && !didDragSelectRef.current) {
-      setSelectedInstanceIds(
-        applyFrameSelectionRange(
-          pendingSelection.startInstanceId,
-          pendingSelection.startInstanceId,
-          pendingSelection.preDragIds,
-          pendingSelection.willSelect,
-        ),
-      );
-    }
-
-    dragSelectionActionRef.current = null;
-    didDragSelectRef.current = false;
-  }, [applyFrameSelectionRange]);
+    scrollFrameIntoView(focusedSelectionId);
+  }, [scrollFrameIntoView, selectedInstanceIds, timelineFrameViews]);
 
   const handleFramePointerDown = useCallback(
     (instanceId: string, event: ReactPointerEvent<HTMLButtonElement>) => {
       if (event.pointerType === "mouse" && event.button !== 0) return;
 
-      didDragSelectRef.current = false;
+      const usesSelectionModifier = event.ctrlKey || event.metaKey || event.shiftKey;
+
+      if (usesSelectionModifier) {
+        const nextSelection = buildFramePointerSelection({
+          orderedFrameIds,
+          selectedInstanceIds,
+          anchorInstanceId: selectionAnchorInstanceIdRef.current,
+          targetInstanceId: instanceId,
+          ctrlKey: event.ctrlKey || event.metaKey,
+          shiftKey: event.shiftKey,
+        });
+        setSelectedInstanceIds(nextSelection.selectedInstanceIds);
+        selectionAnchorInstanceIdRef.current = nextSelection.anchorInstanceId;
+        updateFrameReorderState(null);
+        updateFrameDropTarget(null);
+        releasePointerCaptureIfHeld(event.currentTarget, event.pointerId);
+        return;
+      }
 
       if (selectedInstanceIdSet.has(instanceId)) {
-        const draggedInstanceIds =
-          selectedInstanceIds.length === timelineFrameViews.length
-            ? [instanceId]
-            : selectedInstanceIds;
-
-        if (draggedInstanceIds.length === 1 && selectedInstanceIds.length !== 1) {
-          setSelectedInstanceIds(draggedInstanceIds);
-        }
-
         updateFrameReorderState({
           pointerId: event.pointerId,
-          draggedInstanceIds,
+          draggedInstanceIds: selectedInstanceIds,
+          collapseToInstanceIdOnClick: instanceId,
           startY: event.clientY,
           currentY: event.clientY,
           active: false,
@@ -204,17 +247,16 @@ export function useFrameSelectionInteractions({
         return;
       }
 
-      const startInstanceId = instanceId;
-      const preDragIds: string[] = [];
-      const willSelect = true;
-
-      dragSelectionActionRef.current = {
-        startInstanceId,
-        willSelect,
-        preDragIds,
-        applyOnPointerUp: true,
-      };
+      setSelectedInstanceIds([instanceId]);
       selectionAnchorInstanceIdRef.current = instanceId;
+      updateFrameReorderState({
+        pointerId: event.pointerId,
+        draggedInstanceIds: [instanceId],
+        collapseToInstanceIdOnClick: instanceId,
+        startY: event.clientY,
+        currentY: event.clientY,
+        active: false,
+      });
 
       releasePointerCaptureIfHeld(event.currentTarget, event.pointerId);
       return;
@@ -222,40 +264,37 @@ export function useFrameSelectionInteractions({
     [
       selectedInstanceIdSet,
       selectedInstanceIds,
+      orderedFrameIds,
       timelineFrameViews.length,
+      updateFrameDropTarget,
       updateFrameReorderState,
     ],
   );
 
-  const handleFramePointerEnter = useCallback(
-    (instanceId: string) => {
-      if (!dragSelectionActionRef.current) return;
-
-      const { startInstanceId, willSelect, preDragIds } = dragSelectionActionRef.current;
-      if (startInstanceId !== instanceId) {
-        didDragSelectRef.current = true;
-      }
-
-      setSelectedInstanceIds(
-        applyFrameSelectionRange(startInstanceId, instanceId, preDragIds, willSelect),
-      );
-    },
-    [applyFrameSelectionRange],
-  );
-
   const handleFrameKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        const prevElement = event.currentTarget.previousElementSibling as HTMLButtonElement | null;
-        prevElement?.focus();
-      } else if (event.key === "ArrowDown") {
-        event.preventDefault();
-        const nextElement = event.currentTarget.nextElementSibling as HTMLButtonElement | null;
-        nextElement?.focus();
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") {
+        return;
       }
+
+      const currentInstanceId = event.currentTarget.dataset.instanceId;
+      const currentIndex = currentInstanceId
+        ? orderedFrameIds.indexOf(currentInstanceId)
+        : -1;
+      if (currentIndex === -1 || orderedFrameIds.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      selectAdjacentFrame(
+        event.key === "ArrowDown" ? 1 : -1,
+        currentInstanceId,
+      );
     },
-    [],
+    [
+      orderedFrameIds,
+      selectAdjacentFrame,
+    ],
   );
 
   useEffect(() => {
@@ -292,24 +331,27 @@ export function useFrameSelectionInteractions({
       const reorderState = frameReorderStateRef.current;
       const dropTarget = frameDropTargetRef.current;
       if (!reorderState || event.pointerId !== reorderState.pointerId) {
-        commitPendingFrameSelection();
         return;
       }
 
-      if (reorderState.active && dropTarget) {
-        setTimelineFrames((current) =>
-          moveSelectedFramesAroundAnchor(
-            current,
-            reorderState.draggedInstanceIds,
-            dropTarget.anchorInstanceId,
-            dropTarget.position,
-          ),
-        );
+      if (reorderState.active) {
+        if (dropTarget) {
+          setTimelineFrames((current) =>
+            moveSelectedFramesAroundAnchor(
+              current,
+              reorderState.draggedInstanceIds,
+              dropTarget.anchorInstanceId,
+              dropTarget.position,
+            ),
+          );
+        }
+      } else if (reorderState.collapseToInstanceIdOnClick) {
+        setSelectedInstanceIds([reorderState.collapseToInstanceIdOnClick]);
+        selectionAnchorInstanceIdRef.current = reorderState.collapseToInstanceIdOnClick;
       }
 
       updateFrameReorderState(null);
       updateFrameDropTarget(null);
-      commitPendingFrameSelection();
     };
 
     window.addEventListener("pointermove", handlePointerMove);
@@ -320,7 +362,7 @@ export function useFrameSelectionInteractions({
       window.removeEventListener("pointerup", handlePointerEnd);
       window.removeEventListener("pointercancel", handlePointerEnd);
     };
-  }, [commitPendingFrameSelection, setTimelineFrames, updateFrameDropTarget, updateFrameReorderState]);
+  }, [setTimelineFrames, updateFrameDropTarget, updateFrameReorderState]);
 
 
   const {
@@ -353,9 +395,10 @@ export function useFrameSelectionInteractions({
     frameContextMenuRef,
     resetSelectionState,
     handleFramePointerDown,
-    handleFramePointerEnter,
     handleFrameKeyDown,
     handleFrameContextMenu,
+    selectSingleFrame,
+    selectAdjacentFrame,
     selectAllFrames,
     clearAllFrames,
     selectOddFrames,

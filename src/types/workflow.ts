@@ -5,6 +5,8 @@ export type FitMode = "contain" | "cover" | "fill";
 
 export type OptimizerPresetStrategy = "auto" | "quality" | "size";
 
+export type OptimizerGoal = "balanced" | "motion" | "quality";
+
 export type OptimizerSearchDepth = "standard" | "thorough";
 
 export type InputSourceKind = "path" | "file";
@@ -22,6 +24,8 @@ export type OptimizerPlanRequest = {
   avgFps: number | null;
   fitMode: FitMode;
   presetStrategy: OptimizerPresetStrategy;
+  optimizerGoal: OptimizerGoal;
+  qualityFrameDropInterval: number;
   searchDepth: OptimizerSearchDepth;
   cropRegion: CropRegion | null;
   selectedFrames?: number[];
@@ -39,6 +43,41 @@ export type StaticImageConversionRequest = {
   outputDirectory: string | null;
   locale: Locale;
   cropRegion: CropRegion;
+};
+
+export type FramePreviewRequest = {
+  inputPath: string;
+  sourceFrameId: number;
+  locale: Locale;
+};
+
+export type FramePreviewResult = {
+  ok: boolean;
+  dataUrl: string | null;
+  width: number | null;
+  height: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+};
+
+export type FramePreviewsRequest = {
+  inputPath: string;
+  sourceFrameIds: number[];
+  locale: Locale;
+};
+
+export type FramePreviewItem = {
+  sourceFrameId: number;
+  dataUrl: string;
+  width: number;
+  height: number;
+};
+
+export type FramePreviewsResult = {
+  ok: boolean;
+  previews: FramePreviewItem[];
+  errorCode: string | null;
+  errorMessage: string | null;
 };
 
 export type ToolCheck = {

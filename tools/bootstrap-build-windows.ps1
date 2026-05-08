@@ -237,10 +237,10 @@ Push-Location $WorkspaceRoot
 try {
   Invoke-RepoCommand -Command "npm ci"
   Invoke-RepoCommand -Command "powershell -ExecutionPolicy Bypass -File tools/ffmpeg/build-minimal-ffmpeg.ps1 -WorkspaceRoot ""$WorkspaceRoot"" -FfmpegVersion ""$FfmpegVersion"""
-  Invoke-RepoCommand -Command "npm run build:web"
   Invoke-RepoCommand -Command "npm run build:desktop"
 
   if ($RunChecks) {
+    Invoke-RepoCommand -Command "npm run test:release-sidecar"
     Invoke-RepoCommand -Command "npm run test:unit"
     Invoke-RepoCommand -Command "npm run test:rust"
     Invoke-RepoCommand -Command "npm run test:web-smoke"
@@ -248,14 +248,14 @@ try {
 
   Invoke-RepoCommand -Command "npm run report:size"
 
-  $nsisPath = Join-Path $WorkspaceRoot "src-tauri\target\release\bundle\nsis\StickerFit_0.1.0_x64-setup.exe"
-  $msiPath = Join-Path $WorkspaceRoot "src-tauri\target\release\bundle\msi\StickerFit_0.1.0_x64_en-US.msi"
+  $nsisPath = Get-ChildItem (Join-Path $WorkspaceRoot "src-tauri\target\release\bundle\nsis") -Filter "StickerFit_*_x64-setup.exe" -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
   $desktopPath = Join-Path $WorkspaceRoot "src-tauri\target\release\desktop.exe"
 
   Write-Step "Build completed"
   Write-Host "desktop.exe : $desktopPath"
   Write-Host "NSIS bundle : $nsisPath"
-  Write-Host "MSI bundle  : $msiPath"
 }
 finally {
   Pop-Location

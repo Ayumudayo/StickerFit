@@ -4,8 +4,8 @@ import { EditorResultsOverlay } from "./EditorResultsOverlay";
 import { AdvancedOptimizerSettingsPanel } from "./AdvancedOptimizerSettingsPanel";
 import type { Locale, MessagesForLocale } from "../../locales/messages";
 import type {
+  OptimizerGoal,
   OptimizerPlanResponse,
-  OptimizerPresetStrategy,
   OptimizerSearchDepth,
   OptimizerSearchResponse,
 } from "../../types/workflow";
@@ -21,9 +21,11 @@ type EditorOverlayPanelProps = {
   resultsPanelId: string;
   plan: OptimizerPlanResponse | null;
   searchResult: OptimizerSearchResponse | null;
-  optimizerPresetStrategy: OptimizerPresetStrategy;
+  optimizerGoal: OptimizerGoal;
+  qualityFrameDropInterval: number;
   optimizerSearchDepth: OptimizerSearchDepth;
-  onOptimizerPresetStrategyChange: (value: OptimizerPresetStrategy) => void;
+  onOptimizerGoalChange: (value: OptimizerGoal) => void;
+  onQualityFrameDropIntervalChange: (value: number) => void;
   onOptimizerSearchDepthChange: (value: OptimizerSearchDepth) => void;
   onOpenOutputFolder: (path?: string | null) => void;
   onClose: () => void;
@@ -39,9 +41,11 @@ export function EditorOverlayPanel({
   resultsPanelId,
   plan,
   searchResult,
-  optimizerPresetStrategy,
+  optimizerGoal,
+  qualityFrameDropInterval,
   optimizerSearchDepth,
-  onOptimizerPresetStrategyChange,
+  onOptimizerGoalChange,
+  onQualityFrameDropIntervalChange,
   onOptimizerSearchDepthChange,
   onOpenOutputFolder,
   onClose,
@@ -97,9 +101,11 @@ export function EditorOverlayPanel({
               panelId={advancedSettingsPanelId}
               layout="dock"
               copy={copy}
-              optimizerPresetStrategy={optimizerPresetStrategy}
+              optimizerGoal={optimizerGoal}
+              qualityFrameDropInterval={qualityFrameDropInterval}
               optimizerSearchDepth={optimizerSearchDepth}
-              onOptimizerPresetStrategyChange={onOptimizerPresetStrategyChange}
+              onOptimizerGoalChange={onOptimizerGoalChange}
+              onQualityFrameDropIntervalChange={onQualityFrameDropIntervalChange}
               onOptimizerSearchDepthChange={onOptimizerSearchDepthChange}
             />
           ) : null}

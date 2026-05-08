@@ -56,6 +56,8 @@ type PreviewFrameStyle = CSSProperties & {
 
 type MediaSelectionPreviewProps = {
   previewSrc: string;
+  framePreviewSrc?: string | null;
+  requiresFramePreview?: boolean;
   previewKind: PreviewKind;
   sourceWidth: number | null;
   sourceHeight: number | null;
@@ -77,6 +79,8 @@ type MediaSelectionPreviewProps = {
 
 export function MediaSelectionPreview({
   previewSrc,
+  framePreviewSrc = null,
+  requiresFramePreview = false,
   previewKind,
   sourceWidth,
   sourceHeight,
@@ -98,6 +102,7 @@ export function MediaSelectionPreview({
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [dragState, setDragState] = useState<PreviewDragState | null>(null);
   const [previewFailed, setPreviewFailed] = useState(false);
   const [stageViewportWidth, setStageViewportWidth] = useState<number | null>(null);
@@ -124,6 +129,32 @@ export function MediaSelectionPreview({
 
   const selectionEnabled = sourceWidth !== null && sourceHeight !== null;
   const isControlledVideo = previewKind === "video" && typeof isPlaying === "boolean";
+  const shouldRenderVideoFrameCanvas = isControlledVideo && !framePreviewSrc;
+  const shouldHideVideoElement = isControlledVideo;
+
+  const drawVideoFrameToCanvas = useCallback(() => {
+    if (!shouldRenderVideoFrameCanvas) {
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      return;
+    }
+
+    const frameWidth = video.videoWidth || sourceWidth || 1;
+    const frameHeight = video.videoHeight || sourceHeight || 1;
+    if (canvas.width !== frameWidth) {
+      canvas.width = frameWidth;
+    }
+    if (canvas.height !== frameHeight) {
+      canvas.height = frameHeight;
+    }
+
+    const context = canvas.getContext("2d");
+    context?.drawImage(video, 0, 0, frameWidth, frameHeight);
+  }, [shouldRenderVideoFrameCanvas, sourceHeight, sourceWidth]);
 
   const handleMinimapPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!stageRef.current || !scrollState || mediaW === 0 || mediaH === 0) return;
@@ -256,8 +287,14 @@ export function MediaSelectionPreview({
 
     if (Math.abs(video.currentTime - currentTime) > 0.005) {
       video.currentTime = currentTime;
+    } else {
+      requestAnimationFrame(drawVideoFrameToCanvas);
     }
-  }, [currentTime, previewKind]);
+
+    if (isControlledVideo) {
+      video.pause();
+    }
+  }, [currentTime, drawVideoFrameToCanvas, isControlledVideo, previewKind]);
 
   useEffect(() => {
     if (previewKind !== "video" || isPlaying === undefined) {
@@ -269,6 +306,11 @@ export function MediaSelectionPreview({
       return;
     }
 
+    if (isControlledVideo) {
+      video.pause();
+      return;
+    }
+
     if (isPlaying) {
       void video.play().catch(() => {
         // Ignore autoplay interruptions; the transport controls will retry.
@@ -277,7 +319,7 @@ export function MediaSelectionPreview({
     }
 
     video.pause();
-  }, [isPlaying, previewKind]);
+  }, [isControlledVideo, isPlaying, previewKind]);
 
   function restartPlayback(video: HTMLVideoElement) {
     video.currentTime = 0;
@@ -473,49 +515,85 @@ export function MediaSelectionPreview({
         <div ref={stageRef} className="previewStage">
           <div className="previewStageViewport">
             <div className="previewMediaFrame" style={mediaFrameStyle}>
-              {previewKind === "video" ? (
-                <video
-                  ref={videoRef}
-                  className="previewMedia"
-                  src={previewSrc}
+              {framePreviewSrc ? (
+                <img
+                  className="previewMedia previewFrameImage"
+                  data-preview-frame-image="true"
+                  src={framePreviewSrc}
+                  alt={copy.previewSelection}
+                  decoding="async"
                   draggable={false}
-                  autoPlay={!isControlledVideo}
-                  loop={!isControlledVideo}
-                  muted
-                  playsInline
                   onDragStart={handleNativeDragStart}
-                  onLoadedMetadata={(event) =>
-                    onDurationChange?.(event.currentTarget.duration)
-                  }
-                  onTimeUpdate={(event) => {
-                    const nextTime = event.currentTarget.currentTime;
-                    const loopEnd = event.currentTarget.duration;
-
-                    if (
-                      isControlledVideo &&
-                      isPlaying &&
-                      loopEnd > 0.02 &&
-                      nextTime >= loopEnd - 0.02
-                    ) {
-                      restartPlayback(event.currentTarget);
-                      return;
-                    }
-
-                    if (syncVideoTimeToParent) {
-                      onCurrentTimeChange?.(nextTime);
-                    }
-                  }}
-                  onEnded={(event) => {
-                    if (isControlledVideo && isPlaying) {
-                      restartPlayback(event.currentTarget);
-                      return;
-                    }
-
-                    if (syncVideoTimeToParent) {
-                      onCurrentTimeChange?.(event.currentTarget.duration);
-                    }
-                  }}
                   onError={() => setPreviewFailed(true)}
+                />
+              ) : null}
+
+              {previewKind === "video" ? (
+                <>
+                  {shouldRenderVideoFrameCanvas ? (
+                    <canvas
+                      ref={canvasRef}
+                      className="previewMedia previewFrameCanvas"
+                      data-preview-frame-canvas="true"
+                      aria-label={copy.previewSelection}
+                    />
+                  ) : null}
+                  <video
+                    ref={videoRef}
+                    className={shouldHideVideoElement ? "previewVideoSource" : "previewMedia"}
+                    data-preview-video-source={shouldHideVideoElement ? "true" : undefined}
+                    src={previewSrc}
+                    draggable={false}
+                    autoPlay={!isControlledVideo}
+                    loop={!isControlledVideo}
+                    muted
+                    playsInline
+                    onDragStart={handleNativeDragStart}
+                    onLoadedMetadata={(event) => {
+                      onDurationChange?.(event.currentTarget.duration);
+                      if (currentTime !== undefined && isControlledVideo) {
+                        event.currentTarget.currentTime = currentTime;
+                        event.currentTarget.pause();
+                      }
+                    }}
+                    onLoadedData={drawVideoFrameToCanvas}
+                    onSeeked={drawVideoFrameToCanvas}
+                    onTimeUpdate={(event) => {
+                      const nextTime = event.currentTarget.currentTime;
+                      const loopEnd = event.currentTarget.duration;
+
+                      if (
+                        !isControlledVideo &&
+                        isPlaying &&
+                        loopEnd > 0.02 &&
+                        nextTime >= loopEnd - 0.02
+                      ) {
+                        restartPlayback(event.currentTarget);
+                        return;
+                      }
+
+                      if (syncVideoTimeToParent) {
+                        onCurrentTimeChange?.(nextTime);
+                      }
+                    }}
+                    onEnded={(event) => {
+                      if (!isControlledVideo && isPlaying) {
+                        restartPlayback(event.currentTarget);
+                        return;
+                      }
+
+                      if (syncVideoTimeToParent) {
+                        onCurrentTimeChange?.(event.currentTarget.duration);
+                      }
+                    }}
+                    onError={() => setPreviewFailed(true)}
+                  />
+                </>
+              ) : framePreviewSrc ? null : requiresFramePreview ? (
+                <div
+                  className="previewMedia previewFramePending"
+                  data-preview-frame-pending="true"
+                  aria-hidden="true"
                 />
               ) : (
                 <img

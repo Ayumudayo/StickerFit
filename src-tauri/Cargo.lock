@@ -517,7 +517,7 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
- "gif 0.13.3",
+ "base64 0.22.1",
  "image",
  "png 0.18.1",
  "regex",
@@ -1010,16 +1010,6 @@ dependencies = [
 
 [[package]]
 name = "gif"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae047235e33e2829703574b54fdec96bfbad892062d97fed2f76022287de61b"
-dependencies = [
- "color_quant",
- "weezl",
-]
-
-[[package]]
-name = "gif"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5df2ba84018d80c213569363bdcd0c64e6933c67fe4c1d60ecf822971a3c35e"
@@ -1473,7 +1463,7 @@ dependencies = [
  "bytemuck",
  "byteorder-lite",
  "color_quant",
- "gif 0.14.1",
+ "gif",
  "moxcms",
  "num-traits",
  "png 0.18.1",

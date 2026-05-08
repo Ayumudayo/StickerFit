@@ -61,16 +61,26 @@ function Get-CombinedSizeEntry {
   }
 }
 
+$nsisBundle = Get-ChildItem (Join-Path $WorkspaceRoot "src-tauri\target\release\bundle\nsis") -Filter "StickerFit_*_x64-setup.exe" -File -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+$nsisBundlePath = if ($nsisBundle) {
+  $nsisBundle.FullName
+} else {
+  Join-Path $WorkspaceRoot "src-tauri\target\release\bundle\nsis"
+}
+
 $entries = @(
   (Get-CombinedSizeEntry "Estimated installed footprint" @(
     (Join-Path $WorkspaceRoot "src-tauri\target\release\desktop.exe"),
-    (Join-Path $WorkspaceRoot "src-tauri\binaries")
+    (Join-Path $WorkspaceRoot "src-tauri\target\release\ffmpeg.exe"),
+    (Join-Path $WorkspaceRoot "src-tauri\target\release\libwinpthread-1.dll")
   )),
   (Get-SizeEntry "desktop.exe" (Join-Path $WorkspaceRoot "src-tauri\target\release\desktop.exe")),
-  (Get-SizeEntry "ffmpeg sidecar" (Join-Path $WorkspaceRoot "src-tauri\binaries\ffmpeg-x86_64-pc-windows-msvc.exe")),
+  (Get-SizeEntry "packaged ffmpeg sidecar" (Join-Path $WorkspaceRoot "src-tauri\target\release\ffmpeg.exe")),
+  (Get-SizeEntry "runtime DLL" (Join-Path $WorkspaceRoot "src-tauri\target\release\libwinpthread-1.dll")),
   (Get-SizeEntry "dist" (Join-Path $WorkspaceRoot "dist")),
-  (Get-SizeEntry "NSIS bundle" (Join-Path $WorkspaceRoot "src-tauri\target\release\bundle\nsis\StickerFit_0.1.0_x64-setup.exe")),
-  (Get-SizeEntry "MSI bundle" (Join-Path $WorkspaceRoot "src-tauri\target\release\bundle\msi\StickerFit_0.1.0_x64_en-US.msi"))
+  (Get-SizeEntry "NSIS bundle" $nsisBundlePath)
 )
 
 $entries |

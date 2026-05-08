@@ -1,6 +1,10 @@
 import type { Locale } from "../locales/messages";
 import type {
   MediaInspection,
+  FramePreviewRequest,
+  FramePreviewResult,
+  FramePreviewsRequest,
+  FramePreviewsResult,
   OptimizerPlanRequest,
   OptimizerPlanResponse,
   OptimizerSearchRequest,
@@ -55,6 +59,8 @@ export type AppRuntime = {
   convertStaticImageToPng: (
     request: StaticImageConversionRequest,
   ) => Promise<StaticImageConversionResult>;
+  extractFramePreview: (request: FramePreviewRequest) => Promise<FramePreviewResult | null>;
+  extractFramePreviews: (request: FramePreviewsRequest) => Promise<FramePreviewsResult | null>;
   subscribeInputDrops: (handlers: RuntimeDropHandlers) => Promise<() => void>;
 };
 
@@ -417,6 +423,22 @@ const tauriRuntime: AppRuntime = {
       request,
     });
   },
+  async extractFramePreview(request) {
+    const { invoke } = await loadTauriCore();
+    return invoke<FramePreviewResult>("extract_frame_preview", {
+      inputPath: request.inputPath,
+      sourceFrameId: request.sourceFrameId,
+      locale: request.locale,
+    });
+  },
+  async extractFramePreviews(request) {
+    const { invoke } = await loadTauriCore();
+    return invoke<FramePreviewsResult>("extract_frame_previews", {
+      inputPath: request.inputPath,
+      sourceFrameIds: request.sourceFrameIds,
+      locale: request.locale,
+    });
+  },
   async subscribeInputDrops(handlers) {
     let isFileDragActive = false;
     const { getCurrentWindow } = await loadTauriWindow();
@@ -505,6 +527,12 @@ const webRuntime: AppRuntime = {
   },
   async convertStaticImageToPng(_request) {
     throw new Error(DESKTOP_ONLY_ERROR);
+  },
+  async extractFramePreview(_request) {
+    return null;
+  },
+  async extractFramePreviews(_request) {
+    return null;
   },
   async subscribeInputDrops(handlers) {
     let dragDepth = 0;

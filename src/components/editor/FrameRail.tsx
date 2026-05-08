@@ -5,6 +5,7 @@ import type {
   PointerEvent,
   RefObject,
 } from "react";
+import { useMemo } from "react";
 
 import type { EditorText } from "../../locales/editorText";
 import type { Locale } from "../../locales/messages";
@@ -17,18 +18,18 @@ import type {
 import { formatTimelineTime } from "../../utils/timelineFrames";
 import { GridIcon } from "../AppIcons";
 
+const LARGE_FRAME_LIST_THRESHOLD = 200;
+
 type FrameRailProps = {
   ui: EditorText;
   locale: Locale;
   timelineFrameViews: TimelineFrameView[];
   selection: FrameSelectionModel;
-  currentFrameInstanceId: string | null;
   hasClipboardFrames: boolean;
   frameDropTarget: FrameDropTargetState | null;
   frameReorderState: FrameReorderState | null;
   frameTableBodyRef: RefObject<HTMLDivElement | null>;
   onFramePointerDown: (instanceId: string, event: PointerEvent<HTMLButtonElement>) => void;
-  onFramePointerEnter: (instanceId: string) => void;
   onFrameContextMenu: (instanceId: string, event: MouseEvent<HTMLButtonElement>) => void;
   onFrameKeyDown: KeyboardEventHandler<HTMLButtonElement>;
   onFrameFocus: (time: number) => void;
@@ -40,18 +41,22 @@ export function FrameRail({
   locale,
   timelineFrameViews,
   selection,
-  currentFrameInstanceId,
   hasClipboardFrames,
   frameDropTarget,
   frameReorderState,
   frameTableBodyRef,
   onFramePointerDown,
-  onFramePointerEnter,
   onFrameContextMenu,
   onFrameKeyDown,
   onFrameFocus,
   onPasteFramesBelow,
 }: FrameRailProps) {
+  const isLargeFrameList = timelineFrameViews.length >= LARGE_FRAME_LIST_THRESHOLD;
+  const draggedInstanceIdSet = useMemo(
+    () => new Set(frameReorderState?.draggedInstanceIds ?? []),
+    [frameReorderState?.draggedInstanceIds],
+  );
+
   return (
     <aside className="frameRail">
       <section className="appCard frameCard frameRailCard">
@@ -71,18 +76,17 @@ export function FrameRail({
 
             <div
               ref={frameTableBodyRef}
-              className="frameTableBody"
+              className={isLargeFrameList ? "frameTableBody is-large" : "frameTableBody"}
               role="listbox"
               aria-multiselectable="true"
               aria-label={ui.frameTitle}
             >
               {timelineFrameViews.map((frame) => {
                 const isSelected = selection.selectedInstanceIdSet.has(frame.instanceId);
-                const isCurrent = frame.instanceId === currentFrameInstanceId;
                 const isDropTarget = frameDropTarget?.anchorInstanceId === frame.instanceId;
                 const isDragged =
                   frameReorderState?.active === true &&
-                  frameReorderState.draggedInstanceIds.includes(frame.instanceId);
+                  draggedInstanceIdSet.has(frame.instanceId);
                 const dragOffsetY = isDragged && frameReorderState
                   ? frameReorderState.currentY - frameReorderState.startY
                   : 0;
@@ -90,7 +94,7 @@ export function FrameRail({
                 return (
                   <button
                     key={frame.instanceId}
-                    className={`frameRow ${isSelected ? "is-selected" : ""} ${isCurrent ? "is-current" : ""} ${isDropTarget ? `is-drop-${frameDropTarget?.position}` : ""} ${isDragged ? "is-dragged" : ""}`}
+                    className={`frameRow ${isSelected ? "is-selected" : ""} ${isDropTarget ? `is-drop-${frameDropTarget?.position}` : ""} ${isDragged ? "is-dragged" : ""}`}
                     type="button"
                     role="option"
                     aria-selected={isSelected}
@@ -102,7 +106,6 @@ export function FrameRail({
                         : undefined
                     }
                     onPointerDown={(event) => onFramePointerDown(frame.instanceId, event)}
-                    onPointerEnter={() => onFramePointerEnter(frame.instanceId)}
                     onContextMenu={(event) => onFrameContextMenu(frame.instanceId, event)}
                     onKeyDown={onFrameKeyDown}
                     onFocus={() => onFrameFocus(frame.startTimeSeconds)}
@@ -111,7 +114,6 @@ export function FrameRail({
                       <span className="frameCellLabel">{ui.frameNumber}</span>
                       <span className="frameValueGroup">
                         <span>{frame.displayNumber}</span>
-                        {isCurrent ? <span className="frameDot" /> : null}
                       </span>
                     </div>
                     <div className="frameCell frameTimeCell">

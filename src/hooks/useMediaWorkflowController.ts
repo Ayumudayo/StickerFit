@@ -12,6 +12,7 @@ import type { Locale } from "../locales/messages";
 import type {
   FitMode,
   MediaInspection,
+  OptimizerGoal,
   OptimizerPlanRequest,
   OptimizerPresetStrategy,
   OptimizerPlanResponse,
@@ -40,6 +41,8 @@ type OptimizerBaseRequestContext = WorkflowRequestContext & {
   locale: Locale;
   fitMode: FitMode;
   presetStrategy: OptimizerPresetStrategy;
+  optimizerGoal: OptimizerGoal;
+  qualityFrameDropInterval: number;
   searchDepth: OptimizerSearchDepth;
   cropRegion: CropRegion;
 };
@@ -49,6 +52,8 @@ function buildOptimizerBaseRequest({
   locale,
   fitMode,
   presetStrategy,
+  optimizerGoal,
+  qualityFrameDropInterval,
   searchDepth,
   cropRegion,
   baseFrameCount,
@@ -62,6 +67,8 @@ function buildOptimizerBaseRequest({
     avgFps: inspection.avgFps,
     fitMode,
     presetStrategy,
+    optimizerGoal,
+    qualityFrameDropInterval,
     searchDepth,
     cropRegion,
     selectedFrames: undefined,
@@ -84,6 +91,8 @@ export function useMediaWorkflowController({
   const [fitMode, setFitMode] = useState<FitMode>("contain");
   const [optimizerPresetStrategy, setOptimizerPresetStrategy] =
     useState<OptimizerPresetStrategy>("auto");
+  const [optimizerGoal, setOptimizerGoal] = useState<OptimizerGoal>("balanced");
+  const [qualityFrameDropInterval, setQualityFrameDropInterval] = useState(3);
   const [optimizerSearchDepth, setOptimizerSearchDepth] =
     useState<OptimizerSearchDepth>("standard");
   const [cropRegion, setCropRegion] = useState<CropRegion>(FULL_CROP_REGION);
@@ -142,6 +151,8 @@ export function useMediaWorkflowController({
         locale,
         fitMode,
         presetStrategy: optimizerPresetStrategy,
+        optimizerGoal,
+        qualityFrameDropInterval,
         searchDepth: optimizerSearchDepth,
         cropRegion,
         baseFrameCount,
@@ -170,6 +181,8 @@ export function useMediaWorkflowController({
     inspection,
     locale,
     optimizerPresetStrategy,
+    optimizerGoal,
+    qualityFrameDropInterval,
     optimizerSearchDepth,
     runtime,
   ]);
@@ -193,6 +206,8 @@ export function useMediaWorkflowController({
           locale,
           fitMode,
           presetStrategy: optimizerPresetStrategy,
+          optimizerGoal,
+          qualityFrameDropInterval,
           searchDepth: optimizerSearchDepth,
           cropRegion,
           baseFrameCount,
@@ -216,6 +231,8 @@ export function useMediaWorkflowController({
     inspection,
     locale,
     optimizerPresetStrategy,
+    optimizerGoal,
+    qualityFrameDropInterval,
     optimizerSearchDepth,
     outputDirectory,
     runtime,
@@ -259,6 +276,8 @@ export function useMediaWorkflowController({
     outputDirectory,
     fitMode,
     optimizerPresetStrategy,
+    optimizerGoal,
+    qualityFrameDropInterval,
     optimizerSearchDepth,
     cropRegion,
     cropAspectRatioPreset,
@@ -271,6 +290,8 @@ export function useMediaWorkflowController({
     setOutputDirectory,
     setFitMode,
     setOptimizerPresetStrategy,
+    setOptimizerGoal,
+    setQualityFrameDropInterval,
     setOptimizerSearchDepth,
     setCropRegion,
     setCropAspectRatioPreset,

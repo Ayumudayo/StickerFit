@@ -1,5 +1,70 @@
 import type { FrameDropTargetState } from "../types/editor";
 
+type RectBounds = {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+};
+
+type FrameDropGeometryRow = {
+  instanceId: string;
+  top: number;
+  bottom: number;
+};
+
+type ResolveFrameDropTargetFromGeometryParams = {
+  listBounds: RectBounds;
+  rows: FrameDropGeometryRow[];
+  draggedInstanceIds: string[];
+  clientX: number;
+  clientY: number;
+};
+
+export function resolveFrameDropTargetFromGeometry({
+  listBounds,
+  rows,
+  draggedInstanceIds,
+  clientX,
+  clientY,
+}: ResolveFrameDropTargetFromGeometryParams) {
+  if (
+    clientX < listBounds.left ||
+    clientX > listBounds.right ||
+    clientY < listBounds.top ||
+    clientY > listBounds.bottom
+  ) {
+    return null;
+  }
+
+  const draggedInstanceIdSet = new Set(draggedInstanceIds);
+  let lastAnchorInstanceId: string | null = null;
+
+  for (const row of rows) {
+    if (draggedInstanceIdSet.has(row.instanceId)) {
+      continue;
+    }
+
+    lastAnchorInstanceId = row.instanceId;
+    const rowMidpoint = row.top + (row.bottom - row.top) / 2;
+    if (clientY <= row.bottom) {
+      return {
+        anchorInstanceId: row.instanceId,
+        position: clientY < rowMidpoint ? "above" : "below",
+      } satisfies FrameDropTargetState;
+    }
+  }
+
+  if (!lastAnchorInstanceId) {
+    return null;
+  }
+
+  return {
+    anchorInstanceId: lastAnchorInstanceId,
+    position: "below",
+  } satisfies FrameDropTargetState;
+}
+
 export function resolveFrameDropTargetFromList(
   listElement: HTMLDivElement | null,
   draggedInstanceIds: string[],
@@ -11,51 +76,30 @@ export function resolveFrameDropTargetFromList(
   }
 
   const bounds = listElement.getBoundingClientRect();
-  if (
-    clientX < bounds.left ||
-    clientX > bounds.right ||
-    clientY < bounds.top ||
-    clientY > bounds.bottom
-  ) {
-    return null;
-  }
-
-  const rows = Array.from(
-    listElement.querySelectorAll<HTMLButtonElement>("[data-instance-id]"),
-  ).filter((row) => {
-    const instanceId = row.dataset.instanceId;
-    return instanceId ? !draggedInstanceIds.includes(instanceId) : false;
-  });
-  if (rows.length === 0) {
-    return null;
-  }
-
-  for (const row of rows) {
-    const anchorInstanceId = row.dataset.instanceId;
-    if (!anchorInstanceId) {
-      continue;
-    }
-
-    const rowBounds = row.getBoundingClientRect();
-    const rowMidpoint = rowBounds.top + rowBounds.height / 2;
-    if (clientY < rowMidpoint) {
+  const rows = Array.from(listElement.children)
+    .filter((row): row is HTMLButtonElement => row instanceof HTMLButtonElement)
+    .map((row) => {
+      const rowBounds = row.getBoundingClientRect();
       return {
-        anchorInstanceId,
-        position: "above",
-      } satisfies FrameDropTargetState;
-    }
-  }
+        instanceId: row.dataset.instanceId ?? "",
+        top: rowBounds.top,
+        bottom: rowBounds.bottom,
+      };
+    })
+    .filter((row) => row.instanceId.length > 0);
 
-  const lastRow = rows[rows.length - 1];
-  const anchorInstanceId = lastRow?.dataset.instanceId;
-  if (!anchorInstanceId) {
-    return null;
-  }
-
-  return {
-    anchorInstanceId,
-    position: "below",
-  } satisfies FrameDropTargetState;
+  return resolveFrameDropTargetFromGeometry({
+    listBounds: {
+      left: bounds.left,
+      right: bounds.right,
+      top: bounds.top,
+      bottom: bounds.bottom,
+    },
+    rows,
+    draggedInstanceIds,
+    clientX,
+    clientY,
+  });
 }
 
 export function releasePointerCaptureIfHeld(

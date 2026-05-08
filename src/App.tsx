@@ -57,6 +57,15 @@ function fitModeText(fitMode: FitMode, copy: MessagesForLocale) {
 
   return copy.contain;
 }
+
+function isPlainGlobalShortcut(event: KeyboardEvent) {
+  return !event.altKey && !event.ctrlKey && !event.metaKey && !event.isComposing;
+}
+
+function isSpaceShortcutKey(event: KeyboardEvent) {
+  return event.key === " " || event.key === "Spacebar" || event.code === "Space";
+}
+
 export default function App() {
   const [locale, setLocale] = useState<Locale>(detectLocale());
   const [previewDuration, setPreviewDuration] = useState<number | null>(null);
@@ -67,10 +76,14 @@ export default function App() {
   const [editorSessionKey, setEditorSessionKey] = useState(0);
   const [editorWorkspaceMinHeight, setEditorWorkspaceMinHeight] = useState<number | null>(null);
   const [activeDockPanel, setActiveDockPanel] = useState<EditorDockPanelMode | null>(null);
+  const [framePreviewSrc, setFramePreviewSrc] = useState<string | null>(null);
+  const [framePreviewCacheVersion, setFramePreviewCacheVersion] = useState(0);
   const initialLocaleRef = useRef(locale);
   const timelineRailRef = useRef<HTMLDivElement | null>(null);
   const shellRef = useRef<HTMLElement | null>(null);
   const editorWorkspaceRef = useRef<HTMLElement | null>(null);
+  const framePreviewCacheRef = useRef(new Map<string, string>());
+  const framePreviewRequestIdRef = useRef(0);
 
   const mediaWorkflow = useMediaWorkflowController({
     locale,
@@ -90,7 +103,8 @@ export default function App() {
     conversionResult,
     outputDirectory,
     fitMode,
-    optimizerPresetStrategy,
+    optimizerGoal,
+    qualityFrameDropInterval,
     optimizerSearchDepth,
     cropRegion,
     cropAspectRatioPreset,
@@ -102,7 +116,8 @@ export default function App() {
     isDragging,
     setOutputDirectory,
     setFitMode,
-    setOptimizerPresetStrategy,
+    setOptimizerGoal,
+    setQualityFrameDropInterval,
     setOptimizerSearchDepth,
     setCropRegion,
     setCropAspectRatioPreset,
@@ -156,9 +171,10 @@ export default function App() {
     setFrameDurationMode,
     setNthSelectionStep,
     handleFramePointerDown,
-    handleFramePointerEnter,
     handleFrameKeyDown,
     handleFrameContextMenu,
+    selectSingleFrame,
+    selectAdjacentFrame,
     selectAllFrames,
     clearAllFrames,
     openFrameDurationDialog,
@@ -186,8 +202,8 @@ export default function App() {
     closeNthSelectionDialog,
   } = frameEditor;
   const editedTimelineFramesForRequest = useMemo(
-    () => buildEditedTimelineFramesForRequest(timelineFrames),
-    [timelineFrames],
+    () => buildEditedTimelineFramesForRequest(timelineFrames, sourceFrames),
+    [sourceFrames, timelineFrames],
   );
   const playback = usePlaybackTimelineController({
     editorSessionKey,
@@ -212,6 +228,17 @@ export default function App() {
     handleTimelinePointerMove,
     handleTimelinePointerEnd,
   } = playback;
+  const currentPreviewFrame = useMemo(
+    () =>
+      timelineFrameViews.find(
+        (frame) => frame.instanceId === currentFrameInstanceId,
+      ) ?? null,
+    [currentFrameInstanceId, timelineFrameViews],
+  );
+  const framePreviewSourceFrameIds = useMemo(
+    () => Array.from(new Set(sourceFrames.map((frame) => frame.sourceFrameId))),
+    [sourceFrames],
+  );
 
   const isWebPreviewMode = runtime.kind === "web";
   const isEditorLayoutActive = inspection?.ok === true;
@@ -224,6 +251,146 @@ export default function App() {
       ? copy.toolReady
       : copy.toolUnavailable;
   const isToolReady = isWebPreviewMode || toolReport?.ready === true;
+  const requiresBackendFramePreview =
+    inspection?.ok === true &&
+    !inspection.isStaticImage &&
+    previewKind === "image" &&
+    Boolean(inspection.backendInputPath) &&
+    /\.(gif|apng|png)$/i.test(inspection.backendInputPath ?? "");
+
+  useEffect(() => {
+    const backendInputPath = inspection?.backendInputPath;
+    const requestId = framePreviewRequestIdRef.current + 1;
+    framePreviewRequestIdRef.current = requestId;
+
+    framePreviewCacheRef.current.clear();
+    setFramePreviewCacheVersion((current) => current + 1);
+    setFramePreviewSrc(null);
+
+    if (
+      !requiresBackendFramePreview ||
+      !backendInputPath ||
+      framePreviewSourceFrameIds.length === 0
+    ) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void runtime
+        .extractFramePreviews({
+          inputPath: backendInputPath,
+          sourceFrameIds: framePreviewSourceFrameIds,
+          locale,
+        })
+        .then((result) => {
+          if (framePreviewRequestIdRef.current !== requestId) {
+            return;
+          }
+
+          if (result?.ok) {
+            for (const preview of result.previews) {
+              framePreviewCacheRef.current.set(
+                `${backendInputPath}:${preview.sourceFrameId}`,
+                preview.dataUrl,
+              );
+            }
+            setFramePreviewCacheVersion((current) => current + 1);
+            return;
+          }
+
+          setFramePreviewSrc(null);
+        })
+        .catch(() => {
+          if (framePreviewRequestIdRef.current === requestId) {
+            setFramePreviewSrc(null);
+          }
+        });
+    }, 50);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [
+    framePreviewSourceFrameIds,
+    inspection?.backendInputPath,
+    locale,
+    requiresBackendFramePreview,
+    runtime,
+  ]);
+
+  useEffect(() => {
+    const backendInputPath = inspection?.backendInputPath;
+    if (!requiresBackendFramePreview || !backendInputPath || !currentPreviewFrame) {
+      setFramePreviewSrc(null);
+      return;
+    }
+
+    const cacheKey = `${backendInputPath}:${currentPreviewFrame.sourceFrameId}`;
+    const cachedPreview = framePreviewCacheRef.current.get(cacheKey);
+    if (cachedPreview) {
+      setFramePreviewSrc(cachedPreview);
+    }
+  }, [
+    currentPreviewFrame,
+    framePreviewCacheVersion,
+    inspection?.backendInputPath,
+    requiresBackendFramePreview,
+  ]);
+
+  useEffect(() => {
+    function handleGlobalKeyboardShortcuts(event: KeyboardEvent) {
+      if (
+        !inspection?.ok ||
+        inspection.isStaticImage ||
+        !isPlainGlobalShortcut(event)
+      ) {
+        return;
+      }
+
+      if (isSpaceShortcutKey(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) {
+          togglePlayback();
+        }
+        return;
+      }
+
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") {
+        return;
+      }
+
+      const selectedAnchorInstanceId =
+        selectedInstanceIds[selectedInstanceIds.length - 1] ?? currentFrameInstanceId;
+      const didMoveSelection = selectAdjacentFrame(
+        event.key === "ArrowDown" ? 1 : -1,
+        selectedAnchorInstanceId,
+      );
+      if (didMoveSelection) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    }
+
+    window.addEventListener("keydown", handleGlobalKeyboardShortcuts, true);
+    return () => {
+      window.removeEventListener("keydown", handleGlobalKeyboardShortcuts, true);
+    };
+  }, [
+    currentFrameInstanceId,
+    inspection?.isStaticImage,
+    inspection?.ok,
+    selectAdjacentFrame,
+    selectedInstanceIds,
+    togglePlayback,
+  ]);
+
+  useEffect(() => {
+    if (!isPlaying || !currentFrameInstanceId) {
+      return;
+    }
+
+    selectSingleFrame(currentFrameInstanceId);
+  }, [currentFrameInstanceId, isPlaying, selectSingleFrame]);
+
   const selectionLabel = selectionSummary(
     cropRegion,
     copy,
@@ -454,13 +621,11 @@ export default function App() {
                 locale,
                 timelineFrameViews,
                 selection: selectionModel,
-                currentFrameInstanceId,
                 hasClipboardFrames,
                 frameDropTarget,
                 frameReorderState,
                 frameTableBodyRef,
                 onFramePointerDown: handleFramePointerDown,
-                onFramePointerEnter: handleFramePointerEnter,
                 onFrameContextMenu: handleFrameContextMenu,
                 onFrameKeyDown: handleFrameKeyDown,
                 onFrameFocus: scrubTo,
@@ -482,6 +647,8 @@ export default function App() {
               }}
               previewProps={{
                 previewSrc: inspection.previewSrc,
+                framePreviewSrc,
+                requiresFramePreview: requiresBackendFramePreview,
                 previewKind,
                 sourceWidth: inspection.width,
                 sourceHeight: inspection.height,
@@ -512,9 +679,11 @@ export default function App() {
                 resultsPanelId: EDITOR_RESULTS_PANEL_ID,
                 plan,
                 searchResult,
-                optimizerPresetStrategy,
+                optimizerGoal,
+                qualityFrameDropInterval,
                 optimizerSearchDepth,
-                onOptimizerPresetStrategyChange: setOptimizerPresetStrategy,
+                onOptimizerGoalChange: setOptimizerGoal,
+                onQualityFrameDropIntervalChange: setQualityFrameDropInterval,
                 onOptimizerSearchDepthChange: setOptimizerSearchDepth,
                 onOpenOutputFolder: (path) => void openOutputFolder(path),
                 onClose: () => setActiveDockPanel(null),
