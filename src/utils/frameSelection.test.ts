@@ -16,6 +16,7 @@ const frameViews: TimelineFrameView[] = frameIds.map((instanceId, index) => ({
   displayNumber: index + 1,
   durationUs: 100_000,
   durationSeconds: 0.1,
+  startTimeUs: index * 100_000,
   startTimeSeconds: index / 10,
   sourceStartTimeSeconds: index / 10,
 }));

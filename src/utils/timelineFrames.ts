@@ -13,6 +13,13 @@ export function microsecondsToSeconds(value: number) {
   return value / 1_000_000;
 }
 
+export function timelineDurationSeconds(
+  frames: readonly Pick<TimelineFrame, "durationUs">[],
+) {
+  return frames.reduce((sum, frame) => sum + frame.durationUs, 0) /
+    1_000_000;
+}
+
 export function buildSourceFrames(
   durationSeconds: number | null,
   estimatedFrames: number | null,
@@ -20,18 +27,15 @@ export function buildSourceFrames(
 ) {
   if (
     frameDurationsSeconds &&
-    frameDurationsSeconds.length > 0 &&
-    durationSeconds &&
-    durationSeconds > 0
+    frameDurationsSeconds.length > 0
   ) {
     let currentStartUs = 0;
 
     return frameDurationsSeconds.map((frameDurationSeconds, index) => {
-      const normalizedDuration = Number(frameDurationSeconds.toFixed(3));
       const frame = {
         sourceFrameId: index + 1,
         startTimeUs: currentStartUs,
-        durationUs: secondsToMicroseconds(normalizedDuration),
+        durationUs: secondsToMicroseconds(frameDurationSeconds),
       } satisfies SourceFrame;
 
       currentStartUs += frame.durationUs;
@@ -43,15 +47,18 @@ export function buildSourceFrames(
     return [] as SourceFrame[];
   }
 
-  const frameCount = Math.max(1, Math.round(estimatedFrames));
-  const uniformFrameDuration = Number((durationSeconds / frameCount).toFixed(3));
+  const totalDurationUs = secondsToMicroseconds(durationSeconds);
+  const requestedFrameCount = Math.max(1, Math.round(estimatedFrames));
+  const frameCount = Math.min(requestedFrameCount, totalDurationUs);
+  const baseDurationUs = Math.floor(totalDurationUs / frameCount);
+  const remainderUs = totalDurationUs % frameCount;
   let currentStartUs = 0;
 
   return Array.from({ length: frameCount }, (_, index) => {
     const frame = {
       sourceFrameId: index + 1,
       startTimeUs: currentStartUs,
-      durationUs: secondsToMicroseconds(uniformFrameDuration),
+      durationUs: baseDurationUs + (index < remainderUs ? 1 : 0),
     } satisfies SourceFrame;
 
     currentStartUs += frame.durationUs;
@@ -72,7 +79,7 @@ export function buildTimelineFrameViews(
   timelineFrames: TimelineFrame[],
   sourceFrames: SourceFrame[],
 ) {
-  let currentTimeSeconds = 0;
+  let currentStartUs = 0;
   const sourceFrameMap = new Map(sourceFrames.map((frame) => [frame.sourceFrameId, frame]));
 
   return timelineFrames.map((frame) => {
@@ -83,11 +90,12 @@ export function buildTimelineFrameViews(
       displayNumber: frame.displayNumber,
       durationUs: frame.durationUs,
       durationSeconds: microsecondsToSeconds(frame.durationUs),
-      startTimeSeconds: Number(currentTimeSeconds.toFixed(3)),
+      startTimeUs: currentStartUs,
+      startTimeSeconds: microsecondsToSeconds(currentStartUs),
       sourceStartTimeSeconds: microsecondsToSeconds(sourceFrame?.startTimeUs ?? 0),
     } satisfies TimelineFrameView;
 
-    currentTimeSeconds += microsecondsToSeconds(frame.durationUs);
+    currentStartUs += frame.durationUs;
     return view;
   });
 }

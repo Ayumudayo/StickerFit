@@ -7,9 +7,13 @@ import {
   lastSelectedFrameView,
   selectedPlaybackFrames,
 } from "../utils/frameSelection";
+import {
+  microsecondsToSeconds,
+  timelineDurationSeconds,
+} from "../utils/timelineFrames";
 
-const PLAYBACK_TICK_EPSILON_SECONDS = 0.01;
-const PLAYBACK_FRAME_EPSILON_SECONDS = 0.001;
+const PLAYBACK_TICK_EPSILON_US = 10_000;
+const PLAYBACK_FRAME_EPSILON_US = 1_000;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -17,7 +21,7 @@ function clamp(value: number, min: number, max: number) {
 
 export type PlaybackTimelineLookup = {
   frames: TimelineFrameView[];
-  startTimes: number[];
+  startTimesUs: number[];
 };
 
 export function createPlaybackTimelineLookup(
@@ -25,33 +29,37 @@ export function createPlaybackTimelineLookup(
 ): PlaybackTimelineLookup {
   return {
     frames,
-    startTimes: frames.map((frame) => frame.startTimeSeconds),
+    startTimesUs: frames.map((frame) => frame.startTimeUs),
   };
 }
 
-function findFirstFrameIndexAtOrAfter(startTimes: number[], timeSeconds: number) {
+function timelineMicroseconds(value: number) {
+  return Math.round(value * 1_000_000);
+}
+
+function findFirstFrameIndexAtOrAfter(startTimesUs: number[], timeUs: number) {
   let low = 0;
-  let high = startTimes.length;
+  let high = startTimesUs.length;
 
   while (low < high) {
     const midpoint = Math.floor((low + high) / 2);
-    if (startTimes[midpoint] < timeSeconds) {
+    if (startTimesUs[midpoint] < timeUs) {
       low = midpoint + 1;
     } else {
       high = midpoint;
     }
   }
 
-  return low < startTimes.length ? low : -1;
+  return low < startTimesUs.length ? low : -1;
 }
 
-function findLastFrameIndexAtOrBefore(startTimes: number[], timeSeconds: number) {
+function findLastFrameIndexAtOrBefore(startTimesUs: number[], timeUs: number) {
   let low = 0;
-  let high = startTimes.length;
+  let high = startTimesUs.length;
 
   while (low < high) {
     const midpoint = Math.floor((low + high) / 2);
-    if (startTimes[midpoint] <= timeSeconds) {
+    if (startTimesUs[midpoint] <= timeUs) {
       low = midpoint + 1;
     } else {
       high = midpoint;
@@ -66,8 +74,8 @@ export function findPlaybackFrameIndexAtOrAfter(
   currentTime: number,
 ) {
   return findFirstFrameIndexAtOrAfter(
-    lookup.startTimes,
-    currentTime - PLAYBACK_TICK_EPSILON_SECONDS,
+    lookup.startTimesUs,
+    timelineMicroseconds(currentTime) - PLAYBACK_TICK_EPSILON_US,
   );
 }
 
@@ -92,8 +100,8 @@ export function resolvePlaybackFrameAtTime(
   }
 
   const frameIndex = findLastFrameIndexAtOrBefore(
-    lookup.startTimes,
-    currentTime + PLAYBACK_FRAME_EPSILON_SECONDS,
+    lookup.startTimesUs,
+    timelineMicroseconds(currentTime) + PLAYBACK_FRAME_EPSILON_US,
   );
 
   return frameIndex === -1 ? lookup.frames[0] ?? null : lookup.frames[frameIndex] ?? null;
@@ -107,7 +115,11 @@ export function resolveNearestFrameInstanceIdAtTime(
     return null;
   }
 
-  const nextFrameIndex = findFirstFrameIndexAtOrAfter(lookup.startTimes, currentTime);
+  const currentTimeUs = timelineMicroseconds(currentTime);
+  const nextFrameIndex = findFirstFrameIndexAtOrAfter(
+    lookup.startTimesUs,
+    currentTimeUs,
+  );
   if (nextFrameIndex === -1) {
     return lookup.frames[lookup.frames.length - 1]?.instanceId ?? null;
   }
@@ -126,8 +138,8 @@ export function resolveNearestFrameInstanceIdAtTime(
     return previousFrame.instanceId;
   }
 
-  const previousDistance = Math.abs(previousFrame.startTimeSeconds - currentTime);
-  const nextDistance = Math.abs(nextFrame.startTimeSeconds - currentTime);
+  const previousDistance = Math.abs(previousFrame.startTimeUs - currentTimeUs);
+  const nextDistance = Math.abs(nextFrame.startTimeUs - currentTimeUs);
   return nextDistance < previousDistance ? nextFrame.instanceId : previousFrame.instanceId;
 }
 
@@ -140,18 +152,21 @@ export function resolvePlaybackStartTime(
   }
 
   const currentFrame = resolvePlaybackFrameAtTime(lookup, currentTime);
+  const currentTimeUs = timelineMicroseconds(currentTime);
   if (
     currentFrame &&
-    currentTime >= currentFrame.startTimeSeconds &&
-    currentTime < currentFrame.startTimeSeconds + currentFrame.durationSeconds
+    currentTimeUs >= currentFrame.startTimeUs &&
+    currentTimeUs < currentFrame.startTimeUs + currentFrame.durationUs
   ) {
     return currentTime;
   }
 
   const nextFrameIndex = findPlaybackFrameIndexAtOrAfter(lookup, currentTime);
   return nextFrameIndex === -1
-    ? lookup.frames[0]?.startTimeSeconds ?? currentTime
-    : lookup.frames[nextFrameIndex]?.startTimeSeconds ?? currentTime;
+    ? microsecondsToSeconds(lookup.frames[0]?.startTimeUs ?? timelineMicroseconds(currentTime))
+    : microsecondsToSeconds(
+        lookup.frames[nextFrameIndex]?.startTimeUs ?? timelineMicroseconds(currentTime),
+      );
 }
 
 type UsePlaybackTimelineControllerParams = {
@@ -193,13 +208,13 @@ export function usePlaybackTimelineController({
     setTimelineDrag(null);
   }, [editorSessionKey, inspection?.durationSeconds, setPreviewDuration]);
 
-  const timelineDurationSeconds = useMemo(
-    () => timelineFrameViews.reduce((sum, frame) => sum + frame.durationSeconds, 0),
+  const timelineDuration = useMemo(
+    () => timelineDurationSeconds(timelineFrameViews),
     [timelineFrameViews],
   );
   const totalDuration = inspection?.isStaticImage
     ? sourceDuration
-    : timelineDurationSeconds || sourceDuration;
+    : timelineDuration || sourceDuration;
 
   useEffect(() => {
     if (currentTime > totalDuration) {
@@ -289,8 +304,8 @@ export function usePlaybackTimelineController({
       return;
     }
 
-    setCurrentTime(focusedSelectedFrame.startTimeSeconds);
-  }, [focusedSelectedFrame?.instanceId, focusedSelectedFrame?.startTimeSeconds, isPlaying]);
+    setCurrentTime(microsecondsToSeconds(focusedSelectedFrame.startTimeUs));
+  }, [focusedSelectedFrame?.instanceId, focusedSelectedFrame?.startTimeUs, isPlaying]);
 
   function togglePlayback() {
     if (!inspection?.ok || inspection.isStaticImage || totalDuration <= 0 || playbackTimelineFrames.length === 0) {
@@ -328,8 +343,8 @@ export function usePlaybackTimelineController({
 
     timeoutId = window.setTimeout(() => {
       const nextIndex = (normalizedCurrentIndex + 1) % playbackTimelineFrames.length;
-      setCurrentTime(playbackTimelineFrames[nextIndex].startTimeSeconds);
-    }, currentFrame.durationSeconds * 1000);
+      setCurrentTime(microsecondsToSeconds(playbackTimelineFrames[nextIndex].startTimeUs));
+    }, currentFrame.durationUs / 1_000);
 
     return () => window.clearTimeout(timeoutId);
   }, [currentTime, isPlaying, playbackTimelineFrames, playbackTimelineLookup]);

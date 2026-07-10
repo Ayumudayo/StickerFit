@@ -9,6 +9,7 @@ const timelineFrameViews: TimelineFrameView[] = [
     displayNumber: 1,
     durationUs: 1_000_000,
     durationSeconds: 1,
+    startTimeUs: 0,
     startTimeSeconds: 0,
     sourceStartTimeSeconds: 0,
   },
@@ -18,6 +19,7 @@ const timelineFrameViews: TimelineFrameView[] = [
     displayNumber: 2,
     durationUs: 1_000_000,
     durationSeconds: 1,
+    startTimeUs: 1_000_000,
     startTimeSeconds: 1,
     sourceStartTimeSeconds: 10,
   },
@@ -27,6 +29,7 @@ const timelineFrameViews: TimelineFrameView[] = [
     displayNumber: 3,
     durationUs: 1_500_000,
     durationSeconds: 1.5,
+    startTimeUs: 2_000_000,
     startTimeSeconds: 2,
     sourceStartTimeSeconds: 20,
   },
@@ -36,6 +39,7 @@ const timelineFrameViews: TimelineFrameView[] = [
     displayNumber: 4,
     durationUs: 500_000,
     durationSeconds: 0.5,
+    startTimeUs: 3_500_000,
     startTimeSeconds: 3.5,
     sourceStartTimeSeconds: 35,
   },
@@ -122,6 +126,42 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     expect(resolveNearestFrameInstanceIdAtTime(lookup, 2.6)).toBe("frame-3");
     expect(resolveNearestFrameInstanceIdAtTime(selectedLookup, 1.4)).toBe("frame-3");
     expect(resolveNearestFrameInstanceIdAtTime(createPlaybackTimelineLookup([]), 1.4)).toBeNull();
+  });
+
+  it("uses integer microsecond offsets as the lookup authority", async () => {
+    const playbackModule = await import("./usePlaybackTimelineController");
+    const createPlaybackTimelineLookup = (
+      playbackModule as Record<string, unknown>
+    ).createPlaybackTimelineLookup;
+    const resolveNearestFrameInstanceIdAtTime = (
+      playbackModule as Record<string, unknown>
+    ).resolveNearestFrameInstanceIdAtTime;
+
+    expect(createPlaybackTimelineLookup).toBeTypeOf("function");
+    expect(resolveNearestFrameInstanceIdAtTime).toBeTypeOf("function");
+    if (
+      typeof createPlaybackTimelineLookup !== "function" ||
+      typeof resolveNearestFrameInstanceIdAtTime !== "function"
+    ) {
+      return;
+    }
+
+    const lookup = createPlaybackTimelineLookup([
+      {
+        ...timelineFrameViews[0],
+        durationUs: 333_334,
+        durationSeconds: 0.333334,
+      },
+      {
+        ...timelineFrameViews[1],
+        startTimeUs: 333_334,
+        startTimeSeconds: 0.333,
+        durationUs: 333_333,
+        durationSeconds: 0.333333,
+      },
+    ]);
+
+    expect(resolveNearestFrameInstanceIdAtTime(lookup, 0.166667)).toBe("frame-1");
   });
 
   it("normalizes play start to the next selected frame when current time is in a gap", async () => {

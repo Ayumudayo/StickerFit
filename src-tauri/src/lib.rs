@@ -299,7 +299,7 @@ struct ResolvedFrameSelection {
 #[derive(Debug, Clone)]
 struct ResolvedTimelineFrame {
     source_frame_index: u32,
-    duration_seconds: f64,
+    duration_us: u64,
 }
 
 #[derive(Clone)]
@@ -344,7 +344,7 @@ struct SelectedEncodeOutput {
 #[derive(Clone)]
 struct StickerFrame {
     pixels: RgbaImage,
-    duration_seconds: f64,
+    duration_us: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -363,13 +363,22 @@ struct PngAnimationMetadata {
     frame_durations: Vec<f64>,
 }
 
-const RECOMMENDED_MAX_DURATION_SECONDS: f64 = 3.0;
-const DISCORD_MAX_DURATION_SECONDS: f64 = 5.0;
+const RECOMMENDED_MAX_DURATION_US: u64 = 3_000_000;
+const DISCORD_MAX_DURATION_US: u64 = 5_000_000;
 const DISCORD_MAX_STICKER_BYTES: u64 = 512 * 1024;
 const MAX_SEARCH_BUDGET: usize = 20;
 const INTERNAL_TASK_ERROR_CODE: &str = "internal-task-failed";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn duration_us_to_seconds(duration_us: u64) -> f64 {
+    duration_us as f64 / 1_000_000.0
+}
+
+fn frame_duration_us_for_fps(fps: u32) -> u64 {
+    let fps = u64::from(fps.max(1));
+    (1_000_000 + fps / 2) / fps
+}
 
 async fn run_blocking_task<T, F>(job: F) -> Result<T, String>
 where
@@ -661,7 +670,7 @@ fn preset_ladder_for_strategy(duration_seconds: f64, preset_strategy: &str) -> V
         "quality" => vec!["standard"],
         "size" => vec!["compact", "compactPlus"],
         _ => {
-            if duration_seconds > RECOMMENDED_MAX_DURATION_SECONDS {
+            if duration_seconds > duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US) {
                 vec!["standard", "compact", "compactPlus"]
             } else {
                 vec!["standard", "compact"]
@@ -1142,7 +1151,7 @@ fn resolve_timeline_frames(
 
         resolved.push(ResolvedTimelineFrame {
             source_frame_index: frame.source_frame_id - 1,
-            duration_seconds: frame.duration_us as f64 / 1_000_000.0,
+            duration_us: frame.duration_us,
         });
     }
 
@@ -1202,8 +1211,9 @@ fn frame_sample_steps_for_selection(selected_frame_count: usize) -> Vec<u32> {
         steps.push(4);
     }
 
-    let required_step =
-        (selected_frame_count as f64 / (DISCORD_MAX_DURATION_SECONDS * 30.0)).ceil() as u32;
+    let required_step = (selected_frame_count as f64
+        / (duration_us_to_seconds(DISCORD_MAX_DURATION_US) * 30.0))
+        .ceil() as u32;
     if required_step > 1 {
         steps.push(required_step);
     }
@@ -1217,7 +1227,8 @@ fn frame_sample_steps_for_goal(selected_frame_count: usize, optimizer_goal: &str
     match optimizer_goal {
         "quality" => vec![1],
         "motion" => {
-            if candidate_duration_seconds(selected_frame_count, 30) <= DISCORD_MAX_DURATION_SECONDS
+            if candidate_duration_seconds(selected_frame_count, 30)
+                <= duration_us_to_seconds(DISCORD_MAX_DURATION_US)
             {
                 vec![1]
             } else {
@@ -1321,19 +1332,29 @@ fn natural_selection_duration_seconds(selected_frame_count: usize, source_fps: f
     selected_frame_count as f64 / source_fps.max(1.0)
 }
 
-fn timeline_duration_seconds(timeline_frames: &[ResolvedTimelineFrame]) -> f64 {
-    timeline_frames
-        .iter()
-        .map(|frame| frame.duration_seconds)
-        .sum()
+fn checked_duration_us(durations_us: impl IntoIterator<Item = u64>) -> Result<u64, &'static str> {
+    durations_us
+        .into_iter()
+        .try_fold(0_u64, |total, duration_us| {
+            total
+                .checked_add(duration_us)
+                .ok_or("invalid-frame-selection")
+        })
 }
 
-fn timeline_average_fps(timeline_frames: &[ResolvedTimelineFrame]) -> f64 {
-    let duration_seconds = timeline_duration_seconds(timeline_frames);
-    if duration_seconds <= 0.0 {
+fn timeline_duration_us(timeline_frames: &[ResolvedTimelineFrame]) -> Result<u64, &'static str> {
+    checked_duration_us(timeline_frames.iter().map(|frame| frame.duration_us))
+}
+
+fn sticker_frame_duration_us(frames: &[StickerFrame]) -> Result<u64, &'static str> {
+    checked_duration_us(frames.iter().map(|frame| frame.duration_us))
+}
+
+fn timeline_average_fps(timeline_frames: &[ResolvedTimelineFrame], duration_us: u64) -> f64 {
+    if duration_us == 0 {
         1.0
     } else {
-        timeline_frames.len() as f64 / duration_seconds
+        timeline_frames.len() as f64 / duration_us_to_seconds(duration_us)
     }
 }
 
@@ -1503,19 +1524,48 @@ fn native_png_filter_for_preset(preset: &str) -> PngFilter {
     }
 }
 
-fn frame_delay_seconds(delay_ms: u32, delay_den_ms: u32) -> f64 {
+fn frame_delay_microseconds(delay_ms: u32, delay_den_ms: u32) -> u64 {
     if delay_den_ms == 0 {
-        f64::from(delay_ms) / 100_000.0
+        u64::from(delay_ms) * 10
     } else {
-        f64::from(delay_ms) / f64::from(delay_den_ms) / 1000.0
+        let numerator_us = u64::from(delay_ms) * 1_000;
+        let denominator = u64::from(delay_den_ms);
+        (numerator_us + denominator / 2) / denominator
     }
 }
 
-fn sticker_frame_delay(duration_seconds: f64) -> (u16, u16) {
-    let duration_ms = (duration_seconds * 1000.0)
-        .round()
-        .clamp(1.0, u16::MAX as f64) as u16;
-    (duration_ms, 1000)
+fn quantize_apng_delays(durations_us: &[u64]) -> Result<Vec<(u16, u16)>, &'static str> {
+    let mut cumulative_us = 0_u64;
+    let mut cumulative_ticks = Vec::with_capacity(durations_us.len());
+
+    for duration_us in durations_us {
+        if *duration_us < 100 {
+            return Err("invalid-frame-duration");
+        }
+
+        cumulative_us = cumulative_us
+            .checked_add(*duration_us)
+            .ok_or("invalid-frame-selection")?;
+        let rounded_ticks = cumulative_us / 100 + if cumulative_us % 100 >= 50 { 1 } else { 0 };
+        cumulative_ticks.push(rounded_ticks);
+    }
+
+    let mut previous_ticks = 0_u64;
+    cumulative_ticks
+        .into_iter()
+        .map(|end_ticks| {
+            let frame_ticks = end_ticks
+                .checked_sub(previous_ticks)
+                .ok_or("invalid-frame-selection")?;
+            let numerator = u16::try_from(frame_ticks).map_err(|_| "invalid-frame-duration")?;
+            if numerator == 0 {
+                return Err("invalid-frame-duration");
+            }
+
+            previous_ticks = end_ticks;
+            Ok((numerator, 10_000))
+        })
+        .collect()
 }
 
 fn crop_rgba_image(source: &RgbaImage, crop_region: Option<ResolvedCropRegion>) -> RgbaImage {
@@ -1618,7 +1668,7 @@ fn decode_gif_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, St
             let (delay_ms, delay_den_ms) = frame.delay().numer_denom_ms();
             StickerFrame {
                 pixels: frame.into_buffer(),
-                duration_seconds: frame_delay_seconds(delay_ms, delay_den_ms),
+                duration_us: frame_delay_microseconds(delay_ms, delay_den_ms),
             }
         })
         .collect())
@@ -1628,7 +1678,7 @@ fn image_frame_to_sticker_frame(frame: image::Frame) -> StickerFrame {
     let (delay_ms, delay_den_ms) = frame.delay().numer_denom_ms();
     StickerFrame {
         pixels: frame.into_buffer(),
-        duration_seconds: frame_delay_seconds(delay_ms, delay_den_ms),
+        duration_us: frame_delay_microseconds(delay_ms, delay_den_ms),
     }
 }
 
@@ -1662,7 +1712,7 @@ fn decode_apng_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, S
             let (delay_ms, delay_den_ms) = frame.delay().numer_denom_ms();
             StickerFrame {
                 pixels: frame.into_buffer(),
-                duration_seconds: frame_delay_seconds(delay_ms, delay_den_ms),
+                duration_us: frame_delay_microseconds(delay_ms, delay_den_ms),
             }
         })
         .collect())
@@ -1976,6 +2026,12 @@ fn write_native_apng(
         return Err("APNG frames must share one canvas size".into());
     }
 
+    let durations_us = frames
+        .iter()
+        .map(|frame| frame.duration_us)
+        .collect::<Vec<_>>();
+    let frame_delays = quantize_apng_delays(&durations_us).map_err(str::to_string)?;
+
     let file = File::create(output_path).map_err(|error| error.to_string())?;
     let writer = BufWriter::new(file);
     let mut encoder = NativePngEncoder::new(writer, width, height);
@@ -1995,7 +2051,7 @@ fn write_native_apng(
     encoder
         .set_dispose_op(PngDisposeOp::None)
         .map_err(|error| error.to_string())?;
-    let (delay_num, delay_den) = sticker_frame_delay(frames[0].duration_seconds);
+    let (delay_num, delay_den) = frame_delays[0];
     encoder
         .set_frame_delay(delay_num, delay_den)
         .map_err(|error| error.to_string())?;
@@ -2007,8 +2063,7 @@ fn write_native_apng(
         .map_err(|error| error.to_string())?;
 
     let mut previous_frame = frames[0].pixels.clone();
-    for frame in &frames[1..] {
-        let (delay_num, delay_den) = sticker_frame_delay(frame.duration_seconds);
+    for (frame, &(delay_num, delay_den)) in frames[1..].iter().zip(&frame_delays[1..]) {
         let region = changed_frame_region(&previous_frame, &frame.pixels);
         png_writer
             .reset_frame_position()
@@ -2051,7 +2106,7 @@ fn build_native_selected_animation_frames(
         return Err("no frames available for selection".into());
     }
 
-    let duration_seconds = 1.0 / candidate_fps.max(1) as f64;
+    let duration_us = frame_duration_us_for_fps(candidate_fps);
     frame_indexes
         .into_iter()
         .map(|index| {
@@ -2060,7 +2115,7 @@ fn build_native_selected_animation_frames(
                 .cloned()
                 .map(|frame| StickerFrame {
                     pixels: frame.pixels,
-                    duration_seconds,
+                    duration_us,
                 })
                 .ok_or_else(|| "selected frame index is out of range".to_string())
         })
@@ -2079,7 +2134,7 @@ fn build_native_timeline_frames(
                 .cloned()
                 .map(|source| StickerFrame {
                     pixels: source.pixels,
-                    duration_seconds: frame.duration_seconds,
+                    duration_us: frame.duration_us,
                 })
                 .ok_or_else(|| "timeline frame index is out of range".to_string())
         })
@@ -2224,7 +2279,7 @@ fn build_candidate_ladder(
             .into_iter()
             .filter(|fps| {
                 candidate_duration_seconds(encoded_frame_count, *fps)
-                    <= DISCORD_MAX_DURATION_SECONDS
+                    <= duration_us_to_seconds(DISCORD_MAX_DURATION_US)
             })
             .collect();
 
@@ -2315,7 +2370,9 @@ fn prepare_optimizer_plan(
                 ok: false,
                 fit_mode: fit_mode.into(),
                 selected_duration_seconds: None,
-                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                recommended_max_duration_seconds: duration_us_to_seconds(
+                    RECOMMENDED_MAX_DURATION_US,
+                ),
                 search_budget,
                 warnings,
                 candidates: Vec::new(),
@@ -2346,7 +2403,9 @@ fn prepare_optimizer_plan(
                                 ok: false,
                                 fit_mode: fit_mode.into(),
                                 selected_duration_seconds: None,
-                                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                                recommended_max_duration_seconds: duration_us_to_seconds(
+                                    RECOMMENDED_MAX_DURATION_US,
+                                ),
                                 search_budget,
                                 warnings,
                                 candidates: Vec::new(),
@@ -2363,7 +2422,9 @@ fn prepare_optimizer_plan(
                     ok: false,
                     fit_mode: fit_mode.into(),
                     selected_duration_seconds: None,
-                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    recommended_max_duration_seconds: duration_us_to_seconds(
+                        RECOMMENDED_MAX_DURATION_US,
+                    ),
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
@@ -2376,7 +2437,9 @@ fn prepare_optimizer_plan(
                     ok: false,
                     fit_mode: fit_mode.into(),
                     selected_duration_seconds: None,
-                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    recommended_max_duration_seconds: duration_us_to_seconds(
+                        RECOMMENDED_MAX_DURATION_US,
+                    ),
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
@@ -2386,14 +2449,34 @@ fn prepare_optimizer_plan(
             }
         }
     {
-        let total_duration_seconds = timeline_duration_seconds(&timeline_frames);
+        let total_duration_us = match timeline_duration_us(&timeline_frames) {
+            Ok(duration_us) => duration_us,
+            Err(error) => {
+                return OptimizerPlanResponse {
+                    ok: false,
+                    fit_mode: fit_mode.into(),
+                    selected_duration_seconds: None,
+                    recommended_max_duration_seconds: duration_us_to_seconds(
+                        RECOMMENDED_MAX_DURATION_US,
+                    ),
+                    search_budget,
+                    warnings,
+                    candidates: Vec::new(),
+                    error_code: Some(error.into()),
+                    error_message: Some(locale::invalid_frame_selection_error(locale)),
+                };
+            }
+        };
+        let total_duration_seconds = duration_us_to_seconds(total_duration_us);
 
-        if total_duration_seconds > DISCORD_MAX_DURATION_SECONDS {
+        if total_duration_us > DISCORD_MAX_DURATION_US {
             return OptimizerPlanResponse {
                 ok: false,
                 fit_mode: fit_mode.into(),
                 selected_duration_seconds: Some(total_duration_seconds),
-                recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                recommended_max_duration_seconds: duration_us_to_seconds(
+                    RECOMMENDED_MAX_DURATION_US,
+                ),
                 search_budget,
                 warnings,
                 candidates: Vec::new(),
@@ -2402,11 +2485,11 @@ fn prepare_optimizer_plan(
             };
         }
 
-        if total_duration_seconds > RECOMMENDED_MAX_DURATION_SECONDS {
+        if total_duration_us > RECOMMENDED_MAX_DURATION_US {
             warnings.push(locale::recommended_duration_warning(locale));
         }
 
-        let effective_fps = timeline_average_fps(&timeline_frames)
+        let effective_fps = timeline_average_fps(&timeline_frames, total_duration_us)
             .round()
             .clamp(1.0, 30.0) as u32;
 
@@ -2414,7 +2497,7 @@ fn prepare_optimizer_plan(
             ok: true,
             fit_mode: fit_mode.into(),
             selected_duration_seconds: Some(total_duration_seconds),
-            recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+            recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
             search_budget,
             warnings,
             candidates: build_candidate_ladder_fixed_duration(
@@ -2441,7 +2524,9 @@ fn prepare_optimizer_plan(
                     ok: false,
                     fit_mode: fit_mode.into(),
                     selected_duration_seconds: None,
-                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    recommended_max_duration_seconds: duration_us_to_seconds(
+                        RECOMMENDED_MAX_DURATION_US,
+                    ),
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
@@ -2454,7 +2539,9 @@ fn prepare_optimizer_plan(
                     ok: false,
                     fit_mode: fit_mode.into(),
                     selected_duration_seconds: None,
-                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    recommended_max_duration_seconds: duration_us_to_seconds(
+                        RECOMMENDED_MAX_DURATION_US,
+                    ),
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
@@ -2471,7 +2558,9 @@ fn prepare_optimizer_plan(
                     ok: false,
                     fit_mode: fit_mode.into(),
                     selected_duration_seconds: None,
-                    recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+                    recommended_max_duration_seconds: duration_us_to_seconds(
+                        RECOMMENDED_MAX_DURATION_US,
+                    ),
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
@@ -2499,12 +2588,12 @@ fn prepare_optimizer_plan(
             .unwrap_or(frame_selection.selected_frame_count);
     let shortest_duration_seconds = candidate_duration_seconds(shortest_frame_count, 30);
 
-    if shortest_duration_seconds > DISCORD_MAX_DURATION_SECONDS {
+    if shortest_duration_seconds > duration_us_to_seconds(DISCORD_MAX_DURATION_US) {
         return OptimizerPlanResponse {
             ok: false,
             fit_mode: fit_mode.into(),
             selected_duration_seconds: Some(shortest_duration_seconds),
-            recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+            recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
             search_budget,
             warnings,
             candidates: Vec::new(),
@@ -2513,7 +2602,7 @@ fn prepare_optimizer_plan(
         };
     }
 
-    if natural_duration_seconds > RECOMMENDED_MAX_DURATION_SECONDS {
+    if natural_duration_seconds > duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US) {
         warnings.push(locale::recommended_duration_warning(locale));
     }
 
@@ -2521,7 +2610,7 @@ fn prepare_optimizer_plan(
         ok: true,
         fit_mode: fit_mode.into(),
         selected_duration_seconds: Some(natural_duration_seconds),
-        recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+        recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
         search_budget,
         warnings,
         candidates: build_candidate_ladder(
@@ -2582,7 +2671,7 @@ fn encode_candidate_from_native_animation_internal(
                 candidate.content_scale,
                 resolved_crop_region,
             ),
-            duration_seconds: frame.duration_seconds,
+            duration_us: frame.duration_us,
         })
         .collect::<Vec<_>>();
     let started = Instant::now();
@@ -2642,7 +2731,7 @@ fn encode_candidate_from_video_timeline_internal(
                         candidate.content_scale,
                         resolved_crop_region,
                     ),
-                    duration_seconds: frame.duration_seconds,
+                    duration_us: frame.duration_us,
                 })
                 .ok_or_else(|| "timeline frame index is out of range".to_string())
         })
@@ -2700,7 +2789,7 @@ fn encode_candidate_with_ffmpeg_frames_internal(
         .into_iter()
         .map(|pixels| StickerFrame {
             pixels,
-            duration_seconds: 1.0 / candidate.fps.max(1) as f64,
+            duration_us: frame_duration_us_for_fps(candidate.fps),
         })
         .collect::<Vec<_>>();
     let started = Instant::now();
@@ -2771,7 +2860,7 @@ fn encode_candidate_internal(
                         candidate.content_scale,
                         resolved_crop_region,
                     ),
-                    duration_seconds: frame.duration_seconds,
+                    duration_us: frame.duration_us,
                 })
                 .collect::<Vec<_>>();
         let started = Instant::now();
@@ -3189,12 +3278,25 @@ fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIns
         .first()
         .map(|frame| frame.pixels.height())
         .unwrap_or(0);
+    let total_duration_us = match sticker_frame_duration_us(&frames) {
+        Ok(duration_us) => duration_us,
+        Err(error) => {
+            return inspection_error(
+                input_path,
+                Some("native".into()),
+                None,
+                Some(locale::native_animation_detail(locale, "gif")),
+                "inspect-failed",
+                error.into(),
+            );
+        }
+    };
     let frame_durations = frames
         .iter()
-        .map(|frame| frame.duration_seconds)
+        .map(|frame| duration_us_to_seconds(frame.duration_us))
         .collect::<Vec<_>>();
     let estimated_frames = frame_durations.len() as u64;
-    let duration_seconds = frame_durations.iter().sum::<f64>();
+    let duration_seconds = duration_us_to_seconds(total_duration_us);
     let avg_fps = if duration_seconds > 0.0 {
         Some(estimated_frames as f64 / duration_seconds)
     } else {
@@ -3716,7 +3818,7 @@ async fn build_optimizer_plan(request: OptimizerPlanRequest) -> OptimizerPlanRes
             ok: false,
             fit_mode: fallback_fit_mode,
             selected_duration_seconds: None,
-            recommended_max_duration_seconds: RECOMMENDED_MAX_DURATION_SECONDS,
+            recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
             search_budget: MAX_SEARCH_BUDGET,
             warnings: Vec::new(),
             candidates: Vec::new(),
@@ -4297,7 +4399,7 @@ mod tests {
             .iter()
             .map(|color| StickerFrame {
                 pixels: RgbaImage::from_pixel(48, 48, named_rgba(color)),
-                duration_seconds: 0.1,
+                duration_us: 100_000,
             })
             .collect::<Vec<_>>();
         write_native_apng(Path::new(&input_path), &frames, "standard")
@@ -4361,15 +4463,15 @@ mod tests {
         let frames = vec![
             StickerFrame {
                 pixels: RgbaImage::from_pixel(48, 48, named_rgba("red")),
-                duration_seconds: 0.12,
+                duration_us: 120_000,
             },
             StickerFrame {
                 pixels: RgbaImage::from_pixel(48, 48, named_rgba("green")),
-                duration_seconds: 0.24,
+                duration_us: 240_000,
             },
             StickerFrame {
                 pixels: RgbaImage::from_pixel(48, 48, named_rgba("blue")),
-                duration_seconds: 0.36,
+                duration_us: 360_000,
             },
         ];
         write_native_apng(Path::new(&output_path), &frames, "standard")
@@ -4590,19 +4692,19 @@ mod tests {
         let expected_frames = vec![
             StickerFrame {
                 pixels: sparse_sprite_frame(16, 16, Some((2, 2))),
-                duration_seconds: 0.10,
+                duration_us: 100_000,
             },
             StickerFrame {
                 pixels: sparse_sprite_frame(16, 16, Some((9, 2))),
-                duration_seconds: 0.12,
+                duration_us: 120_000,
             },
             StickerFrame {
                 pixels: sparse_sprite_frame(16, 16, None),
-                duration_seconds: 0.14,
+                duration_us: 140_000,
             },
             StickerFrame {
                 pixels: sparse_sprite_frame(16, 16, Some((4, 10))),
-                duration_seconds: 0.16,
+                duration_us: 160_000,
             },
         ];
 
@@ -4615,10 +4717,7 @@ mod tests {
         assert_eq!(decoded_frames.len(), expected_frames.len());
         for (decoded, expected) in decoded_frames.iter().zip(expected_frames.iter()) {
             assert_eq!(decoded.pixels.as_raw(), expected.pixels.as_raw());
-            assert!(approx_eq(
-                decoded.duration_seconds,
-                expected.duration_seconds
-            ));
+            assert_eq!(decoded.duration_us, expected.duration_us);
         }
     }
 
@@ -5161,15 +5260,15 @@ mod tests {
         let timeline_frames = vec![
             ResolvedTimelineFrame {
                 source_frame_index: 2,
-                duration_seconds: 0.12,
+                duration_us: 120_000,
             },
             ResolvedTimelineFrame {
                 source_frame_index: 0,
-                duration_seconds: 0.24,
+                duration_us: 240_000,
             },
             ResolvedTimelineFrame {
                 source_frame_index: 2,
-                duration_seconds: 0.36,
+                duration_us: 360_000,
             },
         ];
 
@@ -5386,7 +5485,7 @@ mod tests {
             .candidates
             .iter()
             .any(|candidate| candidate.frame_sample_step > 1
-                && candidate.duration_seconds <= DISCORD_MAX_DURATION_SECONDS));
+                && candidate.duration_seconds <= duration_us_to_seconds(DISCORD_MAX_DURATION_US)));
     }
 
     #[test]
@@ -5475,6 +5574,138 @@ mod tests {
     }
 
     #[test]
+    fn timeline_duration_us_accepts_exact_discord_limit() {
+        let frames = vec![
+            ResolvedTimelineFrame {
+                source_frame_index: 0,
+                duration_us: 1_666_667,
+            },
+            ResolvedTimelineFrame {
+                source_frame_index: 1,
+                duration_us: 1_666_667,
+            },
+            ResolvedTimelineFrame {
+                source_frame_index: 2,
+                duration_us: 1_666_666,
+            },
+        ];
+
+        assert_eq!(timeline_duration_us(&frames), Ok(DISCORD_MAX_DURATION_US));
+    }
+
+    #[test]
+    fn timeline_duration_limit_rejects_one_microsecond_over_before_writing() {
+        let response = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: Some("en".into()),
+                source_duration_seconds: Some(5.000001),
+                input_width: Some(48),
+                input_height: Some(48),
+                avg_fps: Some(0.6),
+                fit_mode: "contain".into(),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: Some(3),
+                timeline_frames: Some(vec![
+                    EditedTimelineFrame {
+                        source_frame_id: 1,
+                        duration_us: 1_666_667,
+                    },
+                    EditedTimelineFrame {
+                        source_frame_id: 2,
+                        duration_us: 1_666_667,
+                    },
+                    EditedTimelineFrame {
+                        source_frame_id: 3,
+                        duration_us: 1_666_667,
+                    },
+                ]),
+            },
+            UiLocale::En,
+        );
+
+        assert!(!response.ok);
+        assert!(response.candidates.is_empty());
+        assert_eq!(response.error_code.as_deref(), Some("duration-too-long"));
+    }
+
+    #[test]
+    fn timeline_duration_us_rejects_checked_add_overflow() {
+        let frames = vec![
+            ResolvedTimelineFrame {
+                source_frame_index: 0,
+                duration_us: u64::MAX,
+            },
+            ResolvedTimelineFrame {
+                source_frame_index: 1,
+                duration_us: 1,
+            },
+        ];
+
+        assert_eq!(
+            timeline_duration_us(&frames),
+            Err("invalid-frame-selection")
+        );
+    }
+
+    #[test]
+    fn sticker_frame_duration_us_rejects_checked_add_overflow() {
+        let frames = vec![
+            StickerFrame {
+                pixels: RgbaImage::new(1, 1),
+                duration_us: u64::MAX,
+            },
+            StickerFrame {
+                pixels: RgbaImage::new(1, 1),
+                duration_us: 1,
+            },
+        ];
+
+        assert_eq!(
+            sticker_frame_duration_us(&frames),
+            Err("invalid-frame-selection")
+        );
+    }
+
+    #[test]
+    fn quantize_apng_delays_uses_positive_hundred_microsecond_ticks() {
+        let delays = quantize_apng_delays(&[1_666_667, 1_666_667, 1_666_666])
+            .expect("valid frame durations should quantize");
+
+        assert!(delays.iter().all(|(numerator, _)| *numerator >= 1));
+        assert!(delays.iter().all(|(_, denominator)| *denominator == 10_000));
+    }
+
+    #[test]
+    fn quantize_apng_delays_keeps_total_error_within_half_a_tick() {
+        let delays = quantize_apng_delays(&[1_666_667, 1_666_667, 1_666_666])
+            .expect("valid frame durations should quantize");
+        let quantized_total_us = delays
+            .iter()
+            .map(|(numerator, _)| u64::from(*numerator) * 100)
+            .sum::<u64>();
+
+        assert!(quantized_total_us.abs_diff(5_000_000) <= 50);
+    }
+
+    #[test]
+    fn quantize_apng_delays_rejects_sub_tick_frame_duration() {
+        assert_eq!(quantize_apng_delays(&[99]), Err("invalid-frame-duration"));
+    }
+
+    #[test]
+    fn quantize_apng_delays_rejects_checked_cumulative_overflow() {
+        assert_eq!(
+            quantize_apng_delays(&[u64::MAX, 100]),
+            Err("invalid-frame-selection")
+        );
+    }
+
+    #[test]
     fn resolve_timeline_frames_preserves_order_and_duplicates() {
         let timeline_frames = resolve_timeline_frames(
             Some(&vec![
@@ -5498,11 +5729,11 @@ mod tests {
 
         assert_eq!(timeline_frames.len(), 3);
         assert_eq!(timeline_frames[0].source_frame_index, 2);
-        assert!(approx_eq(timeline_frames[0].duration_seconds, 0.12));
+        assert_eq!(timeline_frames[0].duration_us, 120_000);
         assert_eq!(timeline_frames[1].source_frame_index, 0);
-        assert!(approx_eq(timeline_frames[1].duration_seconds, 0.24));
+        assert_eq!(timeline_frames[1].duration_us, 240_000);
         assert_eq!(timeline_frames[2].source_frame_index, 2);
-        assert!(approx_eq(timeline_frames[2].duration_seconds, 0.36));
+        assert_eq!(timeline_frames[2].duration_us, 360_000);
     }
 
     #[test]
