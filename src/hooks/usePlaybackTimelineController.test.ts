@@ -46,86 +46,125 @@ const timelineFrameViews: TimelineFrameView[] = [
 ];
 
 describe("usePlaybackTimelineController timeline lookup helpers", () => {
-  it("resolves the playback step index from the next matching timeline frame", async () => {
+  it("resolves the containing frame and its remaining delay in microseconds", async () => {
     const playbackModule = await import("./usePlaybackTimelineController");
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackTickIndex = (
+    const resolvePlaybackTick = (
       playbackModule as Record<string, unknown>
-    ).resolvePlaybackTickIndex;
+    ).resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
-    expect(resolvePlaybackTickIndex).toBeTypeOf("function");
+    expect(resolvePlaybackTick).toBeTypeOf("function");
     if (
       typeof createPlaybackTimelineLookup !== "function" ||
-      typeof resolvePlaybackTickIndex !== "function"
+      typeof resolvePlaybackTick !== "function"
     ) {
       return;
     }
 
     const lookup = createPlaybackTimelineLookup(timelineFrameViews);
 
-    expect(resolvePlaybackTickIndex(lookup, 0)).toBe(0);
-    expect(resolvePlaybackTickIndex(lookup, 0.995)).toBe(1);
-    expect(resolvePlaybackTickIndex(lookup, 2.004)).toBe(2);
-    expect(resolvePlaybackTickIndex(lookup, 9)).toBe(0);
+    expect(resolvePlaybackTick(lookup, 2_000_000)).toEqual({
+      frameIndex: 2,
+      delayUs: 1_500_000,
+    });
+    expect(resolvePlaybackTick(lookup, 2_200_000)).toEqual({
+      frameIndex: 2,
+      delayUs: 1_300_000,
+    });
+    expect(resolvePlaybackTick(lookup, 4_000_000)).toEqual({
+      frameIndex: 0,
+      delayUs: 1_000_000,
+    });
   });
 
-  it("resolves the preview frame from the latest frame at or before the current time", async () => {
+  it("uses exact half-open microsecond frame boundaries", async () => {
     const playbackModule = await import("./usePlaybackTimelineController");
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackFrameAtTime = (
+    const resolvePlaybackTick = (
       playbackModule as Record<string, unknown>
-    ).resolvePlaybackFrameAtTime;
+    ).resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
-    expect(resolvePlaybackFrameAtTime).toBeTypeOf("function");
+    expect(resolvePlaybackTick).toBeTypeOf("function");
     if (
       typeof createPlaybackTimelineLookup !== "function" ||
-      typeof resolvePlaybackFrameAtTime !== "function"
+      typeof resolvePlaybackTick !== "function"
     ) {
       return;
     }
 
     const lookup = createPlaybackTimelineLookup(timelineFrameViews);
 
-    expect(resolvePlaybackFrameAtTime(lookup, -0.5)?.instanceId).toBe("frame-1");
-    expect(resolvePlaybackFrameAtTime(lookup, 1.2)?.instanceId).toBe("frame-2");
-    expect(resolvePlaybackFrameAtTime(lookup, 3.9)?.instanceId).toBe("frame-4");
+    expect(resolvePlaybackTick(lookup, 1_999_999)).toEqual({
+      frameIndex: 1,
+      delayUs: 1,
+    });
+    expect(resolvePlaybackTick(lookup, 2_000_000)).toEqual({
+      frameIndex: 2,
+      delayUs: 1_500_000,
+    });
+    expect(resolvePlaybackTick(lookup, 3_500_000)).toEqual({
+      frameIndex: 3,
+      delayUs: 500_000,
+    });
   });
 
-  it("resolves the nearest frame instance id without scanning the full list", async () => {
+  it("selects the next frame across a gap", async () => {
     const playbackModule = await import("./usePlaybackTimelineController");
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolveNearestFrameInstanceIdAtTime = (
+    const resolvePlaybackTick = (
       playbackModule as Record<string, unknown>
-    ).resolveNearestFrameInstanceIdAtTime;
+    ).resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
-    expect(resolveNearestFrameInstanceIdAtTime).toBeTypeOf("function");
+    expect(resolvePlaybackTick).toBeTypeOf("function");
     if (
       typeof createPlaybackTimelineLookup !== "function" ||
-      typeof resolveNearestFrameInstanceIdAtTime !== "function"
+      typeof resolvePlaybackTick !== "function"
     ) {
       return;
     }
 
-    const lookup = createPlaybackTimelineLookup(timelineFrameViews);
-    const selectedLookup = createPlaybackTimelineLookup([
+    const lookup = createPlaybackTimelineLookup([
       timelineFrameViews[0],
       timelineFrameViews[2],
       timelineFrameViews[3],
     ]);
 
-    expect(resolveNearestFrameInstanceIdAtTime(lookup, 0.45)).toBe("frame-1");
-    expect(resolveNearestFrameInstanceIdAtTime(lookup, 2.6)).toBe("frame-3");
-    expect(resolveNearestFrameInstanceIdAtTime(selectedLookup, 1.4)).toBe("frame-3");
-    expect(resolveNearestFrameInstanceIdAtTime(createPlaybackTimelineLookup([]), 1.4)).toBeNull();
+    expect(resolvePlaybackTick(lookup, 1_400_000)).toEqual({
+      frameIndex: 1,
+      delayUs: 1_500_000,
+    });
+  });
+
+  it("returns null for an empty playback lookup", async () => {
+    const playbackModule = await import("./usePlaybackTimelineController");
+    const createPlaybackTimelineLookup = (
+      playbackModule as Record<string, unknown>
+    ).createPlaybackTimelineLookup;
+    const resolvePlaybackTick = (
+      playbackModule as Record<string, unknown>
+    ).resolvePlaybackTick;
+
+    expect(createPlaybackTimelineLookup).toBeTypeOf("function");
+    expect(resolvePlaybackTick).toBeTypeOf("function");
+    if (
+      typeof createPlaybackTimelineLookup !== "function" ||
+      typeof resolvePlaybackTick !== "function"
+    ) {
+      return;
+    }
+
+    const lookup = createPlaybackTimelineLookup([]);
+
+    expect(resolvePlaybackTick(lookup, 0)).toBeNull();
   });
 
   it("uses integer microsecond offsets as the lookup authority", async () => {
@@ -133,15 +172,15 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolveNearestFrameInstanceIdAtTime = (
+    const resolvePlaybackTick = (
       playbackModule as Record<string, unknown>
-    ).resolveNearestFrameInstanceIdAtTime;
+    ).resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
-    expect(resolveNearestFrameInstanceIdAtTime).toBeTypeOf("function");
+    expect(resolvePlaybackTick).toBeTypeOf("function");
     if (
       typeof createPlaybackTimelineLookup !== "function" ||
-      typeof resolveNearestFrameInstanceIdAtTime !== "function"
+      typeof resolvePlaybackTick !== "function"
     ) {
       return;
     }
@@ -161,7 +200,14 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
       },
     ]);
 
-    expect(resolveNearestFrameInstanceIdAtTime(lookup, 0.166667)).toBe("frame-1");
+    expect(resolvePlaybackTick(lookup, 333_333)).toEqual({
+      frameIndex: 0,
+      delayUs: 1,
+    });
+    expect(resolvePlaybackTick(lookup, 333_334)).toEqual({
+      frameIndex: 1,
+      delayUs: 333_333,
+    });
   });
 
   it("normalizes play start to the next selected frame when current time is in a gap", async () => {
@@ -188,8 +234,8 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
       timelineFrameViews[3],
     ]);
 
-    expect(resolvePlaybackStartTime(selectedLookup, 1.4)).toBe(2);
-    expect(resolvePlaybackStartTime(selectedLookup, 2.2)).toBe(2.2);
-    expect(resolvePlaybackStartTime(selectedLookup, 9)).toBe(0);
+    expect(resolvePlaybackStartTime(selectedLookup, 1_400_000)).toBe(2_000_000);
+    expect(resolvePlaybackStartTime(selectedLookup, 2_200_000)).toBe(2_200_000);
+    expect(resolvePlaybackStartTime(selectedLookup, 9_000_000)).toBe(0);
   });
 });
