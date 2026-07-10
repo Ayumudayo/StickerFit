@@ -29,7 +29,6 @@ type EditorOverlayPanelProps = {
   onOptimizerSearchDepthChange: (value: OptimizerSearchDepth) => void;
   onOpenOutputFolder: (path?: string | null) => void;
   onClose: () => void;
-  fitModeLabel: (value: string) => string;
 };
 
 export function EditorOverlayPanel({
@@ -49,7 +48,6 @@ export function EditorOverlayPanel({
   onOptimizerSearchDepthChange,
   onOpenOutputFolder,
   onClose,
-  fitModeLabel,
 }: EditorOverlayPanelProps) {
   if (!activePanel) {
     return null;
@@ -116,7 +114,6 @@ export function EditorOverlayPanel({
               locale={locale}
               plan={plan}
               searchResult={null}
-              fitModeLabel={fitModeLabel}
               variant="dock"
             />
           ) : null}
@@ -126,7 +123,6 @@ export function EditorOverlayPanel({
               copy={copy}
               locale={locale}
               searchResult={searchResult}
-              fitModeLabel={fitModeLabel}
               onOpenOutputFolder={onOpenOutputFolder}
             />
           ) : null}

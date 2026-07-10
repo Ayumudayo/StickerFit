@@ -31,8 +31,7 @@ import {
 import { useMediaWorkflowController } from "./hooks/useMediaWorkflowController";
 import { usePlaybackTimelineController } from "./hooks/usePlaybackTimelineController";
 import { editorText } from "./locales/editorText";
-import { detectLocale, MESSAGES, type Locale, type MessagesForLocale } from "./locales/messages";
-import type { FitMode } from "./types/workflow";
+import { detectLocale, MESSAGES, type Locale } from "./locales/messages";
 import { formatTimelineTime } from "./utils/timelineFrames";
 
 const ADVANCED_PREVIEW_COUNT = 6;
@@ -44,18 +43,6 @@ const MIN_DURATION_US = 10_000;
 
 function filterPathLabel(value: string | null, fallback: string) {
   return value?.trim() ? value : fallback;
-}
-
-function fitModeText(fitMode: FitMode, copy: MessagesForLocale) {
-  if (fitMode === "cover") {
-    return copy.cover;
-  }
-
-  if (fitMode === "fill") {
-    return copy.fill;
-  }
-
-  return copy.contain;
 }
 
 function isPlainGlobalShortcut(event: KeyboardEvent) {
@@ -102,7 +89,6 @@ export default function App() {
     searchResult,
     conversionResult,
     outputDirectory,
-    fitMode,
     optimizerGoal,
     qualityFrameDropInterval,
     optimizerSearchDepth,
@@ -115,7 +101,6 @@ export default function App() {
     plannerError,
     isDragging,
     setOutputDirectory,
-    setFitMode,
     setOptimizerGoal,
     setQualityFrameDropInterval,
     setOptimizerSearchDepth,
@@ -628,11 +613,8 @@ export default function App() {
                 quickFps,
                 previewDurationLabel,
                 selectionLabel,
-                fitMode,
                 cropAspectRatioPreset,
-                isStaticImage: inspection.isStaticImage,
                 isCropSelectionReset,
-                onFitModeChange: setFitMode,
                 onCropAspectRatioPresetChange: handleCropAspectRatioPresetChange,
                 onResetSelection: resetCropSelection,
               }}
@@ -678,7 +660,6 @@ export default function App() {
                 onOptimizerSearchDepthChange: setOptimizerSearchDepth,
                 onOpenOutputFolder: (path) => void openOutputFolder(path),
                 onClose: () => setActiveDockPanel(null),
-                fitModeLabel: (value) => fitModeText(value as FitMode, copy),
               }}
               previewControlBarProps={{
                 copy,

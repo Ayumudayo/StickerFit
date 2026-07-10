@@ -21,7 +21,6 @@ type AdvancedDetailsPanelProps = {
 	locale: Locale;
 	plan: OptimizerPlanResponse | null;
 	searchResult: OptimizerSearchResponse | null;
-	fitModeLabel: (fitMode: string) => string;
 	variant?: "page" | "dock";
 };
 
@@ -30,7 +29,6 @@ export function AdvancedDetailsPanel({
 	locale,
 	plan,
 	searchResult,
-	fitModeLabel,
 	variant = "page",
 }: AdvancedDetailsPanelProps) {
 	const hasAdvancedContent = Boolean(plan) || Boolean(searchResult);
@@ -91,10 +89,6 @@ export function AdvancedDetailsPanel({
 											<div>
 												<span className="metaLabel">{copy.contentScale}</span>
 												<strong>{formatScale(candidate.contentScale)}</strong>
-											</div>
-											<div>
-												<span className="metaLabel">{copy.fit}</span>
-												<strong>{fitModeLabel(candidate.fitMode)}</strong>
 											</div>
 											<div>
 												<span className="metaLabel">{copy.duration}</span>
@@ -159,10 +153,6 @@ export function AdvancedDetailsPanel({
 											<div>
 												<span className="metaLabel">{copy.size}</span>
 												<strong>{formatKiB(attempt.sizeBytes)}</strong>
-											</div>
-											<div>
-												<span className="metaLabel">{copy.fit}</span>
-												<strong>{fitModeLabel(attempt.fitMode)}</strong>
 											</div>
 											<div>
 												<span className="metaLabel">{copy.frameRate}</span>

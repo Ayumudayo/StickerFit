@@ -15,7 +15,6 @@ type EditorResultsOverlayProps = {
   copy: MessagesForLocale;
   locale: Locale;
   searchResult: OptimizerSearchResponse | null;
-  fitModeLabel: (value: string) => string;
   onOpenOutputFolder: (path?: string | null) => void;
 };
 
@@ -23,7 +22,6 @@ export function EditorResultsOverlay({
   copy,
   locale,
   searchResult,
-  fitModeLabel,
   onOpenOutputFolder,
 }: EditorResultsOverlayProps) {
   if (!searchResult) {
@@ -119,10 +117,6 @@ export function EditorResultsOverlay({
                   <div>
                     <span className="metaLabel">{copy.size}</span>
                     <strong>{formatKiB(attempt.sizeBytes)}</strong>
-                  </div>
-                  <div>
-                    <span className="metaLabel">{copy.fit}</span>
-                    <strong>{fitModeLabel(attempt.fitMode)}</strong>
                   </div>
                   <div>
                     <span className="metaLabel">{copy.frameRate}</span>

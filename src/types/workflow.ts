@@ -1,8 +1,6 @@
 import type { CropRegion } from "../components/MediaSelectionPreview";
 import type { Locale } from "../locales/messages";
 
-export type FitMode = "contain" | "cover" | "fill";
-
 export type OptimizerPresetStrategy = "auto" | "quality" | "size";
 
 export type OptimizerGoal = "balanced" | "motion" | "quality";
@@ -22,7 +20,6 @@ export type OptimizerPlanRequest = {
   inputWidth: number | null;
   inputHeight: number | null;
   avgFps: number | null;
-  fitMode: FitMode;
   presetStrategy: OptimizerPresetStrategy;
   optimizerGoal: OptimizerGoal;
   qualityFrameDropInterval: number;
@@ -131,7 +128,6 @@ export type OptimizerCandidatePreview = {
   fps: number;
   contentScale: number;
   preset: string;
-  fitMode: FitMode;
   score: number;
   sourceSimilarityScore: number;
   summary: string;
@@ -139,7 +135,6 @@ export type OptimizerCandidatePreview = {
 
 export type OptimizerPlanResponse = {
   ok: boolean;
-  fitMode: FitMode;
   selectedDurationSeconds: number | null;
   recommendedMaxDurationSeconds: number;
   searchBudget: number;
@@ -185,7 +180,6 @@ export type SearchAttemptResult = {
   fps: number;
   contentScale: number;
   preset: string;
-  fitMode: FitMode;
   score: number;
   sourceSimilarityScore: number;
   summary: string;
@@ -204,7 +198,6 @@ export type SearchAttemptResult = {
 
 export type OptimizerSearchResponse = {
   ok: boolean;
-  fitMode: FitMode;
   selectedDurationSeconds: number | null;
   limitBytes: number;
   searchBudget: number;

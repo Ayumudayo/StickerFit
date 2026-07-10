@@ -4,9 +4,9 @@ use base64::{engine::general_purpose, Engine as _};
 use image::codecs::gif::GifDecoder as ImageGifDecoder;
 use image::codecs::png::PngDecoder as ImagePngDecoder;
 use image::imageops::{self, FilterType};
-use image::{AnimationDecoder, GenericImage, ImageReader, Rgba, RgbaImage};
+use image::{AnimationDecoder, ImageReader, RgbaImage};
 #[cfg(test)]
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, ImageFormat, Rgba};
 use png::{
     BitDepth as PngBitDepth, BlendOp as PngBlendOp, ColorType as PngColorType,
     DeflateCompression as PngDeflateCompression, DisposeOp as PngDisposeOp,
@@ -42,6 +42,8 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 use crate::locale::{parse_ui_locale, UiLocale};
+
+const CANONICAL_FIT_MODE: &str = "contain";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,7 +138,7 @@ struct OptimizerPlanRequest {
     input_width: Option<u32>,
     input_height: Option<u32>,
     avg_fps: Option<f64>,
-    fit_mode: String,
+    fit_mode: Option<String>,
     preset_strategy: Option<String>,
     optimizer_goal: Option<String>,
     quality_frame_drop_interval: Option<u32>,
@@ -219,7 +221,7 @@ struct OptimizerSearchRequest {
     input_width: Option<u32>,
     input_height: Option<u32>,
     avg_fps: Option<f64>,
-    fit_mode: String,
+    fit_mode: Option<String>,
     preset_strategy: Option<String>,
     optimizer_goal: Option<String>,
     quality_frame_drop_interval: Option<u32>,
@@ -1363,7 +1365,6 @@ fn build_candidate_ladder_fixed_duration(
     fps: u32,
     input_width: Option<u32>,
     input_height: Option<u32>,
-    fit_mode: &str,
     preset_strategy: &str,
     optimizer_goal: &str,
     search_budget: usize,
@@ -1404,7 +1405,7 @@ fn build_candidate_ladder_fixed_duration(
             candidates.push(CandidatePreview {
                 id: format!(
                     "{}-{}-{}fps-{}scale-{}ms",
-                    fit_mode,
+                    CANONICAL_FIT_MODE,
                     preset,
                     fps,
                     (scale * 100.0).round() as u32,
@@ -1415,7 +1416,7 @@ fn build_candidate_ladder_fixed_duration(
                 fps,
                 content_scale: *scale,
                 preset: (*preset).into(),
-                fit_mode: fit_mode.into(),
+                fit_mode: CANONICAL_FIT_MODE.into(),
                 score,
                 source_similarity_score: score,
                 summary,
@@ -1428,7 +1429,6 @@ fn build_candidate_ladder_fixed_duration(
 }
 
 fn build_filter_graph(
-    fit_mode: &str,
     fps: u32,
     content_scale: f64,
     input_width: Option<u32>,
@@ -1455,17 +1455,9 @@ fn build_filter_graph(
         })
         .unwrap_or_else(|| "setpts=PTS-STARTPTS,".into());
 
-    match fit_mode {
-        "cover" => format!(
-            "{crop_prefix}{selection_prefix}fps={fps},scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height},format=rgba,setsar=1"
-        ),
-        "fill" => format!(
-            "{crop_prefix}{selection_prefix}fps={fps},scale={target_width}:{target_height},format=rgba,setsar=1"
-        ),
-        _ => format!(
-            "{crop_prefix}{selection_prefix}fps={fps},scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,format=rgba,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black@0.0,setsar=1"
-        ),
-    }
+    format!(
+        "{crop_prefix}{selection_prefix}fps={fps},scale={target_width}:{target_height},format=rgba,setsar=1"
+    )
 }
 
 fn build_source_frame_select_filter(frame_indexes: &BTreeSet<u32>) -> String {
@@ -1577,51 +1569,8 @@ fn crop_rgba_image(source: &RgbaImage, crop_region: Option<ResolvedCropRegion>) 
     }
 }
 
-fn fit_contain_rgba_image(source: &RgbaImage, target_width: u32, target_height: u32) -> RgbaImage {
-    if source.width() == target_width && source.height() == target_height {
-        return source.clone();
-    }
-
-    let width_scale = target_width as f64 / source.width() as f64;
-    let height_scale = target_height as f64 / source.height() as f64;
-    let scale = width_scale.min(height_scale);
-    let resized_width = (source.width() as f64 * scale)
-        .round()
-        .clamp(1.0, target_width as f64) as u32;
-    let resized_height = (source.height() as f64 * scale)
-        .round()
-        .clamp(1.0, target_height as f64) as u32;
-    let resized = imageops::resize(source, resized_width, resized_height, FilterType::Lanczos3);
-    let mut canvas = RgbaImage::from_pixel(target_width, target_height, Rgba([0, 0, 0, 0]));
-    let offset_x = (target_width.saturating_sub(resized_width)) / 2;
-    let offset_y = (target_height.saturating_sub(resized_height)) / 2;
-    let _ = canvas.copy_from(&resized, offset_x, offset_y);
-    canvas
-}
-
-fn fit_cover_rgba_image(source: &RgbaImage, target_width: u32, target_height: u32) -> RgbaImage {
-    if source.width() == target_width && source.height() == target_height {
-        return source.clone();
-    }
-
-    let width_scale = target_width as f64 / source.width() as f64;
-    let height_scale = target_height as f64 / source.height() as f64;
-    let scale = width_scale.max(height_scale);
-    let resized_width = (source.width() as f64 * scale)
-        .round()
-        .max(target_width as f64) as u32;
-    let resized_height = (source.height() as f64 * scale)
-        .round()
-        .max(target_height as f64) as u32;
-    let resized = imageops::resize(source, resized_width, resized_height, FilterType::Lanczos3);
-    let offset_x = (resized_width.saturating_sub(target_width)) / 2;
-    let offset_y = (resized_height.saturating_sub(target_height)) / 2;
-    imageops::crop_imm(&resized, offset_x, offset_y, target_width, target_height).to_image()
-}
-
 fn transform_frame_for_candidate(
     source: &RgbaImage,
-    fit_mode: &str,
     content_scale: f64,
     crop_region: Option<ResolvedCropRegion>,
 ) -> RgbaImage {
@@ -1629,11 +1578,7 @@ fn transform_frame_for_candidate(
     let (target_width, target_height) =
         scaled_output_dimensions(Some(cropped.width()), Some(cropped.height()), content_scale);
 
-    match fit_mode {
-        "cover" => fit_cover_rgba_image(&cropped, target_width, target_height),
-        "fill" => imageops::resize(&cropped, target_width, target_height, FilterType::Lanczos3),
-        _ => fit_contain_rgba_image(&cropped, target_width, target_height),
-    }
+    imageops::resize(&cropped, target_width, target_height, FilterType::Lanczos3)
 }
 
 fn transform_frame_for_static_png(
@@ -2237,14 +2182,12 @@ fn extract_video_source_frames_rgba(
     Ok((frames, output.resolution))
 }
 
-fn normalized_fit_mode(raw: &str, locale: UiLocale) -> (&'static str, Option<String>) {
+fn normalized_fit_mode(raw: Option<&str>, locale: UiLocale) -> (&'static str, Option<String>) {
     match raw {
-        "cover" => ("cover", None),
-        "contain" => ("contain", None),
-        "fill" => ("fill", None),
-        _ => (
-            "contain",
-            Some(locale::unknown_fit_mode_fallback_warning(locale)),
+        None | Some(CANONICAL_FIT_MODE) => (CANONICAL_FIT_MODE, None),
+        Some(_) => (
+            CANONICAL_FIT_MODE,
+            Some(locale::legacy_fit_mode_fallback_warning(locale)),
         ),
     }
 }
@@ -2254,7 +2197,6 @@ fn build_candidate_ladder(
     source_fps: f64,
     input_width: Option<u32>,
     input_height: Option<u32>,
-    fit_mode: &str,
     preset_strategy: &str,
     optimizer_goal: &str,
     search_budget: usize,
@@ -2312,7 +2254,7 @@ fn build_candidate_ladder(
                     candidates.push(CandidatePreview {
                         id: format!(
                             "{}-{}-{}fps-{}scale{}-{}ms",
-                            fit_mode,
+                            CANONICAL_FIT_MODE,
                             preset,
                             fps,
                             (scale * 100.0).round() as u32,
@@ -2324,7 +2266,7 @@ fn build_candidate_ladder(
                         fps,
                         content_scale: *scale,
                         preset: (*preset).into(),
-                        fit_mode: fit_mode.into(),
+                        fit_mode: CANONICAL_FIT_MODE.into(),
                         score,
                         source_similarity_score: score,
                         summary,
@@ -2342,7 +2284,7 @@ fn prepare_optimizer_plan(
     request: &OptimizerPlanRequest,
     locale: UiLocale,
 ) -> OptimizerPlanResponse {
-    let (fit_mode, fit_warning) = normalized_fit_mode(&request.fit_mode, locale);
+    let (fit_mode, fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
     let optimizer_goal = normalized_optimizer_goal(
         request.optimizer_goal.as_deref(),
         request.preset_strategy.as_deref(),
@@ -2383,7 +2325,7 @@ fn prepare_optimizer_plan(
     };
 
     if resolved_crop_region.is_some() {
-        warnings.push(locale::crop_applied_before_fit_warning(locale));
+        warnings.push(locale::crop_applied_before_scale_warning(locale));
     }
 
     let effective_input_width = request.input_width;
@@ -2505,7 +2447,6 @@ fn prepare_optimizer_plan(
                 effective_fps,
                 effective_input_width,
                 effective_input_height,
-                fit_mode,
                 preset_strategy,
                 optimizer_goal,
                 search_budget,
@@ -2618,7 +2559,6 @@ fn prepare_optimizer_plan(
             source_fps,
             effective_input_width,
             effective_input_height,
-            fit_mode,
             preset_strategy,
             optimizer_goal,
             search_budget,
@@ -2667,7 +2607,6 @@ fn encode_candidate_from_native_animation_internal(
         .map(|frame| StickerFrame {
             pixels: transform_frame_for_candidate(
                 &frame.pixels,
-                &candidate.fit_mode,
                 candidate.content_scale,
                 resolved_crop_region,
             ),
@@ -2727,7 +2666,6 @@ fn encode_candidate_from_video_timeline_internal(
                 .map(|pixels| StickerFrame {
                     pixels: transform_frame_for_candidate(
                         pixels,
-                        &candidate.fit_mode,
                         candidate.content_scale,
                         resolved_crop_region,
                     ),
@@ -2764,7 +2702,6 @@ fn encode_candidate_with_ffmpeg_frames_internal(
     let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
     let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)?;
     let filter_graph = build_filter_graph(
-        &candidate.fit_mode,
         candidate.fps,
         candidate.content_scale,
         input_width,
@@ -2856,7 +2793,6 @@ fn encode_candidate_internal(
                 .map(|frame| StickerFrame {
                     pixels: transform_frame_for_candidate(
                         &frame.pixels,
-                        &candidate.fit_mode,
                         candidate.content_scale,
                         resolved_crop_region,
                     ),
@@ -3810,17 +3746,17 @@ async fn inspect_input_media(input_path: String, locale: Option<String>) -> Medi
 #[tauri::command]
 async fn build_optimizer_plan(request: OptimizerPlanRequest) -> OptimizerPlanResponse {
     let locale = parse_ui_locale(request.locale.as_deref());
-    let fallback_fit_mode = request.fit_mode.clone();
+    let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
 
     match run_blocking_task(move || prepare_optimizer_plan(&request, locale)).await {
         Ok(result) => result,
         Err(error) => OptimizerPlanResponse {
             ok: false,
-            fit_mode: fallback_fit_mode,
+            fit_mode: CANONICAL_FIT_MODE.into(),
             selected_duration_seconds: None,
             recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
             search_budget: MAX_SEARCH_BUDGET,
-            warnings: Vec::new(),
+            warnings: fallback_fit_warning.into_iter().collect(),
             candidates: Vec::new(),
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
             error_message: Some(format!(
@@ -3870,6 +3806,8 @@ fn run_optimizer_search_internal(
     request: OptimizerSearchRequest,
     locale: UiLocale,
 ) -> OptimizerSearchResponse {
+    let (_, legacy_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
+    let legacy_fit_warnings = legacy_fit_warning.into_iter().collect::<Vec<_>>();
     let optimizer_goal = normalized_optimizer_goal(
         request.optimizer_goal.as_deref(),
         request.preset_strategy.as_deref(),
@@ -3888,7 +3826,7 @@ fn run_optimizer_search_internal(
                         Err(error) => {
                             return OptimizerSearchResponse {
                                 ok: false,
-                                fit_mode: request.fit_mode.clone(),
+                                fit_mode: CANONICAL_FIT_MODE.into(),
                                 selected_duration_seconds: None,
                                 limit_bytes: DISCORD_MAX_STICKER_BYTES,
                                 search_budget: MAX_SEARCH_BUDGET,
@@ -3896,7 +3834,7 @@ fn run_optimizer_search_internal(
                                 stop_reason: Some(error.into()),
                                 selection_reason: "no_fit_found".into(),
                                 summary: locale::plan_failed_message(locale),
-                                warnings: Vec::new(),
+                                warnings: legacy_fit_warnings.clone(),
                                 attempts: Vec::new(),
                                 winning_candidate_id: None,
                                 closest_candidate_id: None,
@@ -3914,7 +3852,7 @@ fn run_optimizer_search_internal(
             Err("no-frames-selected") => {
                 return OptimizerSearchResponse {
                     ok: false,
-                    fit_mode: request.fit_mode.clone(),
+                    fit_mode: CANONICAL_FIT_MODE.into(),
                     selected_duration_seconds: None,
                     limit_bytes: DISCORD_MAX_STICKER_BYTES,
                     search_budget: MAX_SEARCH_BUDGET,
@@ -3922,7 +3860,7 @@ fn run_optimizer_search_internal(
                     stop_reason: Some("no-frames-selected".into()),
                     selection_reason: "no_fit_found".into(),
                     summary: locale::plan_failed_message(locale),
-                    warnings: Vec::new(),
+                    warnings: legacy_fit_warnings.clone(),
                     attempts: Vec::new(),
                     winning_candidate_id: None,
                     closest_candidate_id: None,
@@ -3936,7 +3874,7 @@ fn run_optimizer_search_internal(
             Err(_) => {
                 return OptimizerSearchResponse {
                     ok: false,
-                    fit_mode: request.fit_mode.clone(),
+                    fit_mode: CANONICAL_FIT_MODE.into(),
                     selected_duration_seconds: None,
                     limit_bytes: DISCORD_MAX_STICKER_BYTES,
                     search_budget: MAX_SEARCH_BUDGET,
@@ -3944,7 +3882,7 @@ fn run_optimizer_search_internal(
                     stop_reason: Some("invalid-frame-selection".into()),
                     selection_reason: "no_fit_found".into(),
                     summary: locale::plan_failed_message(locale),
-                    warnings: Vec::new(),
+                    warnings: legacy_fit_warnings.clone(),
                     attempts: Vec::new(),
                     winning_candidate_id: None,
                     closest_candidate_id: None,
@@ -3973,7 +3911,7 @@ fn run_optimizer_search_internal(
                             Err(error) => {
                                 return OptimizerSearchResponse {
                                     ok: false,
-                                    fit_mode: request.fit_mode.clone(),
+                                    fit_mode: CANONICAL_FIT_MODE.into(),
                                     selected_duration_seconds: None,
                                     limit_bytes: DISCORD_MAX_STICKER_BYTES,
                                     search_budget: MAX_SEARCH_BUDGET,
@@ -3981,7 +3919,7 @@ fn run_optimizer_search_internal(
                                     stop_reason: Some(error.into()),
                                     selection_reason: "no_fit_found".into(),
                                     summary: locale::plan_failed_message(locale),
-                                    warnings: Vec::new(),
+                                    warnings: legacy_fit_warnings.clone(),
                                     attempts: Vec::new(),
                                     winning_candidate_id: None,
                                     closest_candidate_id: None,
@@ -4004,7 +3942,7 @@ fn run_optimizer_search_internal(
                 Err("no-frames-selected") => {
                     return OptimizerSearchResponse {
                         ok: false,
-                        fit_mode: request.fit_mode.clone(),
+                        fit_mode: CANONICAL_FIT_MODE.into(),
                         selected_duration_seconds: None,
                         limit_bytes: DISCORD_MAX_STICKER_BYTES,
                         search_budget: MAX_SEARCH_BUDGET,
@@ -4012,7 +3950,7 @@ fn run_optimizer_search_internal(
                         stop_reason: Some("no-frames-selected".into()),
                         selection_reason: "no_fit_found".into(),
                         summary: locale::plan_failed_message(locale),
-                        warnings: Vec::new(),
+                        warnings: legacy_fit_warnings.clone(),
                         attempts: Vec::new(),
                         winning_candidate_id: None,
                         closest_candidate_id: None,
@@ -4026,7 +3964,7 @@ fn run_optimizer_search_internal(
                 Err(_) => {
                     return OptimizerSearchResponse {
                         ok: false,
-                        fit_mode: request.fit_mode.clone(),
+                        fit_mode: CANONICAL_FIT_MODE.into(),
                         selected_duration_seconds: None,
                         limit_bytes: DISCORD_MAX_STICKER_BYTES,
                         search_budget: MAX_SEARCH_BUDGET,
@@ -4034,7 +3972,7 @@ fn run_optimizer_search_internal(
                         stop_reason: Some("invalid-frame-selection".into()),
                         selection_reason: "no_fit_found".into(),
                         summary: locale::plan_failed_message(locale),
-                        warnings: Vec::new(),
+                        warnings: legacy_fit_warnings.clone(),
                         attempts: Vec::new(),
                         winning_candidate_id: None,
                         closest_candidate_id: None,
@@ -4557,16 +4495,98 @@ mod tests {
     }
 
     #[test]
-    fn build_filter_graph_retimes_selected_frames_before_fps_resampling() {
-        let graph = build_filter_graph(
-            "contain",
-            12,
-            1.0,
-            Some(320),
-            Some(320),
-            None,
-            Some(&[0, 6]),
+    fn legacy_fit_modes_are_canonicalized_to_contain() {
+        for raw in ["cover", "fill", "unexpected"] {
+            let (mode, warning) = normalized_fit_mode(Some(raw), UiLocale::En);
+            assert_eq!(mode, "contain");
+            assert!(warning.is_some());
+        }
+
+        assert_eq!(
+            normalized_fit_mode(Some("contain"), UiLocale::En),
+            ("contain", None),
         );
+        assert_eq!(normalized_fit_mode(None, UiLocale::En), ("contain", None));
+    }
+
+    #[test]
+    fn optimizer_plan_request_accepts_missing_fit_mode() {
+        let plan_request = serde_json::from_str::<OptimizerPlanRequest>("{}");
+        let search_request =
+            serde_json::from_str::<OptimizerSearchRequest>(r#"{"inputPath":"ignored.png"}"#);
+
+        assert!(
+            plan_request.is_ok(),
+            "plan fitMode should remain optional on the wire"
+        );
+        assert!(
+            search_request.is_ok(),
+            "search fitMode should remain optional on the wire"
+        );
+    }
+
+    #[test]
+    fn legacy_fit_mode_plan_metadata_stays_canonical() {
+        let response = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: Some("en".into()),
+                source_duration_seconds: Some(1.0),
+                input_width: Some(640),
+                input_height: Some(320),
+                avg_fps: Some(1.0),
+                fit_mode: Some("cover".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: Some(1),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+        );
+
+        assert!(response.ok);
+        assert_eq!(response.fit_mode, "contain");
+        assert!(!response.warnings.is_empty());
+        assert!(response.candidates.iter().all(|candidate| {
+            candidate.fit_mode == "contain" && candidate.id.starts_with("contain-")
+        }));
+    }
+
+    #[test]
+    fn legacy_fit_mode_search_error_stays_canonical_and_warns() {
+        let response = run_optimizer_search_internal(
+            OptimizerSearchRequest {
+                input_path: "ignored.png".into(),
+                output_directory: None,
+                locale: Some("en".into()),
+                source_duration_seconds: Some(1.0),
+                input_width: Some(48),
+                input_height: Some(48),
+                avg_fps: Some(7.0),
+                fit_mode: Some("fill".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: Some(Vec::new()),
+                base_frame_count: Some(7),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+        );
+
+        assert!(!response.ok);
+        assert_eq!(response.fit_mode, "contain");
+        assert!(!response.warnings.is_empty());
+    }
+
+    #[test]
+    fn build_filter_graph_retimes_selected_frames_before_fps_resampling() {
+        let graph = build_filter_graph(12, 1.0, Some(320), Some(320), None, Some(&[0, 6]));
 
         assert!(graph.contains("select='eq(n,0)+eq(n,6)',setpts=N/(12*TB),fps=12"));
         assert!(!graph.contains("select='eq(n,0)+eq(n,6)',fps=12"));
@@ -4724,7 +4744,6 @@ mod tests {
     #[test]
     fn build_filter_graph_uses_cropped_dimensions_for_max_320_scaling() {
         let graph = build_filter_graph(
-            "contain",
             12,
             1.0,
             Some(640),
@@ -4739,8 +4758,9 @@ mod tests {
         );
 
         assert!(graph.contains("crop=200:100:0:0"));
-        assert!(graph.contains("scale=200:100:force_original_aspect_ratio=decrease"));
-        assert!(graph.contains("pad=200:100:(ow-iw)/2:(oh-ih)/2:color=black@0.0"));
+        assert!(
+            graph.contains("crop=200:100:0:0,setpts=PTS-STARTPTS,fps=12,scale=200:100,format=rgba")
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -5039,7 +5059,7 @@ mod tests {
                     input_width: inspection.width,
                     input_height: inspection.height,
                     avg_fps: inspection.avg_fps,
-                    fit_mode: "contain".into(),
+                    fit_mode: Some("contain".into()),
                     preset_strategy: Some(preset_strategy.clone()),
                     optimizer_goal: None,
                     quality_frame_drop_interval: None,
@@ -5319,7 +5339,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(7.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: None,
                 quality_frame_drop_interval: None,
@@ -5369,7 +5389,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(7.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: None,
                 quality_frame_drop_interval: None,
@@ -5401,7 +5421,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(7.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: None,
                 quality_frame_drop_interval: None,
@@ -5434,7 +5454,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(7.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: None,
                 quality_frame_drop_interval: None,
@@ -5467,7 +5487,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(24.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: None,
                 quality_frame_drop_interval: None,
@@ -5497,7 +5517,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(9.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: Some("quality".into()),
                 quality_frame_drop_interval: Some(3),
@@ -5527,7 +5547,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(24.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: Some("quality".into()),
                 quality_frame_drop_interval: Some(0),
@@ -5553,7 +5573,7 @@ mod tests {
                 input_width: Some(100),
                 input_height: Some(100),
                 avg_fps: Some(8.333),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: Some("motion".into()),
                 quality_frame_drop_interval: None,
@@ -5602,7 +5622,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(0.6),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: None,
                 quality_frame_drop_interval: None,
@@ -5745,7 +5765,7 @@ mod tests {
                 input_width: Some(48),
                 input_height: Some(48),
                 avg_fps: Some(7.0),
-                fit_mode: "contain".into(),
+                fit_mode: Some("contain".into()),
                 preset_strategy: None,
                 optimizer_goal: None,
                 quality_frame_drop_interval: None,
@@ -5783,13 +5803,13 @@ mod tests {
 #[tauri::command]
 async fn run_optimizer_search(request: OptimizerSearchRequest) -> OptimizerSearchResponse {
     let locale = parse_ui_locale(request.locale.as_deref());
-    let fallback_fit_mode = request.fit_mode.clone();
+    let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
 
     match run_blocking_task(move || run_optimizer_search_internal(request, locale)).await {
         Ok(result) => result,
         Err(error) => OptimizerSearchResponse {
             ok: false,
-            fit_mode: fallback_fit_mode,
+            fit_mode: CANONICAL_FIT_MODE.into(),
             selected_duration_seconds: None,
             limit_bytes: DISCORD_MAX_STICKER_BYTES,
             search_budget: MAX_SEARCH_BUDGET,
@@ -5797,7 +5817,7 @@ async fn run_optimizer_search(request: OptimizerSearchRequest) -> OptimizerSearc
             stop_reason: Some(INTERNAL_TASK_ERROR_CODE.into()),
             selection_reason: "no_fit_found".into(),
             summary: locale::internal_task_error_message(locale),
-            warnings: Vec::new(),
+            warnings: fallback_fit_warning.into_iter().collect(),
             attempts: Vec::new(),
             winning_candidate_id: None,
             closest_candidate_id: None,

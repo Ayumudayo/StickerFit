@@ -1,6 +1,5 @@
 import type { CropAspectRatioPreset } from "../../components/MediaSelectionPreview";
 import type { MessagesForLocale } from "../../locales/messages";
-import type { FitMode } from "../../types/workflow";
 
 import { ChevronDownIcon, RefreshIcon } from "../AppIcons";
 
@@ -10,11 +9,8 @@ type PreviewInfoBarProps = {
   quickFps: string | null;
   previewDurationLabel: string | null;
   selectionLabel: string;
-  fitMode: FitMode;
   cropAspectRatioPreset: CropAspectRatioPreset;
-  isStaticImage: boolean;
   isCropSelectionReset: boolean;
-  onFitModeChange: (value: FitMode) => void;
   onCropAspectRatioPresetChange: (value: CropAspectRatioPreset) => void;
   onResetSelection: () => void;
 };
@@ -25,11 +21,8 @@ export function PreviewInfoBar({
   quickFps,
   previewDurationLabel,
   selectionLabel,
-  fitMode,
   cropAspectRatioPreset,
-  isStaticImage,
   isCropSelectionReset,
-  onFitModeChange,
   onCropAspectRatioPresetChange,
   onResetSelection,
 }: PreviewInfoBarProps) {
@@ -62,24 +55,6 @@ export function PreviewInfoBar({
       </div>
 
       <div className="previewInfoSettings">
-        <label className="previewInfoField previewInfoFieldFit" htmlFor="preview-fit-mode-select">
-          <span className="metaLabel">{copy.fitMode}</span>
-          <div className="previewInlineSelectShell">
-            <select
-              id="preview-fit-mode-select"
-              className="previewInlineSelect"
-              value={fitMode}
-              onChange={(event) => onFitModeChange(event.target.value as FitMode)}
-              disabled={isStaticImage}
-            >
-              <option value="contain">{copy.contain}</option>
-              <option value="cover">{copy.cover}</option>
-              <option value="fill">{copy.fill}</option>
-            </select>
-            <ChevronDownIcon size={14} className="previewInlineChevron" />
-          </div>
-        </label>
-
         <label className="previewInfoField previewInfoFieldCrop" htmlFor="preview-crop-aspect-ratio-select">
           <span className="metaLabel">{copy.cropAspectRatio}</span>
           <div className="previewInlineSelectShell">

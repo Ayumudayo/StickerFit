@@ -63,6 +63,25 @@ test("loads a still image in web preview mode", async ({ page }) => {
   expect(hasPageScroll).toBe(false);
 });
 
+test("does not expose a redundant image fitting mode", async ({ page }) => {
+  await page.goto("/");
+
+  await chooseInputFile(page, {
+    name: "fit-mode-smoke.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(TINY_PNG_BASE64, "base64"),
+  });
+
+  await expect(page.getByRole("button", { name: "Convert to PNG" })).toBeVisible();
+  await expect(page.getByLabel("Image fitting")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "KO" }).click();
+  await expect(
+    page.getByRole("heading", { name: "디스코드용 스티커 컨버터" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("이미지 맞춤 방식")).toHaveCount(0);
+});
+
 test("opens and closes the advanced settings overlay for video preview", async ({
   page,
 }) => {

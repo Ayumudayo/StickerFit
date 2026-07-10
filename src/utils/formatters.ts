@@ -1,11 +1,5 @@
 import type { Locale } from "../locales/messages";
 
-type FitModeCopy = {
-  cover: string;
-  contain: string;
-  fill: string;
-};
-
 type StopReasonCopy = {
   statusFirstFit: string;
   statusExhausted: string;
@@ -104,18 +98,6 @@ export function presetLabel(preset: string, locale: Locale) {
   } as const;
 
   return labels[preset as keyof typeof labels] ?? preset;
-}
-
-export function fitModeLabel(fitMode: string, copy: FitModeCopy) {
-  if (fitMode === "cover") {
-    return copy.cover;
-  }
-
-  if (fitMode === "fill") {
-    return copy.fill;
-  }
-
-  return copy.contain;
 }
 
 export function stopReasonLabel(reason: string | null, copy: StopReasonCopy) {

@@ -10,7 +10,6 @@ import { useMediaInputSelector } from "./mediaWorkflow/useMediaInputSelector";
 import { useToolHealthReport } from "./mediaWorkflow/useToolHealthReport";
 import type { Locale } from "../locales/messages";
 import type {
-  FitMode,
   MediaInspection,
   OptimizerGoal,
   OptimizerPlanRequest,
@@ -39,7 +38,6 @@ type WorkflowRequestContext = {
 type OptimizerBaseRequestContext = WorkflowRequestContext & {
   inspection: MediaInspection;
   locale: Locale;
-  fitMode: FitMode;
   presetStrategy: OptimizerPresetStrategy;
   optimizerGoal: OptimizerGoal;
   qualityFrameDropInterval: number;
@@ -50,7 +48,6 @@ type OptimizerBaseRequestContext = WorkflowRequestContext & {
 function buildOptimizerBaseRequest({
   inspection,
   locale,
-  fitMode,
   presetStrategy,
   optimizerGoal,
   qualityFrameDropInterval,
@@ -65,7 +62,6 @@ function buildOptimizerBaseRequest({
     inputWidth: inspection.width,
     inputHeight: inspection.height,
     avgFps: inspection.avgFps,
-    fitMode,
     presetStrategy,
     optimizerGoal,
     qualityFrameDropInterval,
@@ -88,7 +84,6 @@ export function useMediaWorkflowController({
   const [searchResult, setSearchResult] = useState<OptimizerSearchResponse | null>(null);
   const [conversionResult, setConversionResult] =
     useState<StaticImageConversionResult | null>(null);
-  const [fitMode, setFitMode] = useState<FitMode>("contain");
   const [optimizerPresetStrategy, setOptimizerPresetStrategy] =
     useState<OptimizerPresetStrategy>("auto");
   const [optimizerGoal, setOptimizerGoal] = useState<OptimizerGoal>("balanced");
@@ -149,7 +144,6 @@ export function useMediaWorkflowController({
       const request = buildOptimizerBaseRequest({
         inspection,
         locale,
-        fitMode,
         presetStrategy: optimizerPresetStrategy,
         optimizerGoal,
         qualityFrameDropInterval,
@@ -177,7 +171,6 @@ export function useMediaWorkflowController({
   }, [
     advancedPreviewCount,
     cropRegion,
-    fitMode,
     inspection,
     locale,
     optimizerPresetStrategy,
@@ -204,7 +197,6 @@ export function useMediaWorkflowController({
         ...buildOptimizerBaseRequest({
           inspection,
           locale,
-          fitMode,
           presetStrategy: optimizerPresetStrategy,
           optimizerGoal,
           qualityFrameDropInterval,
@@ -227,7 +219,6 @@ export function useMediaWorkflowController({
     }
   }, [
     cropRegion,
-    fitMode,
     inspection,
     locale,
     optimizerPresetStrategy,
@@ -274,7 +265,6 @@ export function useMediaWorkflowController({
     searchResult,
     conversionResult,
     outputDirectory,
-    fitMode,
     optimizerPresetStrategy,
     optimizerGoal,
     qualityFrameDropInterval,
@@ -288,7 +278,6 @@ export function useMediaWorkflowController({
     plannerError,
     isDragging,
     setOutputDirectory,
-    setFitMode,
     setOptimizerPresetStrategy,
     setOptimizerGoal,
     setQualityFrameDropInterval,

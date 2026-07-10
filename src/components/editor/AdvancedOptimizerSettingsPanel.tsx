@@ -48,7 +48,7 @@ export function AdvancedOptimizerSettingsPanel({
           <span className="metaLabel">{copy.optimizerGoal}</span>
           <div className="selectShell">
             <select
-              className="fitModeSelect"
+              className="fieldSelect"
               value={optimizerGoal}
               onChange={(event) =>
                 onOptimizerGoalChange(event.target.value as OptimizerGoal)
@@ -67,7 +67,7 @@ export function AdvancedOptimizerSettingsPanel({
             <span className="metaLabel">{copy.qualityFrameDropInterval}</span>
             <div className="selectShell">
               <select
-                className="fitModeSelect"
+                className="fieldSelect"
                 value={qualityFrameDropInterval}
                 onChange={(event) =>
                   onQualityFrameDropIntervalChange(Number(event.target.value))
@@ -88,7 +88,7 @@ export function AdvancedOptimizerSettingsPanel({
           <span className="metaLabel">{copy.advancedSearchDepth}</span>
           <div className="selectShell">
             <select
-              className="fitModeSelect"
+              className="fieldSelect"
               value={optimizerSearchDepth}
               onChange={(event) =>
                 onOptimizerSearchDepthChange(event.target.value as OptimizerSearchDepth)

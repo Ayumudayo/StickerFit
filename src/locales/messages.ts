@@ -22,7 +22,6 @@ export type MessagesForLocale = {
   toolStatus: string;
   saveLocation: string;
   selection: string;
-  fit: string;
   sourceInfo: string;
   topCandidate: string;
   latestOutput: string;
@@ -51,12 +50,8 @@ export type MessagesForLocale = {
   frameRate: string;
   duration: string;
   contentScale: string;
-  fitMode: string;
   cropAspectRatio: string;
   cropAspectRatioFree: string;
-  contain: string;
-  cover: string;
-  fill: string;
   buildPreview: string;
   buildingPreview: string;
   runOptimizer: string;
@@ -155,7 +150,6 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     toolStatus: "Tool status",
     saveLocation: "Save location",
     selection: "Selection",
-    fit: "Fit",
     sourceInfo: "Source info",
     topCandidate: "Top preview candidate",
     latestOutput: "Latest output",
@@ -184,18 +178,14 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     frameRate: "Frame rate",
     duration: "Duration",
     contentScale: "Scale",
-    fitMode: "Image fitting",
     cropAspectRatio: "Crop ratio",
     cropAspectRatioFree: "Free",
-    contain: "Show whole image",
-    cover: "Fill and crop",
-    fill: "Stretch to fit",
     buildPreview: "Preview candidates",
     buildingPreview: "Preparing preview...",
     runOptimizer: "Run optimizer",
     runningOptimizer: "Optimizing...",
     nextStep: "Next step",
-    nextStepBody: "Preview the candidate ladder first, then run the optimizer once the crop, frame selection, and fit settings look right.",
+    nextStepBody: "Preview the candidate ladder first, then run the optimizer once the crop and frame selection look right.",
     guidance: "Guidance",
     optimizerHint: "Discord allows at most 5 seconds and 512 KiB.",
     staticImageSourceTitle: "Static image source",
@@ -290,7 +280,6 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     toolStatus: "도구 상태",
     saveLocation: "저장 위치",
     selection: "선택 영역",
-    fit: "맞춤",
     sourceInfo: "원본 정보",
     topCandidate: "상위 미리보기 후보",
     latestOutput: "최근 출력",
@@ -319,18 +308,14 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     frameRate: "프레임레이트",
     duration: "길이",
     contentScale: "스케일",
-    fitMode: "이미지 맞춤 방식",
     cropAspectRatio: "크롭 비율",
     cropAspectRatioFree: "자유",
-    contain: "전체 보이기",
-    cover: "영역 꽉 채우기",
-    fill: "비율 무시하고 늘리기",
     buildPreview: "후보 미리보기",
     buildingPreview: "후보를 준비하는 중...",
     runOptimizer: "최적화 실행",
     runningOptimizer: "최적화 중...",
     nextStep: "다음 단계",
-    nextStepBody: "먼저 후보 미리보기를 실행해 정렬된 래더를 확인한 다음, 크롭·프레임 선택·맞춤 설정이 괜찮으면 최적화를 실행하세요.",
+    nextStepBody: "먼저 후보 미리보기를 실행해 정렬된 래더를 확인한 다음, 크롭과 프레임 선택이 괜찮으면 최적화를 실행하세요.",
     guidance: "안내",
     optimizerHint: "디스코드는 최대 5초, 512 KiB까지 허용합니다.",
     staticImageSourceTitle: "정적 이미지 소스",

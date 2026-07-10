@@ -66,11 +66,11 @@ pub(crate) fn crop_needs_source_height_error(locale: UiLocale) -> String {
     )
 }
 
-pub(crate) fn unknown_fit_mode_fallback_warning(locale: UiLocale) -> String {
+pub(crate) fn legacy_fit_mode_fallback_warning(locale: UiLocale) -> String {
     tr(
         locale,
-        "Unknown fit mode was received, so contain was used.",
-        "알 수 없는 맞춤 모드가 들어와 contain으로 처리했습니다.",
+        "A legacy or unknown fit mode was ignored; contain is now always used.",
+        "레거시 또는 알 수 없는 맞춤 모드는 무시되며, 이제 항상 contain으로 처리합니다.",
     )
 }
 
@@ -106,11 +106,11 @@ pub(crate) fn recommended_duration_warning(locale: UiLocale) -> String {
     )
 }
 
-pub(crate) fn crop_applied_before_fit_warning(locale: UiLocale) -> String {
+pub(crate) fn crop_applied_before_scale_warning(locale: UiLocale) -> String {
     tr(
         locale,
-        "The selected crop area will be applied before fit and scale are evaluated.",
-        "선택한 크롭 영역을 먼저 적용한 뒤 맞춤 방식과 스케일을 계산합니다.",
+        "The selected crop area will be applied before output scale is evaluated.",
+        "선택한 크롭 영역을 먼저 적용한 뒤 출력 스케일을 계산합니다.",
     )
 }
 

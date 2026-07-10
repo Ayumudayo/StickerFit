@@ -1178,29 +1178,6 @@ h3 {
   gap: 16px;
 }
 
-.desktopFitField {
-  gap: 10px;
-}
-
-.desktopSelectWrap {
-  position: relative;
-}
-
-.desktopFitSelect {
-  width: 100%;
-  appearance: none;
-  padding-right: 42px;
-}
-
-.desktopSelectIcon {
-  position: absolute;
-  top: 50%;
-  right: 14px;
-  transform: translateY(-50%);
-  color: rgba(255, 255, 255, 0.5);
-  pointer-events: none;
-}
-
 .desktopPrimaryActions {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }

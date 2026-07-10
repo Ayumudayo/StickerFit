@@ -355,7 +355,7 @@
 
 .previewInfoSettings {
   display: grid;
-  grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr) auto;
+  grid-template-columns: minmax(152px, 1fr) auto;
   align-items: end;
   align-content: center;
   gap: 10px 12px;
@@ -393,17 +393,6 @@
   white-space: nowrap;
 }
 
-.previewInlineSelect:disabled {
-  background: #12141b;
-  color: #7b8191;
-  border-color: rgba(255, 255, 255, 0.06);
-  cursor: not-allowed;
-}
-
-.previewInlineSelect:disabled + .previewInlineChevron {
-  color: #5b6170;
-}
-
 .previewInlineChevron {
   position: absolute;
   right: 10px;
@@ -434,17 +423,6 @@
   align-self: end;
   min-width: 0;
   max-width: 100%;
-}
-
-@media (max-width: 1320px) {
-  .previewInfoSettings {
-    grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr);
-  }
-
-  .previewInfoResetAction {
-    grid-column: 1 / -1;
-    justify-self: start;
-  }
 }
 
 .previewControlBar {
@@ -858,7 +836,7 @@
   position: relative;
 }
 
-.fitModeSelect,
+.fieldSelect,
 .fieldInput {
   width: 100%;
   appearance: none;
@@ -868,7 +846,7 @@
   color: #ffffff;
 }
 
-.fitModeSelect {
+.fieldSelect {
   min-height: 36px;
   padding: 7px 34px 7px 10px;
 }
@@ -1149,7 +1127,7 @@
   }
 
   .previewInfoSettings {
-    grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr) auto;
+    grid-template-columns: minmax(152px, 1fr) auto;
     padding-left: 0;
     padding-top: 8px;
     border-left: 0;
