@@ -1,4 +1,8 @@
-import type { Locale, MessagesForLocale } from "../locales/messages";
+import {
+	mediaOperationMessage,
+	type Locale,
+	type MessagesForLocale,
+} from "../locales/messages";
 import type {
 	OptimizerPlanResponse,
 	OptimizerSearchResponse,
@@ -170,8 +174,14 @@ export function AdvancedDetailsPanel({
 												</code>
 											</div>
 										) : null}
-										{attempt.errorMessage ? (
-											<p>{attempt.errorMessage}</p>
+										{attempt.errorCode ? (
+											<p>
+												{mediaOperationMessage(
+													locale,
+													attempt.errorCode,
+													attempt.reasonCode,
+												)}
+											</p>
 										) : null}
 									</article>
 									);

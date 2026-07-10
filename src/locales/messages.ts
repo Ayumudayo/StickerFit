@@ -1,4 +1,14 @@
+import type {
+  MediaOperationErrorCode,
+  MediaOperationReasonCode,
+} from "../types/workflow";
+
 export type Locale = "en" | "ko";
+
+export type MediaOperationMessagesForLocale = {
+  errorCodes: Record<MediaOperationErrorCode, string>;
+  reasonCodes: Record<MediaOperationReasonCode, string>;
+};
 
 export type MessagesForLocale = {
   eyebrow: string;
@@ -389,6 +399,100 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
       "웹 모드에서는 파일 검사, 크롭, 확대, 타임라인 확인까지만 지원합니다. 최적화, 내보내기, 출력 폴더 기능은 데스크톱 앱 전용입니다.",
   },
 };
+
+export const MEDIA_OPERATION_MESSAGES: Record<
+  Locale,
+  MediaOperationMessagesForLocale
+> = {
+  en: {
+    errorCodes: {
+      cancelled: "The operation was cancelled.",
+      "timed-out": "The operation timed out.",
+      "operation-conflict": "Another media operation is already in progress.",
+      "invalid-request": "The media request is not valid.",
+      "source-changed": "The source changed while the operation was running.",
+      "media-input-too-large": "The source file is too large to process safely.",
+      "media-dimensions-too-large": "The source dimensions are too large to process safely.",
+      "media-frame-limit": "The source contains too many frames to process safely.",
+      "decoded-byte-limit": "The decoded media would use too much memory.",
+      "png-chunk-limit": "The PNG contains too many chunks to process safely.",
+      "malformed-media": "The source media could not be read.",
+      "malformed-process-output": "The media tool returned an unreadable result.",
+      "tool-missing": "A required media tool is unavailable.",
+      "process-failed": "The media tool failed while processing the request.",
+      "output-conflict": "The output path conflicts with an existing file.",
+      "internal-task-failed": "The media operation failed unexpectedly.",
+    },
+    reasonCodes: {
+      "no-frames-selected": "Select at least one frame before exporting.",
+      "invalid-frame-selection": "The selected frames no longer match the current timeline.",
+      "invalid-frame-duration": "One or more frame durations are invalid.",
+      "duration-too-long": "The selected duration exceeds Discord's 5-second limit.",
+      "invalid-crop": "The crop selection is invalid for the current source.",
+      "invalid-output-directory": "Choose a valid output folder.",
+      "unsupported-source-format": "This source format is not supported.",
+      "unsupported-frame-preview": "A preview is not available for this source format.",
+      "frame-preview-decode-failed": "The selected frame could not be decoded for preview.",
+      "frame-preview-encode-failed": "The selected frame preview could not be encoded.",
+      "decode-failed": "The source media could not be decoded.",
+      "encode-failed": "The output could not be encoded.",
+      "missing-output": "The media tool completed without creating an output file.",
+      "plan-invalid": "The optimizer plan is not valid for the current input.",
+      "invoke-failed": "The optimizer command could not be started.",
+    },
+  },
+  ko: {
+    errorCodes: {
+      cancelled: "작업이 취소되었습니다.",
+      "timed-out": "작업 시간이 초과되었습니다.",
+      "operation-conflict": "다른 미디어 작업이 이미 진행 중입니다.",
+      "invalid-request": "미디어 요청이 올바르지 않습니다.",
+      "source-changed": "작업 중 원본이 변경되었습니다.",
+      "media-input-too-large": "원본 파일이 너무 커서 안전하게 처리할 수 없습니다.",
+      "media-dimensions-too-large": "원본 해상도가 너무 커서 안전하게 처리할 수 없습니다.",
+      "media-frame-limit": "원본 프레임 수가 너무 많아 안전하게 처리할 수 없습니다.",
+      "decoded-byte-limit": "디코딩한 미디어가 너무 많은 메모리를 사용합니다.",
+      "png-chunk-limit": "PNG 청크 수가 너무 많아 안전하게 처리할 수 없습니다.",
+      "malformed-media": "원본 미디어를 읽을 수 없습니다.",
+      "malformed-process-output": "미디어 도구가 읽을 수 없는 결과를 반환했습니다.",
+      "tool-missing": "필수 미디어 도구를 사용할 수 없습니다.",
+      "process-failed": "요청을 처리하는 동안 미디어 도구가 실패했습니다.",
+      "output-conflict": "출력 경로가 기존 파일과 충돌합니다.",
+      "internal-task-failed": "미디어 작업이 예기치 않게 실패했습니다.",
+    },
+    reasonCodes: {
+      "no-frames-selected": "내보내기 전에 최소 한 개의 프레임을 선택하세요.",
+      "invalid-frame-selection": "선택한 프레임이 현재 타임라인과 맞지 않습니다.",
+      "invalid-frame-duration": "하나 이상의 프레임 길이가 올바르지 않습니다.",
+      "duration-too-long": "선택한 길이가 디스코드의 5초 제한을 초과합니다.",
+      "invalid-crop": "현재 원본에 적용할 수 없는 크롭 영역입니다.",
+      "invalid-output-directory": "올바른 출력 폴더를 선택하세요.",
+      "unsupported-source-format": "지원하지 않는 원본 형식입니다.",
+      "unsupported-frame-preview": "이 원본 형식은 프레임 미리보기를 지원하지 않습니다.",
+      "frame-preview-decode-failed": "선택한 프레임을 미리보기용으로 디코딩하지 못했습니다.",
+      "frame-preview-encode-failed": "선택한 프레임 미리보기를 인코딩하지 못했습니다.",
+      "decode-failed": "원본 미디어를 디코딩하지 못했습니다.",
+      "encode-failed": "출력을 인코딩하지 못했습니다.",
+      "missing-output": "미디어 도구가 출력 파일을 만들지 않았습니다.",
+      "plan-invalid": "현재 입력에 사용할 수 없는 최적화 계획입니다.",
+      "invoke-failed": "최적화 명령을 시작하지 못했습니다.",
+    },
+  },
+};
+
+export function mediaOperationMessage(
+  locale: Locale,
+  errorCode: MediaOperationErrorCode | null,
+  reasonCode: MediaOperationReasonCode | null,
+) {
+  if (reasonCode) {
+    return MEDIA_OPERATION_MESSAGES[locale].reasonCodes[reasonCode];
+  }
+
+  return errorCode
+    ? MEDIA_OPERATION_MESSAGES[locale].errorCodes[errorCode]
+    : null;
+}
 
 export function detectLocale(): Locale {
   if (typeof navigator !== "undefined" && navigator.language.toLowerCase().startsWith("ko")) {

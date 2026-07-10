@@ -1,5 +1,6 @@
 import {
   type CSSProperties,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -29,15 +30,31 @@ import {
   useEditorWorkflowBridge,
 } from "./hooks/useEditorWorkflowBridge";
 import { useMediaWorkflowController } from "./hooks/useMediaWorkflowController";
+import {
+  buildWorkflowFingerprints,
+  currentWorkflowState,
+  latestActiveWorkflowState,
+  type WorkflowFingerprints,
+} from "./hooks/mediaWorkflow/workflowFingerprint";
 import { usePlaybackTimelineController } from "./hooks/usePlaybackTimelineController";
 import { editorText } from "./locales/editorText";
-import { detectLocale, MESSAGES, type Locale } from "./locales/messages";
+import {
+  detectLocale,
+  mediaOperationMessage,
+  MESSAGES,
+  type Locale,
+} from "./locales/messages";
 import { formatTimelineTime } from "./utils/timelineFrames";
 
 const ADVANCED_PREVIEW_COUNT = 6;
 const ADVANCED_SETTINGS_PANEL_ID = "advanced-optimizer-settings";
 const EDITOR_RESULTS_PANEL_ID = "editor-results-panel";
 const EDITOR_PREVIEW_PANEL_ID = "editor-preview-panel";
+const EMPTY_WORKFLOW_FINGERPRINTS: WorkflowFingerprints = {
+  encoding: "",
+  planner: "",
+  export: "",
+};
 
 const MIN_DURATION_US = 10_000;
 
@@ -71,6 +88,15 @@ export default function App() {
   const editorWorkspaceRef = useRef<HTMLElement | null>(null);
   const framePreviewCacheRef = useRef(new Map<string, string>());
   const framePreviewRequestIdRef = useRef(0);
+  const workflowFingerprintRef = useRef<WorkflowFingerprints>(
+    EMPTY_WORKFLOW_FINGERPRINTS,
+  );
+  const invalidatedWorkflowFingerprintRef =
+    useRef<WorkflowFingerprints | null>(null);
+  const getCurrentWorkflowFingerprints = useCallback(
+    () => workflowFingerprintRef.current,
+    [],
+  );
 
   const mediaWorkflow = useMediaWorkflowController({
     locale,
@@ -79,26 +105,24 @@ export default function App() {
     onCommitEditorSession: () => {
       setEditorSessionKey((current) => current + 1);
     },
+    getCurrentWorkflowFingerprints,
   });
   const {
     runtime,
     toolReport,
     toolError,
     inspection,
-    plan,
-    searchResult,
-    conversionResult,
+    planState,
+    searchState,
+    conversionState,
     outputDirectory,
+    optimizerPresetStrategy,
     optimizerGoal,
     qualityFrameDropInterval,
     optimizerSearchDepth,
     cropRegion,
     cropAspectRatioPreset,
     inspectionLoading,
-    planLoading,
-    searchLoading,
-    conversionLoading,
-    plannerError,
     isDragging,
     setOutputDirectory,
     setOptimizerGoal,
@@ -112,6 +136,7 @@ export default function App() {
     buildPlan,
     runBoundedSearch,
     convertStaticImageToPng,
+    invalidateWorkflowResults,
   } = mediaWorkflow;
 
   const copy = MESSAGES[locale];
@@ -190,6 +215,110 @@ export default function App() {
     () => buildEditedTimelineFramesForRequest(timelineFrames, sourceFrames),
     [sourceFrames, timelineFrames],
   );
+  const workflowFingerprints = useMemo(
+    () =>
+      buildWorkflowFingerprints({
+        editorSessionKey,
+        locale,
+        inputPath: inspection?.inputPath ?? null,
+        sourceRevision: inspection?.sourceRevision ?? null,
+        outputDirectory,
+        sourceDurationSeconds: inspection?.durationSeconds ?? null,
+        inputWidth: inspection?.width ?? null,
+        inputHeight: inspection?.height ?? null,
+        avgFps: inspection?.avgFps ?? null,
+        optimizerPresetStrategy,
+        optimizerGoal,
+        qualityFrameDropInterval,
+        optimizerSearchDepth,
+        cropRegion,
+        baseFrameCount: sourceFrames.length,
+        timelineFrames: editedTimelineFramesForRequest,
+      }),
+    [
+      cropRegion,
+      editedTimelineFramesForRequest,
+      editorSessionKey,
+      inspection?.avgFps,
+      inspection?.durationSeconds,
+      inspection?.height,
+      inspection?.inputPath,
+      inspection?.sourceRevision,
+      inspection?.width,
+      locale,
+      optimizerGoal,
+      optimizerPresetStrategy,
+      optimizerSearchDepth,
+      outputDirectory,
+      qualityFrameDropInterval,
+      sourceFrames.length,
+    ],
+  );
+  workflowFingerprintRef.current = workflowFingerprints;
+
+  const currentPlanState = currentWorkflowState(
+    planState,
+    workflowFingerprints.planner,
+  );
+  const currentSearchState = currentWorkflowState(
+    searchState,
+    workflowFingerprints.export,
+  );
+  const currentConversionState = currentWorkflowState(
+    conversionState,
+    workflowFingerprints.export,
+  );
+  const plan =
+    currentPlanState?.status === "ready" ? currentPlanState.value : null;
+  const searchResult =
+    currentSearchState?.status === "ready" ? currentSearchState.value : null;
+  const conversionResult =
+    currentConversionState?.status === "ready"
+      ? currentConversionState.value
+      : null;
+  const planLoading = currentPlanState?.status === "loading";
+  const searchLoading = currentSearchState?.status === "loading";
+  const conversionLoading = currentConversionState?.status === "loading";
+  const latestWorkflowState = latestActiveWorkflowState([
+    currentPlanState,
+    currentSearchState,
+    currentConversionState,
+  ]);
+  const plannerError = latestWorkflowState?.status === "error"
+    ? mediaOperationMessage(
+        locale,
+        latestWorkflowState.code,
+        latestWorkflowState.reasonCode,
+      )
+    : latestWorkflowState?.status === "cancelled"
+      ? mediaOperationMessage(locale, "cancelled", null)
+      : null;
+
+  useEffect(() => {
+    const previous = invalidatedWorkflowFingerprintRef.current;
+    invalidateWorkflowResults(workflowFingerprints);
+
+    if (previous) {
+      setActiveDockPanel((current) => {
+        if (
+          current === "preview" &&
+          previous.planner !== workflowFingerprints.planner
+        ) {
+          return null;
+        }
+        if (
+          current === "results" &&
+          previous.export !== workflowFingerprints.export
+        ) {
+          return null;
+        }
+        return current;
+      });
+    }
+
+    invalidatedWorkflowFingerprintRef.current = workflowFingerprints;
+  }, [invalidateWorkflowResults, workflowFingerprints]);
+
   const playback = usePlaybackTimelineController({
     editorSessionKey,
     inspection,
@@ -489,9 +618,13 @@ export default function App() {
     const result = await buildPlan({
       baseFrameCount: sourceFrames.length,
       editedTimelineFramesForRequest,
+      fingerprint: workflowFingerprints.planner,
     });
 
-    if (result) {
+    if (
+      result &&
+      result.fingerprint === workflowFingerprintRef.current.planner
+    ) {
       setActiveDockPanel("preview");
     }
   }
@@ -500,9 +633,13 @@ export default function App() {
     const result = await runBoundedSearch({
       baseFrameCount: sourceFrames.length,
       editedTimelineFramesForRequest,
+      fingerprint: workflowFingerprints.export,
     });
 
-    if (result) {
+    if (
+      result &&
+      result.fingerprint === workflowFingerprintRef.current.export
+    ) {
       setActiveDockPanel("results");
     }
   }
@@ -704,14 +841,24 @@ export default function App() {
                 onToggleAdvancedSettings: handleAdvancedSettingsToggle,
                 onToggleResults: handleResultsPanelToggle,
                 onRunOptimizer: () => void handleOptimizerRun(),
-                onConvertToPng: () => void convertStaticImageToPng(),
+                onConvertToPng: () =>
+                  void convertStaticImageToPng(workflowFingerprints.export),
               }}
               staticImageResultsProps={staticImageResultsProps}
             />
 
           </>
         ) : (
-          <InspectionErrorCard copy={copy} message={inspection.errorMessage} />
+          <InspectionErrorCard
+            copy={copy}
+            message={
+              mediaOperationMessage(
+                locale,
+                inspection.errorCode,
+                inspection.reasonCode,
+              ) ?? copy.inspectionFailed
+            }
+          />
         )}
 
       </main>

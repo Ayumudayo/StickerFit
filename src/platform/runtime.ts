@@ -1,6 +1,10 @@
 import type { Locale } from "../locales/messages";
+import mediaOperationCodes from "../types/media-operation-error-codes.json";
 import type {
   MediaInspection,
+  MediaOperationErrorCode,
+  MediaOperationErrorFields,
+  MediaOperationReasonCode,
   FramePreviewRequest,
   FramePreviewResult,
   FramePreviewsRequest,
@@ -9,15 +13,240 @@ import type {
   OptimizerPlanResponse,
   OptimizerSearchRequest,
   OptimizerSearchResponse,
+  SearchAttemptResult,
   StaticImageConversionRequest,
   StaticImageConversionResult,
   ToolHealthReport,
 } from "../types/workflow";
 
+export type NormalizedMediaError = {
+  errorCode: MediaOperationErrorCode | null;
+  reasonCode: MediaOperationReasonCode | null;
+  diagnostics: string | null;
+};
+
+type RawMediaErrorFields = {
+  errorCode?: unknown;
+  reasonCode?: unknown;
+  errorMessage?: unknown;
+};
+
+const MEDIA_OPERATION_ERROR_CODES = new Set<string>(
+  mediaOperationCodes.errorCodes,
+);
+const MEDIA_OPERATION_REASON_CODES = new Set<string>(
+  mediaOperationCodes.reasonCodes,
+);
+
+function isMediaOperationErrorCode(
+  value: unknown,
+): value is MediaOperationErrorCode {
+  return (
+    typeof value === "string" && MEDIA_OPERATION_ERROR_CODES.has(value)
+  );
+}
+
+function isMediaOperationReasonCode(
+  value: unknown,
+): value is MediaOperationReasonCode {
+  return (
+    typeof value === "string" && MEDIA_OPERATION_REASON_CODES.has(value)
+  );
+}
+
+function diagnosticMessage(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function withLegacyCodeDiagnostic(message: string | null, code: string) {
+  const suffix = `(legacy code: ${code})`;
+  return message ? `${message} ${suffix}` : suffix;
+}
+
+function withLegacyReasonDiagnostic(message: string | null, reason: string) {
+  const suffix = `(legacy reason code: ${reason})`;
+  return message ? `${message} ${suffix}` : suffix;
+}
+
+export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
+  if (raw === null || raw === undefined) {
+    return { errorCode: null, reasonCode: null, diagnostics: null };
+  }
+
+  const fields: RawMediaErrorFields =
+    typeof raw === "object" && raw !== null
+      ? (raw as RawMediaErrorFields)
+      : { errorCode: raw };
+  const rawCode = fields.errorCode;
+  const rawReasonCode = fields.reasonCode;
+  const diagnostics =
+    raw instanceof Error
+      ? diagnosticMessage(raw.message)
+      : diagnosticMessage(fields.errorMessage);
+  const rawCodeIsKnown =
+    isMediaOperationErrorCode(rawCode) ||
+    isMediaOperationReasonCode(rawCode) ||
+    rawCode === "browser_inspection_failed" ||
+    rawCode === "inspect-failed" ||
+    rawCode === "tool-unavailable";
+
+  if (rawCode !== null && rawCode !== undefined && !rawCodeIsKnown) {
+    let unknownDiagnostics = withLegacyCodeDiagnostic(
+      diagnostics,
+      String(rawCode),
+    );
+    if (
+      rawReasonCode !== null &&
+      rawReasonCode !== undefined &&
+      !isMediaOperationReasonCode(rawReasonCode)
+    ) {
+      unknownDiagnostics = withLegacyReasonDiagnostic(
+        unknownDiagnostics,
+        String(rawReasonCode),
+      );
+    }
+
+    return {
+      errorCode: "internal-task-failed",
+      reasonCode: null,
+      diagnostics: unknownDiagnostics,
+    };
+  }
+
+  if (
+    rawReasonCode !== null &&
+    rawReasonCode !== undefined &&
+    !isMediaOperationReasonCode(rawReasonCode)
+  ) {
+    return {
+      errorCode: "internal-task-failed",
+      reasonCode: null,
+      diagnostics: withLegacyReasonDiagnostic(
+        diagnostics,
+        String(rawReasonCode),
+      ),
+    };
+  }
+
+  if (isMediaOperationErrorCode(rawCode)) {
+    return {
+      errorCode: rawCode,
+      reasonCode: isMediaOperationReasonCode(rawReasonCode)
+        ? rawReasonCode
+        : null,
+      diagnostics,
+    };
+  }
+
+  if (
+    (rawCode === null || rawCode === undefined) &&
+    isMediaOperationReasonCode(rawReasonCode)
+  ) {
+    return {
+      errorCode: "invalid-request",
+      reasonCode: rawReasonCode,
+      diagnostics,
+    };
+  }
+
+  if (isMediaOperationReasonCode(rawCode)) {
+    return {
+      errorCode: "invalid-request",
+      reasonCode: rawCode,
+      diagnostics,
+    };
+  }
+
+  if (rawCode === "browser_inspection_failed" || rawCode === "inspect-failed") {
+    return {
+      errorCode: "malformed-media",
+      reasonCode: "decode-failed",
+      diagnostics,
+    };
+  }
+
+  if (rawCode === "tool-unavailable") {
+    return {
+      errorCode: "tool-missing",
+      reasonCode: null,
+      diagnostics,
+    };
+  }
+
+  if (rawCode === null || rawCode === undefined) {
+    if (diagnostics === null) {
+      return { errorCode: null, reasonCode: null, diagnostics: null };
+    }
+
+    return {
+      errorCode: "internal-task-failed",
+      reasonCode: null,
+      diagnostics,
+    };
+  }
+
+  const legacyCode = String(rawCode);
+  return {
+    errorCode: "internal-task-failed",
+    reasonCode: null,
+    diagnostics: withLegacyCodeDiagnostic(diagnostics, legacyCode),
+  };
+}
+
+export function normalizeLegacyMediaResponse<T extends RawMediaErrorFields>(
+  response: T,
+) {
+  const normalized = normalizeLegacyMediaError(response);
+  return {
+    ...response,
+    errorCode: normalized.errorCode,
+    reasonCode: normalized.reasonCode,
+    errorMessage: normalized.diagnostics,
+  };
+}
+
+export function normalizeLegacyOptimizerSearchResponse<
+  T extends RawMediaErrorFields & {
+    attempts: readonly RawMediaErrorFields[];
+  },
+>(response: T) {
+  return {
+    ...normalizeLegacyMediaResponse(response),
+    attempts: response.attempts.map((attempt) =>
+      normalizeLegacyMediaResponse(attempt),
+    ),
+  };
+}
+
+export function buildWebFileSourceRevision(
+  file: Pick<File, "name" | "size" | "lastModified" | "type">,
+) {
+  return JSON.stringify([
+    file.name,
+    file.size,
+    file.lastModified,
+    file.type,
+  ]);
+}
+
+type LegacyMediaResponse<T> = Omit<T, keyof MediaOperationErrorFields> &
+  RawMediaErrorFields;
+
 type RuntimeInspectionPayload = Omit<
-  MediaInspection,
-  "backendInputPath" | "previewSrc" | "inputSourceKind"
->;
+  LegacyMediaResponse<MediaInspection>,
+  "backendInputPath" | "previewSrc" | "inputSourceKind" | "sourceRevision"
+> & { sourceRevision?: string | null };
+
+type LegacyOptimizerSearchResponse = LegacyMediaResponse<
+  Omit<OptimizerSearchResponse, "attempts">
+> & {
+  attempts: Array<LegacyMediaResponse<SearchAttemptResult>>;
+};
 
 export type RuntimeKind = "tauri" | "web";
 
@@ -124,6 +353,7 @@ function createMediaErrorInspection(
   return {
     ok: false,
     inputPath,
+    sourceRevision: null,
     backendInputPath: null,
     previewSrc,
     inputSourceKind: sourceKind,
@@ -143,7 +373,8 @@ function createMediaErrorInspection(
     frameDurationsSeconds: null,
     isStaticImage: true,
     canConvertToPng: false,
-    errorCode: "browser_inspection_failed",
+    errorCode: "malformed-media",
+    reasonCode: "decode-failed",
     errorMessage: error instanceof Error ? error.message : String(error),
   };
 }
@@ -196,6 +427,7 @@ function createBrowserVideoInspection(file: File, previewSrc: string, metadata: 
   return {
     ok: true,
     inputPath: file.name,
+    sourceRevision: buildWebFileSourceRevision(file),
     backendInputPath: null,
     previewSrc,
     inputSourceKind: "file",
@@ -216,6 +448,7 @@ function createBrowserVideoInspection(file: File, previewSrc: string, metadata: 
     isStaticImage: false,
     canConvertToPng: false,
     errorCode: null,
+    reasonCode: null,
     errorMessage: null,
   } satisfies MediaInspection;
 }
@@ -227,6 +460,7 @@ function createBrowserImageInspection(file: File, previewSrc: string, metadata: 
   return {
     ok: true,
     inputPath: file.name,
+    sourceRevision: buildWebFileSourceRevision(file),
     backendInputPath: null,
     previewSrc,
     inputSourceKind: "file",
@@ -247,6 +481,7 @@ function createBrowserImageInspection(file: File, previewSrc: string, metadata: 
     isStaticImage: true,
     canConvertToPng: false,
     errorCode: null,
+    reasonCode: null,
     errorMessage: null,
   } satisfies MediaInspection;
 }
@@ -390,10 +625,12 @@ const tauriRuntime: AppRuntime = {
       inputPath: source.path,
       locale,
     });
+    const normalized = normalizeLegacyMediaResponse(result);
 
     return {
-      ...result,
+      ...normalized,
       inputPath: source.path,
+      sourceRevision: result.sourceRevision ?? null,
       backendInputPath: source.path,
       previewSrc: convertFileSrc(source.path),
       inputSourceKind: "path",
@@ -407,37 +644,53 @@ const tauriRuntime: AppRuntime = {
   },
   async buildOptimizerPlan(request) {
     const { invoke } = await loadTauriCore();
-    return invoke<OptimizerPlanResponse>("build_optimizer_plan", {
-      request,
-    });
+    const result = await invoke<LegacyMediaResponse<OptimizerPlanResponse>>(
+      "build_optimizer_plan",
+      { request },
+    );
+    return normalizeLegacyMediaResponse(result);
   },
   async runOptimizerSearch(request) {
     const { invoke } = await loadTauriCore();
-    return invoke<OptimizerSearchResponse>("run_optimizer_search", {
-      request,
-    });
+    const result = await invoke<LegacyOptimizerSearchResponse>(
+      "run_optimizer_search",
+      { request },
+    );
+    return normalizeLegacyOptimizerSearchResponse(
+      result,
+    ) as OptimizerSearchResponse;
   },
   async convertStaticImageToPng(request) {
     const { invoke } = await loadTauriCore();
-    return invoke<StaticImageConversionResult>("convert_static_image_to_png", {
-      request,
-    });
+    const result = await invoke<LegacyMediaResponse<StaticImageConversionResult>>(
+      "convert_static_image_to_png",
+      { request },
+    );
+    return normalizeLegacyMediaResponse(result);
   },
   async extractFramePreview(request) {
     const { invoke } = await loadTauriCore();
-    return invoke<FramePreviewResult>("extract_frame_preview", {
-      inputPath: request.inputPath,
-      sourceFrameId: request.sourceFrameId,
-      locale: request.locale,
-    });
+    const result = await invoke<LegacyMediaResponse<FramePreviewResult>>(
+      "extract_frame_preview",
+      {
+        inputPath: request.inputPath,
+        sourceFrameId: request.sourceFrameId,
+        locale: request.locale,
+      },
+    );
+    return normalizeLegacyMediaResponse(result);
   },
   async extractFramePreviews(request) {
     const { invoke } = await loadTauriCore();
-    return invoke<FramePreviewsResult>("extract_frame_previews", {
-      inputPath: request.inputPath,
-      sourceFrameIds: request.sourceFrameIds,
-      locale: request.locale,
-    });
+    const result = await invoke<LegacyMediaResponse<FramePreviewsResult>>(
+      "extract_frame_previews",
+      {
+        inputPath: request.inputPath,
+        sourceFrameIds: request.sourceFrameIds,
+        locale: request.locale,
+      },
+    );
+    return normalizeLegacyMediaResponse(result);
   },
   async subscribeInputDrops(handlers) {
     let isFileDragActive = false;

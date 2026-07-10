@@ -1,0 +1,37 @@
+{
+  "errorCodes": [
+    "cancelled",
+    "timed-out",
+    "operation-conflict",
+    "invalid-request",
+    "source-changed",
+    "media-input-too-large",
+    "media-dimensions-too-large",
+    "media-frame-limit",
+    "decoded-byte-limit",
+    "png-chunk-limit",
+    "malformed-media",
+    "malformed-process-output",
+    "tool-missing",
+    "process-failed",
+    "output-conflict",
+    "internal-task-failed"
+  ],
+  "reasonCodes": [
+    "no-frames-selected",
+    "invalid-frame-selection",
+    "invalid-frame-duration",
+    "duration-too-long",
+    "invalid-crop",
+    "invalid-output-directory",
+    "unsupported-source-format",
+    "unsupported-frame-preview",
+    "frame-preview-decode-failed",
+    "frame-preview-encode-failed",
+    "decode-failed",
+    "encode-failed",
+    "missing-output",
+    "plan-invalid",
+    "invoke-failed"
+  ]
+}

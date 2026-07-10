@@ -1,4 +1,8 @@
-import type { Locale, MessagesForLocale } from "../../locales/messages";
+import {
+  mediaOperationMessage,
+  type Locale,
+  type MessagesForLocale,
+} from "../../locales/messages";
 import type { OptimizerSearchResponse } from "../../types/workflow";
 import {
   formatDuration,
@@ -136,7 +140,15 @@ export function EditorResultsOverlay({
                   </div>
                 ) : null}
 
-                {attempt.errorMessage ? <p className="detailText">{attempt.errorMessage}</p> : null}
+                {attempt.errorCode ? (
+                  <p className="detailText">
+                    {mediaOperationMessage(
+                      locale,
+                      attempt.errorCode,
+                      attempt.reasonCode,
+                    )}
+                  </p>
+                ) : null}
               </article>
             );
           })}

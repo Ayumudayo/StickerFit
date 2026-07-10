@@ -1,6 +1,47 @@
 import type { CropRegion } from "../components/MediaSelectionPreview";
 import type { Locale } from "../locales/messages";
 
+export type MediaOperationErrorCode =
+  | "cancelled"
+  | "timed-out"
+  | "operation-conflict"
+  | "invalid-request"
+  | "source-changed"
+  | "media-input-too-large"
+  | "media-dimensions-too-large"
+  | "media-frame-limit"
+  | "decoded-byte-limit"
+  | "png-chunk-limit"
+  | "malformed-media"
+  | "malformed-process-output"
+  | "tool-missing"
+  | "process-failed"
+  | "output-conflict"
+  | "internal-task-failed";
+
+export type MediaOperationReasonCode =
+  | "no-frames-selected"
+  | "invalid-frame-selection"
+  | "invalid-frame-duration"
+  | "duration-too-long"
+  | "invalid-crop"
+  | "invalid-output-directory"
+  | "unsupported-source-format"
+  | "unsupported-frame-preview"
+  | "frame-preview-decode-failed"
+  | "frame-preview-encode-failed"
+  | "decode-failed"
+  | "encode-failed"
+  | "missing-output"
+  | "plan-invalid"
+  | "invoke-failed";
+
+export type MediaOperationErrorFields = {
+  errorCode: MediaOperationErrorCode | null;
+  reasonCode: MediaOperationReasonCode | null;
+  errorMessage: string | null;
+};
+
 export type OptimizerPresetStrategy = "auto" | "quality" | "size";
 
 export type OptimizerGoal = "balanced" | "motion" | "quality";
@@ -53,9 +94,7 @@ export type FramePreviewResult = {
   dataUrl: string | null;
   width: number | null;
   height: number | null;
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
 export type FramePreviewsRequest = {
   inputPath: string;
@@ -73,9 +112,7 @@ export type FramePreviewItem = {
 export type FramePreviewsResult = {
   ok: boolean;
   previews: FramePreviewItem[];
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
 export type ToolCheck = {
   tool: string;
@@ -98,6 +135,7 @@ export type ToolHealthReport = {
 export type MediaInspection = {
   ok: boolean;
   inputPath: string;
+  sourceRevision?: string | null;
   backendInputPath: string | null;
   previewSrc: string;
   inputSourceKind: InputSourceKind;
@@ -117,9 +155,7 @@ export type MediaInspection = {
   frameDurationsSeconds: number[] | null;
   isStaticImage: boolean;
   canConvertToPng: boolean;
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
 export type OptimizerCandidatePreview = {
   id: string;
@@ -140,9 +176,7 @@ export type OptimizerPlanResponse = {
   searchBudget: number;
   warnings: string[];
   candidates: OptimizerCandidatePreview[];
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
 export type EncodedCandidateResult = {
   ok: boolean;
@@ -154,9 +188,7 @@ export type EncodedCandidateResult = {
   toolCommand: string | null;
   toolDetail: string | null;
   warnings: string[];
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
 export type StaticImageConversionResult = {
   ok: boolean;
@@ -167,9 +199,7 @@ export type StaticImageConversionResult = {
   toolCommand: string | null;
   toolDetail: string | null;
   warnings: string[];
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
 export type SearchAttemptResult = {
   candidateId: string;
@@ -192,9 +222,7 @@ export type SearchAttemptResult = {
   toolCommand: string | null;
   toolDetail: string | null;
   warnings: string[];
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
 export type OptimizerSearchResponse = {
   ok: boolean;
@@ -212,7 +240,5 @@ export type OptimizerSearchResponse = {
   bestOutputPath: string | null;
   bestSizeBytes: number | null;
   bestWithinLimit: boolean;
-  errorCode: string | null;
-  errorMessage: string | null;
-};
+} & MediaOperationErrorFields;
 
