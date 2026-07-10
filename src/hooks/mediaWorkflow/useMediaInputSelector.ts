@@ -4,6 +4,10 @@ import type { Locale } from "../../locales/messages";
 import type { AppRuntime } from "../../platform/runtime";
 import { releaseInspectionPreview, type RuntimeInputSource } from "../../platform/runtime";
 import type { MediaInspection } from "../../types/workflow";
+import {
+  createRequestLifecycleCoordinator,
+  type RequestLifecycleCoordinator,
+} from "./requestFreshness";
 
 type UseMediaInputSelectorParams = {
   runtime: AppRuntime;
@@ -11,6 +15,20 @@ type UseMediaInputSelectorParams = {
   onResetForNewInspection: () => void;
   onCommitEditorSession: () => void;
 };
+
+function inputSourceFingerprint(source: RuntimeInputSource) {
+  if (source.kind === "tauri-path") {
+    return JSON.stringify(["path", source.path]);
+  }
+
+  return JSON.stringify([
+    "file",
+    source.file.name,
+    source.file.size,
+    source.file.lastModified,
+    source.file.type,
+  ]);
+}
 
 export function useMediaInputSelector({
   runtime,
@@ -23,22 +41,34 @@ export function useMediaInputSelector({
   const [isDragging, setIsDragging] = useState(false);
   const [outputDirectory, setOutputDirectory] = useState<string | null>(null);
 
-  const previousInspectionRef = useRef<MediaInspection | null>(null);
+  const requestLifecycleRef = useRef<RequestLifecycleCoordinator<MediaInspection> | null>(
+    null,
+  );
+  if (requestLifecycleRef.current === null) {
+    requestLifecycleRef.current = createRequestLifecycleCoordinator<MediaInspection>({
+      publishCurrent: (nextInspection) => setInspection(nextInspection),
+      disposeValue: releaseInspectionPreview,
+    });
+  }
+  const requestLifecycle = requestLifecycleRef.current;
 
   const inspectSource = useCallback(
     async (source: RuntimeInputSource) => {
-      setInspectionLoading(true);
-      onResetForNewInspection();
-
-      try {
-        const result = await runtime.inspectInput(source, locale);
-        setInspection(result);
-        onCommitEditorSession();
-      } finally {
-        setInspectionLoading(false);
-      }
+      await requestLifecycle.run({
+        fingerprint: inputSourceFingerprint(source),
+        request: () => runtime.inspectInput(source, locale),
+        onBegin: onResetForNewInspection,
+        onCommit: onCommitEditorSession,
+        onLoadingChange: setInspectionLoading,
+      });
     },
-    [locale, onCommitEditorSession, onResetForNewInspection, runtime],
+    [
+      locale,
+      onCommitEditorSession,
+      onResetForNewInspection,
+      requestLifecycle,
+      runtime,
+    ],
   );
 
   useEffect(() => {
@@ -71,18 +101,10 @@ export function useMediaInputSelector({
   }, [inspectSource, runtime]);
 
   useEffect(() => {
-    const previousInspection = previousInspectionRef.current;
-    previousInspectionRef.current = inspection;
-    if (previousInspection && previousInspection !== inspection) {
-      releaseInspectionPreview(previousInspection);
-    }
-  }, [inspection]);
-
-  useEffect(() => {
     return () => {
-      releaseInspectionPreview(previousInspectionRef.current);
+      requestLifecycle.invalidate();
     };
-  }, []);
+  }, [requestLifecycle]);
 
   const pickInputFile = useCallback(async () => {
     const selected = await runtime.pickInputFile();

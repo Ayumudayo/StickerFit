@@ -420,21 +420,12 @@ export default function App() {
       : null;
 
   useEffect(() => {
-    if (!inspection?.inputPath) {
-      setPreviewZoomMode("fit");
-      setManualPreviewZoomScale(1);
-      setResolvedPreviewZoomScale(1);
-      setResolvedFitPreviewZoomScale(1);
-      setActiveDockPanel(null);
-      return;
-    }
-
     setPreviewZoomMode("fit");
     setManualPreviewZoomScale(1);
     setResolvedPreviewZoomScale(1);
     setResolvedFitPreviewZoomScale(1);
     setActiveDockPanel(null);
-  }, [inspection?.inputPath]);
+  }, [editorSessionKey]);
 
   useEffect(() => {
     function updateEditorWorkspaceMinHeight() {
