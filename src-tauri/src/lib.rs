@@ -1,3 +1,4 @@
+mod frame_source;
 mod locale;
 mod media_error;
 mod media_limits;
@@ -33,7 +34,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, State};
 #[cfg(target_os = "windows")]
@@ -49,6 +50,12 @@ use windows::Win32::Media::MediaFoundation::{
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
+use crate::frame_source::{
+    build_candidate_output_sequence, build_inspected_timing_grid, checked_prepared_bytes,
+    checked_timeline_duration, project_timing_grid, FramePreparationRequest, FrameSourceLoader,
+    PreparedCandidateSequence, PreparedFrame, PreparedSearchSource, TimelineTimingAuthority,
+    MAX_PREPARED_SEARCH_BYTES, MAX_SEARCH_OUTPUT_FRAMES,
+};
 use crate::locale::{parse_ui_locale, UiLocale};
 use crate::media_error::PipelineError;
 use crate::media_limits::{
@@ -269,7 +276,7 @@ struct FramePreviewsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CropRegion {
+pub(crate) struct CropRegion {
     x: f64,
     y: f64,
     width: f64,
@@ -278,7 +285,7 @@ struct CropRegion {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OptimizerPlanRequest {
+pub(crate) struct OptimizerPlanRequest {
     locale: Option<String>,
     source_duration_seconds: Option<f64>,
     input_width: Option<u32>,
@@ -300,14 +307,14 @@ struct OptimizerPlanRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EditedTimelineFrame {
+pub(crate) struct EditedTimelineFrame {
     source_frame_id: u32,
     duration_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CandidatePreview {
+pub(crate) struct CandidatePreview {
     id: String,
     rank: usize,
     duration_seconds: f64,
@@ -324,7 +331,7 @@ struct CandidatePreview {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OptimizerPlanResponse {
+pub(crate) struct OptimizerPlanResponse {
     ok: bool,
     fit_mode: String,
     selected_duration_seconds: Option<f64>,
@@ -458,8 +465,8 @@ struct ResolvedFrameSelection {
     base_frame_count: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
-struct ResolvedTimelineFrame {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedTimelineFrame {
     source_frame_index: u32,
     duration_us: u64,
 }
@@ -1243,8 +1250,6 @@ fn normalize_selected_frame_indexes(selected_frames: Option<&Vec<u32>>) -> Optio
             .copied()
             .filter(|frame| *frame > 0)
             .map(|frame| frame - 1)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
             .collect()
     })
 }
@@ -1268,10 +1273,12 @@ fn resolve_frame_selection(
             }
 
             let selected_frame_count = frames.len();
-            let selected_frames = match base_frame_count.filter(|count| *count > 0) {
-                Some(base_count) if selected_frame_count == base_count as usize => None,
-                _ => Some(frames),
-            };
+            let is_unedited_full_sequence = base_frame_count
+                .filter(|count| *count > 0)
+                .is_some_and(|base_count| {
+                    frames.len() == base_count as usize && frames.iter().copied().eq(0..base_count)
+                });
+            let selected_frames = (!is_unedited_full_sequence).then_some(frames);
 
             Ok(ResolvedFrameSelection {
                 selected_frames,
@@ -1489,25 +1496,25 @@ fn apply_quality_frame_drop_to_timeline_frames(
     }
 }
 
-fn sampled_frame_indexes(
-    selected_frames: Option<&[u32]>,
-    base_frame_count: Option<u32>,
-    sample_step: u32,
-) -> Option<Vec<u32>> {
-    if sample_step <= 1 {
-        return selected_frames.map(|frames| frames.to_vec());
-    }
-
-    let frame_indexes = selected_frames
-        .map(|frames| frames.to_vec())
-        .or_else(|| base_frame_count.map(|count| (0..count).collect::<Vec<_>>()))?;
-
-    let step = sample_step as usize;
-    Some(frame_indexes.into_iter().step_by(step).collect())
-}
-
 fn natural_selection_duration_seconds(selected_frame_count: usize, source_fps: f64) -> f64 {
     selected_frame_count as f64 / source_fps.max(1.0)
+}
+
+fn projected_selection_duration_seconds(
+    selected_frame_count: usize,
+    base_frame_count: Option<u32>,
+    source_duration_seconds: Option<f64>,
+    source_fps: f64,
+) -> f64 {
+    match (
+        source_duration_seconds.filter(|duration| duration.is_finite() && *duration > 0.0),
+        base_frame_count.filter(|count| *count > 0),
+    ) {
+        (Some(duration), Some(base_frame_count)) => {
+            duration * selected_frame_count as f64 / f64::from(base_frame_count)
+        }
+        _ => natural_selection_duration_seconds(selected_frame_count, source_fps),
+    }
 }
 
 fn checked_duration_us(durations_us: impl IntoIterator<Item = u64>) -> Result<u64, &'static str> {
@@ -1536,14 +1543,13 @@ fn timeline_average_fps(timeline_frames: &[ResolvedTimelineFrame], duration_us: 
     }
 }
 
-fn build_candidate_ladder_fixed_duration(
+fn build_candidate_universe_fixed_duration(
     duration_seconds: f64,
     fps: u32,
     input_width: Option<u32>,
     input_height: Option<u32>,
     preset_strategy: &str,
     optimizer_goal: &str,
-    search_budget: usize,
     locale: UiLocale,
 ) -> Vec<CandidatePreview> {
     let scale_ladder: Vec<f64> = match (input_width.unwrap_or(0), input_height.unwrap_or(0)) {
@@ -1601,7 +1607,31 @@ fn build_candidate_ladder_fixed_duration(
         }
     }
 
-    select_ranked_candidate_subset(candidates, search_budget)
+    candidates
+}
+
+fn build_candidate_ladder_fixed_duration(
+    duration_seconds: f64,
+    fps: u32,
+    input_width: Option<u32>,
+    input_height: Option<u32>,
+    preset_strategy: &str,
+    optimizer_goal: &str,
+    search_budget: usize,
+    locale: UiLocale,
+) -> Vec<CandidatePreview> {
+    select_ranked_candidate_subset(
+        build_candidate_universe_fixed_duration(
+            duration_seconds,
+            fps,
+            input_width,
+            input_height,
+            preset_strategy,
+            optimizer_goal,
+            locale,
+        ),
+        search_budget,
+    )
 }
 
 fn build_filter_graph(
@@ -1765,6 +1795,41 @@ fn transform_frame_for_static_png(
     let (target_width, target_height) =
         scaled_output_dimensions(Some(cropped.width()), Some(cropped.height()), 1.0);
     imageops::resize(&cropped, target_width, target_height, FilterType::Lanczos3)
+}
+
+fn prepare_frame_for_search(
+    source: RgbaImage,
+    crop_region: Option<ResolvedCropRegion>,
+) -> RgbaImage {
+    let effective_width = crop_region.map(|crop| crop.width).unwrap_or(source.width());
+    let effective_height = crop_region
+        .map(|crop| crop.height)
+        .unwrap_or(source.height());
+    let (target_width, target_height) =
+        scaled_output_dimensions(Some(effective_width), Some(effective_height), 1.0);
+
+    match crop_region {
+        None if source.dimensions() == (target_width, target_height) => source,
+        None => imageops::resize(&source, target_width, target_height, FilterType::Lanczos3),
+        Some(crop) => {
+            let cropped = imageops::crop_imm(&source, crop.x, crop.y, crop.width, crop.height);
+            if (crop.width, crop.height) == (target_width, target_height) {
+                cropped.to_image()
+            } else {
+                imageops::resize(&cropped, target_width, target_height, FilterType::Lanczos3)
+            }
+        }
+    }
+}
+
+fn scale_prepared_frame_for_candidate(source: &RgbaImage, content_scale: f64) -> RgbaImage {
+    let (target_width, target_height) =
+        scaled_output_dimensions(Some(source.width()), Some(source.height()), content_scale);
+    if source.dimensions() == (target_width, target_height) {
+        source.clone()
+    } else {
+        imageops::resize(source, target_width, target_height, FilterType::Lanczos3)
+    }
 }
 
 fn malformed_decoder_error(format: &'static str, error: impl std::fmt::Display) -> PipelineError {
@@ -1950,6 +2015,57 @@ where
     Err(PipelineError::InvalidRequest {
         reason: "invalid-frame-selection",
     })
+}
+
+fn visit_decoded_animation_frame_iterator<I, F>(
+    format: &'static str,
+    mut frames: I,
+    expected_frame_count: Option<u64>,
+    limits: MediaLimits,
+    context: &OperationContext,
+    mut visitor: F,
+) -> Result<u32, PipelineError>
+where
+    I: Iterator<Item = image::ImageResult<image::Frame>>,
+    F: FnMut(u32, image::Frame) -> Result<(), PipelineError>,
+{
+    let mut count = 0_u32;
+    loop {
+        context.checkpoint()?;
+        let Some(decoded) = frames.next() else {
+            if expected_frame_count.is_some_and(|expected| expected != u64::from(count)) {
+                return Err(PipelineError::MalformedInput {
+                    format,
+                    reason: "decoded frame count did not match metadata".into(),
+                });
+            }
+            return Ok(count);
+        };
+        let next_count = count.checked_add(1).ok_or(PipelineError::LimitExceeded {
+            resource: "frame-count",
+            limit: u64::from(limits.max_frame_count),
+            actual: u64::MAX,
+        })?;
+        if next_count > limits.max_frame_count {
+            return Err(PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: u64::from(limits.max_frame_count),
+                actual: u64::from(next_count),
+            });
+        }
+        if expected_frame_count.is_some_and(|expected| u64::from(next_count) > expected) {
+            return Err(PipelineError::MalformedInput {
+                format,
+                reason: "decoder produced more frames than metadata declared".into(),
+            });
+        }
+
+        let frame = decoded.map_err(|error| image_decoder_error(format, error, limits))?;
+        context.checkpoint()?;
+        visitor(next_count, frame)?;
+        context.checkpoint()?;
+        count = next_count;
+    }
 }
 
 fn open_limited_image_reader(
@@ -2371,6 +2487,518 @@ fn decode_apng_animation_frame(
             || checkpoint(),
         )
     })
+}
+
+pub(crate) fn visit_native_animation_frames<F>(
+    input_path: &Path,
+    limits: MediaLimits,
+    context: &OperationContext,
+    mut visitor: F,
+) -> Result<u32, PipelineError>
+where
+    F: FnMut(u32, image::Frame) -> Result<(), PipelineError>,
+{
+    let extension = input_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "gif" => run_decoder_boundary("gif", || {
+            context.checkpoint()?;
+            let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+                operation: "open GIF input",
+                message: error.to_string(),
+            })?;
+            let metadata = file.metadata().map_err(|error| PipelineError::Io {
+                operation: "read GIF input metadata",
+                message: error.to_string(),
+            })?;
+            validate_file_metadata(metadata, limits)?;
+            let (metadata_width, metadata_height, frame_count) = {
+                let mut metadata_reader = BufReader::new(&mut file);
+                read_gif_frame_metadata(&mut metadata_reader, limits, &mut || context.checkpoint())?
+            };
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| pipeline_io_error("rewind GIF input", error))?;
+            let mut decoder = ImageGifDecoder::new(BufReader::new(file))
+                .map_err(|error| image_decoder_error("gif", error, limits))?;
+            decoder
+                .set_limits(image_decode_limits(limits))
+                .map_err(|error| image_decoder_error("gif", error, limits))?;
+            if decoder.dimensions() != (metadata_width, metadata_height) {
+                return Err(malformed_gif("GIF dimensions changed during decode setup"));
+            }
+            visit_decoded_animation_frame_iterator(
+                "gif",
+                decoder.into_frames(),
+                Some(u64::from(frame_count)),
+                limits,
+                context,
+                |source_frame_id, frame| visitor(source_frame_id, frame),
+            )
+        }),
+        "apng" | "png" => run_decoder_boundary("png", || {
+            context.checkpoint()?;
+            let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+                operation: "open PNG input",
+                message: error.to_string(),
+            })?;
+            let metadata = file.metadata().map_err(|error| PipelineError::Io {
+                operation: "read PNG input metadata",
+                message: error.to_string(),
+            })?;
+            let file_length = validate_file_metadata(metadata, limits)?.len();
+            let frame_count = {
+                let mut metadata_reader = BufReader::new(&mut file);
+                read_png_metadata_from_reader(&mut metadata_reader, file_length, limits, || {
+                    context.checkpoint()
+                })?
+                .animation
+                .and_then(|metadata| metadata.frame_count)
+                .ok_or_else(|| malformed_decoder_error("png", "missing APNG animation control"))?
+            };
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| pipeline_io_error("rewind PNG input", error))?;
+            let decoder =
+                ImagePngDecoder::with_limits(BufReader::new(file), image_decode_limits(limits))
+                    .map_err(|error| image_decoder_error("png", error, limits))?;
+            let apng_decoder = decoder
+                .apng()
+                .map_err(|error| image_decoder_error("png", error, limits))?;
+            visit_decoded_animation_frame_iterator(
+                "png",
+                apng_decoder.into_frames(),
+                Some(frame_count),
+                limits,
+                context,
+                |source_frame_id, frame| visitor(source_frame_id, frame),
+            )
+        }),
+        _ => Err(PipelineError::InvalidRequest {
+            reason: "unsupported-source-format",
+        }),
+    }
+}
+
+fn resolved_authored_timeline(
+    request: FramePreparationRequest<'_>,
+) -> Result<Option<Vec<ResolvedTimelineFrame>>, PipelineError> {
+    if let Some(frames) = request.resolved_timeline_frames {
+        return Ok(Some(frames.to_vec()));
+    }
+    request
+        .timeline_frames
+        .map(|frames| {
+            frames
+                .iter()
+                .map(|frame| {
+                    if frame.source_frame_id == 0 || frame.duration_us < 100 {
+                        return Err(PipelineError::InvalidRequest {
+                            reason: "invalid-frame-selection",
+                        });
+                    }
+                    Ok(ResolvedTimelineFrame {
+                        source_frame_index: frame.source_frame_id - 1,
+                        duration_us: frame.duration_us,
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn required_prepared_source_indexes(
+    request: FramePreparationRequest<'_>,
+) -> Result<Option<BTreeSet<u32>>, PipelineError> {
+    if let Some(timeline) = resolved_authored_timeline(request)? {
+        return Ok(Some(
+            timeline
+                .into_iter()
+                .map(|frame| frame.source_frame_index)
+                .collect(),
+        ));
+    }
+    Ok(request
+        .selected_frame_indexes
+        .map(|indexes| indexes.iter().copied().collect()))
+}
+
+fn prepared_sequence_base_fps(sequence: &[ResolvedTimelineFrame]) -> Result<u32, PipelineError> {
+    let duration_us = checked_timeline_duration(sequence)?;
+    if duration_us == 0 {
+        return Ok(1);
+    }
+    let numerator = sequence.len() as u128 * 1_000_000_u128;
+    let rounded = (numerator + u128::from(duration_us) / 2) / u128::from(duration_us);
+    Ok(u32::try_from(rounded).unwrap_or(u32::MAX).max(1))
+}
+
+fn prepare_native_search_source(
+    request: FramePreparationRequest<'_>,
+    context: &OperationContext,
+    limits: MediaLimits,
+) -> Result<PreparedSearchSource, PipelineError> {
+    let requested_indexes = required_prepared_source_indexes(request)?;
+    let mut decoded_bytes = 0_usize;
+    let mut frames = Vec::new();
+    let mut native_timing_grid = Vec::new();
+    let mut decoded_dimensions = None;
+    let mut resolved_crop_region = None;
+
+    let decoded_count = visit_native_animation_frames(
+        request.input_path,
+        limits,
+        context,
+        |source_frame_id, frame| {
+            let source_frame_index = source_frame_id - 1;
+            let sticker_frame = image_frame_to_sticker_frame(frame);
+            let dimensions = sticker_frame.pixels.dimensions();
+            if let Some(expected_dimensions) = decoded_dimensions {
+                if dimensions != expected_dimensions {
+                    return Err(PipelineError::MalformedInput {
+                        format: "animation",
+                        reason: "decoded frame dimensions changed during preparation".into(),
+                    });
+                }
+            } else {
+                decoded_dimensions = Some(dimensions);
+                resolved_crop_region = resolve_crop_region(
+                    request.crop_region,
+                    Some(dimensions.0),
+                    Some(dimensions.1),
+                    request.locale,
+                )
+                .map_err(|_| PipelineError::InvalidRequest {
+                    reason: "invalid-crop",
+                })?;
+            }
+
+            native_timing_grid.push(ResolvedTimelineFrame {
+                source_frame_index,
+                duration_us: sticker_frame.duration_us,
+            });
+            if requested_indexes
+                .as_ref()
+                .is_some_and(|indexes| !indexes.contains(&source_frame_index))
+            {
+                return Ok(());
+            }
+
+            context.checkpoint()?;
+            let pixels = prepare_frame_for_search(sticker_frame.pixels, resolved_crop_region);
+            let frame_bytes = checked_rgba_bytes(pixels.width(), pixels.height(), limits)?;
+            decoded_bytes = checked_prepared_bytes(decoded_bytes, frame_bytes)?;
+            frames.push(PreparedFrame {
+                source_frame_id,
+                pixels: Arc::new(pixels),
+                duration_us: sticker_frame.duration_us,
+            });
+            context.checkpoint()
+        },
+    )?;
+
+    if request
+        .base_frame_count
+        .is_some_and(|expected| expected != decoded_count)
+    {
+        return Err(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        });
+    }
+
+    let authored_timeline = resolved_authored_timeline(request)?;
+    let (base_sequence, timing_authority) = match authored_timeline {
+        Some(timeline) => (timeline, TimelineTimingAuthority::Authored),
+        None => (
+            project_timing_grid(&native_timing_grid, request.selected_frame_indexes)?,
+            TimelineTimingAuthority::Native,
+        ),
+    };
+    if base_sequence.is_empty()
+        || base_sequence
+            .iter()
+            .any(|frame| frame.source_frame_index >= decoded_count)
+    {
+        return Err(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        });
+    }
+    for frame in &base_sequence {
+        let source_frame_id = frame.source_frame_index + 1;
+        if !frames
+            .iter()
+            .any(|prepared| prepared.source_frame_id == source_frame_id)
+        {
+            return Err(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            });
+        }
+    }
+
+    let base_fps = prepared_sequence_base_fps(&base_sequence)?;
+    Ok(PreparedSearchSource {
+        frames,
+        base_sequence,
+        timing_authority,
+        base_fps,
+        decoded_bytes,
+        tool_source: "native".into(),
+        tool_command: None,
+        tool_detail: Some(locale::native_apng_encode_detail(request.locale)),
+    })
+}
+
+struct DefaultFrameSourceLoader;
+
+fn build_prepared_video_filter(
+    frame_indexes: &BTreeSet<u32>,
+    crop_region: Option<ResolvedCropRegion>,
+    target_width: u32,
+    target_height: u32,
+) -> String {
+    let selection = frame_indexes
+        .iter()
+        .map(|frame| format!("eq(n,{frame})"))
+        .collect::<Vec<_>>()
+        .join("+");
+    let crop = crop_region
+        .map(|crop| format!("crop={}:{}:{}:{},", crop.width, crop.height, crop.x, crop.y))
+        .unwrap_or_default();
+    format!(
+        "select='{selection}',{crop}scale={target_width}:{target_height}:flags=lanczos,format=rgba,setsar=1"
+    )
+}
+
+fn prepare_video_base_sequence(
+    request: FramePreparationRequest<'_>,
+) -> Result<(Vec<ResolvedTimelineFrame>, TimelineTimingAuthority), PipelineError> {
+    if let Some(authored) = resolved_authored_timeline(request)? {
+        if authored.is_empty() {
+            return Err(PipelineError::InvalidRequest {
+                reason: "no-frames-selected",
+            });
+        }
+        return Ok((authored, TimelineTimingAuthority::Authored));
+    }
+
+    let base_frame_count = request.base_frame_count.filter(|count| *count > 0).ok_or(
+        PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        },
+    )?;
+    let timing_grid = build_inspected_timing_grid(
+        base_frame_count,
+        request.source_duration_seconds,
+        request.avg_fps,
+    )?;
+    Ok((
+        project_timing_grid(&timing_grid, request.selected_frame_indexes)?,
+        TimelineTimingAuthority::Inspected,
+    ))
+}
+
+fn required_video_source_indexes(
+    base_sequence: &[ResolvedTimelineFrame],
+    base_fps: u32,
+    optimizer_goal: &str,
+    context: &OperationContext,
+) -> Result<BTreeSet<u32>, PipelineError> {
+    let placeholder = PreparedSearchSource {
+        frames: Vec::new(),
+        base_sequence: base_sequence.to_vec(),
+        timing_authority: TimelineTimingAuthority::Inspected,
+        base_fps,
+        decoded_bytes: 0,
+        tool_source: "pending".into(),
+        tool_command: None,
+        tool_detail: None,
+    };
+    let mut required = BTreeSet::new();
+    let duration_seconds = duration_us_to_seconds(checked_timeline_duration(base_sequence)?);
+    let frame_sample_steps = frame_sample_steps_for_goal(base_sequence.len(), optimizer_goal);
+    for frame_sample_step in frame_sample_steps {
+        for fps in (1..=30).rev() {
+            context.checkpoint()?;
+            let candidate = CandidatePreview {
+                id: "preparation-union".into(),
+                rank: 0,
+                duration_seconds,
+                fps,
+                content_scale: 1.0,
+                preset: "standard".into(),
+                fit_mode: CANONICAL_FIT_MODE.into(),
+                score: 0.0,
+                source_similarity_score: 0.0,
+                summary: String::new(),
+                frame_sample_step,
+            };
+            let sequence = build_candidate_output_sequence(&placeholder, &candidate, context)?;
+            required.extend(sequence.frames.iter().map(|frame| frame.source_frame_index));
+        }
+    }
+    if required.is_empty() {
+        return Err(PipelineError::InvalidRequest {
+            reason: "plan-invalid",
+        });
+    }
+    Ok(required)
+}
+
+fn prepare_video_search_source(
+    request: FramePreparationRequest<'_>,
+    _plan: &OptimizerPlanResponse,
+    context: &OperationContext,
+    limits: MediaLimits,
+) -> Result<PreparedSearchSource, PipelineError> {
+    let (base_sequence, timing_authority) = prepare_video_base_sequence(request)?;
+    let base_fps = prepared_sequence_base_fps(&base_sequence)?;
+    let required_indexes =
+        required_video_source_indexes(&base_sequence, base_fps, request.optimizer_goal, context)?;
+    if required_indexes.len() > limits.max_frame_count as usize {
+        return Err(PipelineError::LimitExceeded {
+            resource: "frame-count",
+            limit: u64::from(limits.max_frame_count),
+            actual: u64::try_from(required_indexes.len()).unwrap_or(u64::MAX),
+        });
+    }
+
+    let source_width =
+        request
+            .input_width
+            .filter(|width| *width > 0)
+            .ok_or(PipelineError::InvalidRequest {
+                reason: "invalid-crop",
+            })?;
+    let source_height =
+        request
+            .input_height
+            .filter(|height| *height > 0)
+            .ok_or(PipelineError::InvalidRequest {
+                reason: "invalid-crop",
+            })?;
+    let crop_region = resolve_crop_region(
+        request.crop_region,
+        Some(source_width),
+        Some(source_height),
+        request.locale,
+    )
+    .map_err(|_| PipelineError::InvalidRequest {
+        reason: "invalid-crop",
+    })?;
+    let effective_width = crop_region.map(|crop| crop.width).unwrap_or(source_width);
+    let effective_height = crop_region.map(|crop| crop.height).unwrap_or(source_height);
+    let (target_width, target_height) =
+        scaled_output_dimensions(Some(effective_width), Some(effective_height), 1.0);
+    let frame_size = checked_rgba_bytes(target_width, target_height, limits)?;
+    let stdout_limit =
+        frame_size
+            .checked_mul(required_indexes.len())
+            .ok_or(PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: MAX_PREPARED_SEARCH_BYTES as u64,
+                actual: u64::MAX,
+            })?;
+    checked_prepared_bytes(0, stdout_limit)?;
+
+    let filter =
+        build_prepared_video_filter(&required_indexes, crop_region, target_width, target_height);
+    let resolution = resolve_tool("ffmpeg", request.locale)
+        .map_err(|_| PipelineError::ToolMissing { tool: "ffmpeg" })?;
+    let args = [
+        OsString::from("-v"),
+        OsString::from("error"),
+        OsString::from("-i"),
+        request.input_path.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-vf"),
+        OsString::from(filter),
+        OsString::from("-pix_fmt"),
+        OsString::from("rgba"),
+        OsString::from("-fps_mode"),
+        OsString::from("passthrough"),
+        OsString::from("-f"),
+        OsString::from("rawvideo"),
+        OsString::from("-an"),
+        OsString::from("-"),
+    ];
+    let mut index_iter = required_indexes.iter().copied();
+    let mut frames = Vec::with_capacity(required_indexes.len());
+    let mut decoded_bytes = 0_usize;
+    let summary = stream_fixed_rgba_frames(
+        &resolution.command,
+        &args,
+        frame_size,
+        required_indexes.len(),
+        ProcessLimits {
+            timeout: RAW_DECODE_PROCESS_TIMEOUT,
+            max_stdout_bytes: stdout_limit,
+            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+        },
+        context,
+        |frame| {
+            context.checkpoint()?;
+            let source_frame_index =
+                index_iter
+                    .next()
+                    .ok_or(PipelineError::MalformedProcessOutput {
+                        reason: "raw RGBA output exceeded selected source indexes".into(),
+                    })?;
+            decoded_bytes = checked_prepared_bytes(decoded_bytes, frame.len())?;
+            let pixels = rgba_frame_from_bytes(target_width, target_height, frame.to_vec())?;
+            let duration_us = base_sequence
+                .iter()
+                .find(|prepared| prepared.source_frame_index == source_frame_index)
+                .map(|prepared| prepared.duration_us)
+                .unwrap_or_default();
+            frames.push(PreparedFrame {
+                source_frame_id: source_frame_index + 1,
+                pixels: Arc::new(pixels),
+                duration_us,
+            });
+            context.checkpoint()
+        },
+    )?;
+    validate_exact_selected_frame_stream(required_indexes.len(), summary.frame_count)?;
+    if index_iter.next().is_some() {
+        return Err(PipelineError::MalformedProcessOutput {
+            reason: "raw RGBA output did not cover selected source indexes".into(),
+        });
+    }
+
+    Ok(PreparedSearchSource {
+        frames,
+        base_sequence,
+        timing_authority,
+        base_fps,
+        decoded_bytes,
+        tool_source: resolution.source.into(),
+        tool_command: Some(resolution.command_display),
+        tool_detail: resolution.fallback_reason,
+    })
+}
+
+impl FrameSourceLoader for DefaultFrameSourceLoader {
+    fn prepare(
+        &self,
+        request: FramePreparationRequest<'_>,
+        plan: &OptimizerPlanResponse,
+        context: &OperationContext,
+        limits: MediaLimits,
+    ) -> Result<PreparedSearchSource, PipelineError> {
+        let extension = request
+            .input_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match extension.as_str() {
+            "gif" | "apng" | "png" => prepare_native_search_source(request, context, limits),
+            _ => prepare_video_search_source(request, plan, context, limits),
+        }
+    }
 }
 
 fn decode_native_animation_frames(
@@ -2870,36 +3498,71 @@ fn write_native_apng_with_checkpoint<W: Write>(
     preset: &str,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<(), PipelineError> {
-    checkpoint()?;
-    if frames.is_empty() {
-        return Err(PipelineError::InvalidRequest {
-            reason: "no-frames-selected",
-        });
-    }
-
-    let width = frames[0].pixels.width();
-    let height = frames[0].pixels.height();
-    if frames
-        .iter()
-        .any(|frame| frame.pixels.width() != width || frame.pixels.height() != height)
-    {
-        return Err(PipelineError::InvalidRequest {
-            reason: "invalid-frame-selection",
-        });
-    }
-
     let durations_us = frames
         .iter()
         .map(|frame| frame.duration_us)
         .collect::<Vec<_>>();
-    let frame_delays = quantize_apng_delays(&durations_us)
+    write_native_apng_iterator_with_checkpoint(
+        writer,
+        frames.len(),
+        &durations_us,
+        frames.iter().cloned().map(Ok),
+        preset,
+        || checkpoint(),
+    )
+}
+
+fn write_native_apng_iterator_with_checkpoint<W, I>(
+    writer: W,
+    frame_count: usize,
+    durations_us: &[u64],
+    mut frames: I,
+    preset: &str,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<(), PipelineError>
+where
+    W: Write,
+    I: Iterator<Item = Result<StickerFrame, PipelineError>>,
+{
+    checkpoint()?;
+    if frame_count == 0 {
+        return Err(PipelineError::InvalidRequest {
+            reason: "no-frames-selected",
+        });
+    }
+    if durations_us.len() != frame_count {
+        return Err(PipelineError::MalformedProcessOutput {
+            reason: "APNG duration count did not match frame count".into(),
+        });
+    }
+    let frame_count_u32 = u32::try_from(frame_count).map_err(|_| PipelineError::LimitExceeded {
+        resource: "frame-count",
+        limit: u64::from(u32::MAX),
+        actual: u64::try_from(frame_count).unwrap_or(u64::MAX),
+    })?;
+    let frame_delays = quantize_apng_delays(durations_us)
         .map_err(|reason| PipelineError::InvalidRequest { reason })?;
+
+    checkpoint()?;
+    let first = frames
+        .next()
+        .ok_or_else(|| PipelineError::MalformedProcessOutput {
+            reason: "APNG frame iterator ended before the declared frame count".into(),
+        })??;
+    if first.duration_us != durations_us[0] {
+        return Err(PipelineError::MalformedProcessOutput {
+            reason: "APNG frame duration did not match sequence metadata".into(),
+        });
+    }
+
+    let width = first.pixels.width();
+    let height = first.pixels.height();
 
     let mut encoder = NativePngEncoder::new(writer, width, height);
     encoder.set_color(PngColorType::Rgba);
     encoder.set_depth(PngBitDepth::Eight);
     encoder
-        .set_animated(frames.len() as u32, 0)
+        .set_animated(frame_count_u32, 0)
         .map_err(|error| pipeline_io_error("configure APNG output", error))?;
     encoder
         .set_sep_def_img(false)
@@ -2923,12 +3586,29 @@ fn write_native_apng_with_checkpoint<W: Write>(
         .map_err(|error| pipeline_io_error("write APNG header", error))?;
     checkpoint()?;
     png_writer
-        .write_image_data(frames[0].pixels.as_raw())
+        .write_image_data(first.pixels.as_raw())
         .map_err(|error| pipeline_io_error("write APNG frame", error))?;
     checkpoint()?;
 
-    let mut previous_frame = frames[0].pixels.clone();
-    for (frame, &(delay_num, delay_den)) in frames[1..].iter().zip(&frame_delays[1..]) {
+    let mut previous_frame = first.pixels;
+    for frame_index in 1..frame_count {
+        checkpoint()?;
+        let frame = frames
+            .next()
+            .ok_or_else(|| PipelineError::MalformedProcessOutput {
+                reason: "APNG frame iterator ended before the declared frame count".into(),
+            })??;
+        if frame.duration_us != durations_us[frame_index] {
+            return Err(PipelineError::MalformedProcessOutput {
+                reason: "APNG frame duration did not match sequence metadata".into(),
+            });
+        }
+        if frame.pixels.width() != width || frame.pixels.height() != height {
+            return Err(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            });
+        }
+        let (delay_num, delay_den) = frame_delays[frame_index];
         checkpoint()?;
         let region = changed_frame_region(&previous_frame, &frame.pixels);
         png_writer
@@ -2954,61 +3634,24 @@ fn write_native_apng_with_checkpoint<W: Write>(
             .write_image_data(&region_pixels)
             .map_err(|error| pipeline_io_error("write APNG frame", error))?;
         checkpoint()?;
-        previous_frame = frame.pixels.clone();
+        previous_frame = frame.pixels;
+    }
+
+    checkpoint()?;
+    match frames.next() {
+        None => {}
+        Some(Ok(_)) => {
+            return Err(PipelineError::MalformedProcessOutput {
+                reason: "APNG frame iterator exceeded the declared frame count".into(),
+            })
+        }
+        Some(Err(error)) => return Err(error),
     }
 
     checkpoint()?;
     png_writer
         .finish()
         .map_err(|error| pipeline_io_error("finish APNG output", error))
-}
-
-fn build_native_selected_animation_frames(
-    source_frames: &[StickerFrame],
-    selected_frames: Option<&[u32]>,
-    candidate_fps: u32,
-) -> Result<Vec<StickerFrame>, String> {
-    let frame_indexes: Vec<u32> = selected_frames
-        .map(|frames| frames.to_vec())
-        .unwrap_or_else(|| (0..source_frames.len() as u32).collect());
-
-    if frame_indexes.is_empty() {
-        return Err("no frames available for selection".into());
-    }
-
-    let duration_us = frame_duration_us_for_fps(candidate_fps);
-    frame_indexes
-        .into_iter()
-        .map(|index| {
-            source_frames
-                .get(index as usize)
-                .cloned()
-                .map(|frame| StickerFrame {
-                    pixels: frame.pixels,
-                    duration_us,
-                })
-                .ok_or_else(|| "selected frame index is out of range".to_string())
-        })
-        .collect()
-}
-
-fn build_native_timeline_frames(
-    source_frames: &[StickerFrame],
-    timeline_frames: &[ResolvedTimelineFrame],
-) -> Result<Vec<StickerFrame>, String> {
-    timeline_frames
-        .iter()
-        .map(|frame| {
-            source_frames
-                .get(frame.source_frame_index as usize)
-                .cloned()
-                .map(|source| StickerFrame {
-                    pixels: source.pixels,
-                    duration_us: frame.duration_us,
-                })
-                .ok_or_else(|| "timeline frame index is out of range".to_string())
-        })
-        .collect()
 }
 
 fn validate_raw_rgba_output(
@@ -3056,63 +3699,6 @@ fn rgba_frame_from_bytes(
     RgbaImage::from_raw(width, height, bytes).ok_or_else(|| PipelineError::MalformedProcessOutput {
         reason: "raw RGBA frame size did not match image dimensions".into(),
     })
-}
-
-fn decode_video_frames_with_ffmpeg(
-    input_path: &str,
-    filter_graph: &str,
-    frame_width: u32,
-    frame_height: u32,
-    locale: UiLocale,
-    context: Option<&OperationContext>,
-) -> Result<(Vec<RgbaImage>, ToolResolution), PipelineError> {
-    let limits = MediaLimits::default();
-    let frame_size = checked_rgba_bytes(frame_width, frame_height, limits)?;
-    preflight_animation_decoded_bytes(frame_size, 1, limits)?;
-    let resolution = resolve_tool("ffmpeg", locale)
-        .map_err(|_| PipelineError::ToolMissing { tool: "ffmpeg" })?;
-    let args = [
-        OsString::from("-v"),
-        OsString::from("error"),
-        OsString::from("-i"),
-        OsString::from(input_path),
-        OsString::from("-vf"),
-        OsString::from(filter_graph),
-        OsString::from("-pix_fmt"),
-        OsString::from("rgba"),
-        OsString::from("-f"),
-        OsString::from("rawvideo"),
-        OsString::from("-an"),
-        OsString::from("-"),
-    ];
-    let detached = context
-        .is_none()
-        .then(|| OperationContext::detached(RAW_DECODE_PROCESS_TIMEOUT));
-    let context = context.unwrap_or_else(|| detached.as_ref().expect("detached decode context"));
-    let mut frames = Vec::new();
-    let summary = stream_fixed_rgba_frames(
-        &resolution.command,
-        &args,
-        frame_size,
-        limits.max_frame_count as usize,
-        ProcessLimits {
-            timeout: RAW_DECODE_PROCESS_TIMEOUT,
-            max_stdout_bytes: usize::try_from(limits.max_total_decoded_bytes).unwrap_or(usize::MAX),
-            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
-        },
-        context,
-        |frame| {
-            frames.push(rgba_frame_from_bytes(
-                frame_width,
-                frame_height,
-                frame.to_vec(),
-            )?);
-            Ok(())
-        },
-    )?;
-    validate_resampled_frame_stream(summary.frame_count)?;
-
-    Ok((frames, resolution))
 }
 
 fn extract_video_source_frames_rgba(
@@ -3237,9 +3823,12 @@ fn build_candidate_ladder(
     search_budget: usize,
     locale: UiLocale,
 ) -> Vec<CandidatePreview> {
+    let source_duration_seconds =
+        natural_selection_duration_seconds(selected_frame_count, source_fps);
     build_candidate_ladder_with_checkpoint(
         selected_frame_count,
         source_fps,
+        source_duration_seconds,
         input_width,
         input_height,
         preset_strategy,
@@ -3251,14 +3840,14 @@ fn build_candidate_ladder(
     .unwrap_or_default()
 }
 
-fn build_candidate_ladder_with_checkpoint(
+fn build_candidate_universe_with_checkpoint(
     selected_frame_count: usize,
     source_fps: f64,
+    source_duration_seconds: f64,
     input_width: Option<u32>,
     input_height: Option<u32>,
     preset_strategy: &str,
     optimizer_goal: &str,
-    search_budget: usize,
     locale: UiLocale,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<Vec<CandidatePreview>, PipelineError> {
@@ -3272,24 +3861,16 @@ fn build_candidate_ladder_with_checkpoint(
     };
 
     let mut candidates = Vec::new();
-    let source_duration_seconds =
-        natural_selection_duration_seconds(selected_frame_count, source_fps);
     let frame_sample_steps = frame_sample_steps_for_goal(selected_frame_count, optimizer_goal);
 
     for frame_sample_step in frame_sample_steps {
         checkpoint()?;
         let encoded_frame_count = sampled_frame_count(selected_frame_count, frame_sample_step);
-        let fps_ladder: Vec<u32> = [30, 27, 24, 21, 18, 15, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
-            .into_iter()
-            .filter(|fps| {
-                candidate_duration_seconds(encoded_frame_count, *fps)
-                    <= duration_us_to_seconds(DISCORD_MAX_DURATION_US)
-            })
-            .collect();
+        let fps_ladder: Vec<u32> = vec![30, 27, 24, 21, 18, 15, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
 
         for fps in fps_ladder {
             checkpoint()?;
-            let duration_seconds = candidate_duration_seconds(encoded_frame_count, fps);
+            let duration_seconds = source_duration_seconds;
             let preset_ladder = preset_ladder_for_strategy(duration_seconds, preset_strategy);
 
             for scale in &scale_ladder {
@@ -3342,7 +3923,123 @@ fn build_candidate_ladder_with_checkpoint(
     }
 
     checkpoint()?;
+    Ok(candidates)
+}
+
+fn build_candidate_ladder_with_checkpoint(
+    selected_frame_count: usize,
+    source_fps: f64,
+    source_duration_seconds: f64,
+    input_width: Option<u32>,
+    input_height: Option<u32>,
+    preset_strategy: &str,
+    optimizer_goal: &str,
+    search_budget: usize,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> Result<Vec<CandidatePreview>, PipelineError> {
+    let candidates = build_candidate_universe_with_checkpoint(
+        selected_frame_count,
+        source_fps,
+        source_duration_seconds,
+        input_width,
+        input_height,
+        preset_strategy,
+        optimizer_goal,
+        locale,
+        checkpoint,
+    )?;
     Ok(select_ranked_candidate_subset(candidates, search_budget))
+}
+
+fn synchronize_candidates_with_prepared_duration(
+    plan: &mut OptimizerPlanResponse,
+    prepared: &PreparedSearchSource,
+    input_width: Option<u32>,
+    input_height: Option<u32>,
+    preset_strategy: &str,
+    optimizer_goal: &str,
+    locale: UiLocale,
+    context: &OperationContext,
+) -> Result<(), PipelineError> {
+    let duration_us = checked_timeline_duration(&prepared.base_sequence)?;
+    let duration_seconds = duration_us_to_seconds(duration_us);
+    plan.selected_duration_seconds = Some(duration_seconds);
+    if duration_us > DISCORD_MAX_DURATION_US {
+        return Err(PipelineError::InvalidRequest {
+            reason: "duration-too-long",
+        });
+    }
+    let base_frame_count = prepared.base_sequence.len().max(1);
+    plan.candidates = match prepared.timing_authority {
+        TimelineTimingAuthority::Authored => build_candidate_universe_fixed_duration(
+            duration_seconds,
+            prepared.base_fps.min(30),
+            input_width,
+            input_height,
+            preset_strategy,
+            optimizer_goal,
+            locale,
+        ),
+        TimelineTimingAuthority::Native | TimelineTimingAuthority::Inspected => {
+            build_candidate_universe_with_checkpoint(
+                base_frame_count,
+                f64::from(prepared.base_fps),
+                duration_seconds,
+                input_width,
+                input_height,
+                preset_strategy,
+                optimizer_goal,
+                locale,
+                &mut || context.checkpoint(),
+            )?
+        }
+    };
+    let mut synchronized = Vec::with_capacity(plan.candidates.len());
+
+    for mut candidate in plan.candidates.drain(..) {
+        context.checkpoint()?;
+        let sequence = build_candidate_output_sequence(prepared, &candidate, context)?;
+        let frame_retention_score = sequence.frames.len() as f64 / base_frame_count as f64;
+        let score = optimizer_goal_score(
+            optimizer_goal,
+            f64::from(prepared.base_fps),
+            candidate.fps,
+            candidate.content_scale,
+            &candidate.preset,
+            duration_seconds,
+            duration_seconds,
+            frame_retention_score,
+        );
+        candidate.duration_seconds = duration_seconds;
+        candidate.score = score;
+        candidate.source_similarity_score = score;
+        candidate.summary = locale::candidate_summary(
+            locale,
+            candidate.fps,
+            candidate.content_scale,
+            &candidate.preset,
+            duration_seconds,
+        );
+        let sample_suffix = if candidate.frame_sample_step > 1 {
+            format!("-every{}", candidate.frame_sample_step)
+        } else {
+            String::new()
+        };
+        candidate.id = format!(
+            "{}-{}-{}fps-{}scale{}-{}ms",
+            candidate.fit_mode,
+            candidate.preset,
+            candidate.fps,
+            (candidate.content_scale * 100.0).round() as u32,
+            sample_suffix,
+            (duration_seconds * 1000.0).round() as u64
+        );
+        synchronized.push(candidate);
+    }
+
+    plan.candidates = select_ranked_candidate_subset(synchronized, plan.search_budget);
+    Ok(())
 }
 
 fn prepare_optimizer_plan(
@@ -3610,21 +4307,18 @@ fn prepare_optimizer_plan_with_checkpoint(
         request.source_duration_seconds,
         frame_selection.base_frame_count,
     );
-    let natural_duration_seconds =
-        natural_selection_duration_seconds(frame_selection.selected_frame_count, source_fps);
-    let shortest_frame_count =
-        frame_sample_steps_for_goal(frame_selection.selected_frame_count, optimizer_goal)
-            .into_iter()
-            .map(|step| sampled_frame_count(frame_selection.selected_frame_count, step))
-            .min()
-            .unwrap_or(frame_selection.selected_frame_count);
-    let shortest_duration_seconds = candidate_duration_seconds(shortest_frame_count, 30);
+    let natural_duration_seconds = projected_selection_duration_seconds(
+        frame_selection.selected_frame_count,
+        frame_selection.base_frame_count,
+        request.source_duration_seconds,
+        source_fps,
+    );
 
-    if shortest_duration_seconds > duration_us_to_seconds(DISCORD_MAX_DURATION_US) {
+    if natural_duration_seconds > duration_us_to_seconds(DISCORD_MAX_DURATION_US) {
         return OptimizerPlanResponse {
             ok: false,
             fit_mode: fit_mode.into(),
-            selected_duration_seconds: Some(shortest_duration_seconds),
+            selected_duration_seconds: Some(natural_duration_seconds),
             recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
             search_budget,
             warnings,
@@ -3642,6 +4336,7 @@ fn prepare_optimizer_plan_with_checkpoint(
     let candidates = match build_candidate_ladder_with_checkpoint(
         frame_selection.selected_frame_count,
         source_fps,
+        natural_duration_seconds,
         effective_input_width,
         effective_input_height,
         preset_strategy,
@@ -3687,260 +4382,67 @@ fn prepare_optimizer_plan_with_operation(
     }
 }
 
-fn encode_candidate_from_native_animation_internal(
-    input_path: &str,
+fn encode_prepared_candidate_with_checkpoint(
+    input_path: &Path,
     output_directory: Option<&str>,
     locale: UiLocale,
-    crop_region: Option<&CropRegion>,
-    _input_width: Option<u32>,
-    _input_height: Option<u32>,
-    candidate: &CandidatePreview,
-    timeline_frames: &[ResolvedTimelineFrame],
+    sequence: &PreparedCandidateSequence<'_, '_>,
     expected_source: Option<&SourceIdentity>,
-    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+    context: &OperationContext,
 ) -> Result<EncodeResult, PipelineError> {
-    let output_directory =
-        resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
-            PipelineError::InvalidRequest {
-                reason: "invalid-output-directory",
-            }
-        })?;
-    let source_frames =
-        decode_native_animation_frames(input_path, MediaLimits::default(), || checkpoint())?;
-    let first_frame = source_frames
-        .first()
-        .ok_or_else(|| PipelineError::MalformedInput {
-            format: "animation",
-            reason: "native animation did not contain frames".into(),
-        })?;
-    let resolved_crop_region = resolve_crop_region(
-        crop_region,
-        Some(first_frame.pixels.width()),
-        Some(first_frame.pixels.height()),
-        locale,
-    )
-    .map_err(|_| PipelineError::InvalidRequest {
-        reason: "invalid-crop",
-    })?;
-    let frames = build_native_timeline_frames(&source_frames, timeline_frames)
+    context.checkpoint()?;
+    let input_path_display = input_path.to_string_lossy();
+    let output_directory = resolve_output_directory(output_directory, &input_path_display, locale)
         .map_err(|_| PipelineError::InvalidRequest {
+            reason: "invalid-output-directory",
+        })?;
+    if let Some(expected_source) = expected_source {
+        ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    }
+
+    let durations_us = sequence
+        .frames
+        .iter()
+        .map(|frame| frame.duration_us)
+        .collect::<Vec<_>>();
+    if checked_timeline_duration(sequence.frames.as_ref())? != sequence.duration_us {
+        return Err(PipelineError::InvalidRequest {
             reason: "invalid-frame-selection",
-        })?
-        .into_iter()
-        .map(|frame| {
-            checkpoint()?;
-            let transformed = StickerFrame {
-                pixels: transform_frame_for_candidate(
-                    &frame.pixels,
-                    candidate.content_scale,
-                    resolved_crop_region,
-                ),
-                duration_us: frame.duration_us,
-            };
-            checkpoint()?;
-            Ok(transformed)
-        })
-        .collect::<Result<Vec<_>, PipelineError>>()?;
-    if let Some(expected_source) = expected_source {
-        ensure_source_unchanged(expected_source, MediaLimits::default())?;
+        });
     }
+    let transformed_frames = sequence.frames.iter().map(|frame| {
+        let source_pixels = sequence
+            .source
+            .pixels_for_source_index(frame.source_frame_index)?;
+        Ok(StickerFrame {
+            pixels: scale_prepared_frame_for_candidate(
+                source_pixels.as_ref(),
+                sequence.candidate.content_scale,
+            ),
+            duration_us: frame.duration_us,
+        })
+    });
+
     let started = Instant::now();
-    let mut pending_output = PendingOutput::new(
-        &output_directory,
-        Path::new(input_path),
-        &candidate.id,
-        "png",
+    let mut pending_output =
+        PendingOutput::new(&output_directory, input_path, &sequence.candidate.id, "png")?;
+    write_native_apng_iterator_with_checkpoint(
+        pending_output.writer(),
+        sequence.frames.len(),
+        &durations_us,
+        transformed_frames,
+        &sequence.candidate.preset,
+        || context.checkpoint(),
     )?;
-    write_native_apng_with_checkpoint(pending_output.writer(), &frames, &candidate.preset, || {
-        checkpoint()
-    })?;
     let size_bytes = pending_output_size(&mut pending_output)?;
 
     Ok(EncodeResult {
         pending_output,
         size_bytes,
         elapsed_ms: started.elapsed().as_millis() as u64,
-        tool_source: "native".into(),
-        tool_command: None,
-        tool_detail: Some(locale::native_apng_encode_detail(locale)),
-    })
-}
-
-fn encode_candidate_from_video_timeline_internal(
-    input_path: &str,
-    output_directory: Option<&str>,
-    locale: UiLocale,
-    crop_region: Option<&CropRegion>,
-    input_width: Option<u32>,
-    input_height: Option<u32>,
-    candidate: &CandidatePreview,
-    timeline_frames: &[ResolvedTimelineFrame],
-    expected_source: Option<&SourceIdentity>,
-    context: Option<&OperationContext>,
-    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
-) -> Result<EncodeResult, PipelineError> {
-    let output_directory =
-        resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
-            PipelineError::InvalidRequest {
-                reason: "invalid-output-directory",
-            }
-        })?;
-    let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)
-        .map_err(|_| PipelineError::InvalidRequest {
-            reason: "invalid-crop",
-        })?;
-    let source_width =
-        input_width
-            .filter(|width| *width > 0)
-            .ok_or(PipelineError::InvalidRequest {
-                reason: "invalid-crop",
-            })?;
-    let source_height =
-        input_height
-            .filter(|height| *height > 0)
-            .ok_or(PipelineError::InvalidRequest {
-                reason: "invalid-crop",
-            })?;
-    let unique_frame_indexes = timeline_frames
-        .iter()
-        .map(|frame| frame.source_frame_index)
-        .collect::<BTreeSet<_>>();
-    checkpoint()?;
-    let decoded = extract_video_source_frames_rgba(
-        input_path,
-        &unique_frame_indexes,
-        source_width,
-        source_height,
-        locale,
-        context,
-    );
-    checkpoint()?;
-    let (source_frames, resolution) = decoded?;
-
-    let frames = timeline_frames
-        .iter()
-        .map(|frame| {
-            checkpoint()?;
-            source_frames
-                .get(&frame.source_frame_index)
-                .map(|pixels| StickerFrame {
-                    pixels: transform_frame_for_candidate(
-                        pixels,
-                        candidate.content_scale,
-                        resolved_crop_region,
-                    ),
-                    duration_us: frame.duration_us,
-                })
-                .ok_or(PipelineError::InvalidRequest {
-                    reason: "invalid-frame-selection",
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(expected_source) = expected_source {
-        ensure_source_unchanged(expected_source, MediaLimits::default())?;
-    }
-    let started = Instant::now();
-    let mut pending_output = PendingOutput::new(
-        &output_directory,
-        Path::new(input_path),
-        &candidate.id,
-        "png",
-    )?;
-    write_native_apng_with_checkpoint(pending_output.writer(), &frames, &candidate.preset, || {
-        checkpoint()
-    })?;
-    let size_bytes = pending_output_size(&mut pending_output)?;
-
-    Ok(EncodeResult {
-        pending_output,
-        size_bytes,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        tool_source: resolution.source.into(),
-        tool_command: Some(resolution.command_display),
-        tool_detail: resolution.fallback_reason,
-    })
-}
-
-fn encode_candidate_with_ffmpeg_frames_internal(
-    input_path: &str,
-    output_directory: Option<&str>,
-    locale: UiLocale,
-    crop_region: Option<&CropRegion>,
-    input_width: Option<u32>,
-    input_height: Option<u32>,
-    candidate: &CandidatePreview,
-    selected_frames: Option<&[u32]>,
-    expected_source: Option<&SourceIdentity>,
-    context: Option<&OperationContext>,
-    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
-) -> Result<EncodeResult, PipelineError> {
-    let output_directory =
-        resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
-            PipelineError::InvalidRequest {
-                reason: "invalid-output-directory",
-            }
-        })?;
-    let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)
-        .map_err(|_| PipelineError::InvalidRequest {
-            reason: "invalid-crop",
-        })?;
-    let filter_graph = build_filter_graph(
-        candidate.fps,
-        candidate.content_scale,
-        input_width,
-        input_height,
-        resolved_crop_region,
-        selected_frames,
-    );
-    let effective_width = resolved_crop_region.map(|crop| crop.width).or(input_width);
-    let effective_height = resolved_crop_region
-        .map(|crop| crop.height)
-        .or(input_height);
-    let (frame_width, frame_height) =
-        scaled_output_dimensions(effective_width, effective_height, candidate.content_scale);
-    checkpoint()?;
-    let decoded = decode_video_frames_with_ffmpeg(
-        input_path,
-        &filter_graph,
-        frame_width,
-        frame_height,
-        locale,
-        context,
-    );
-    checkpoint()?;
-    let (pixels, resolution) = decoded?;
-    let frames = pixels
-        .into_iter()
-        .map(|pixels| {
-            checkpoint()?;
-            Ok(StickerFrame {
-                pixels,
-                duration_us: frame_duration_us_for_fps(candidate.fps),
-            })
-        })
-        .collect::<Result<Vec<_>, PipelineError>>()?;
-    if let Some(expected_source) = expected_source {
-        ensure_source_unchanged(expected_source, MediaLimits::default())?;
-    }
-    let started = Instant::now();
-    let mut pending_output = PendingOutput::new(
-        &output_directory,
-        Path::new(input_path),
-        &candidate.id,
-        "png",
-    )?;
-    write_native_apng_with_checkpoint(pending_output.writer(), &frames, &candidate.preset, || {
-        checkpoint()
-    })?;
-    let size_bytes = pending_output_size(&mut pending_output)?;
-
-    Ok(EncodeResult {
-        pending_output,
-        size_bytes,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        tool_source: resolution.source.into(),
-        tool_command: Some(resolution.command_display),
-        tool_detail: resolution.fallback_reason,
+        tool_source: sequence.source.tool_source.clone(),
+        tool_command: sequence.source.tool_command.clone(),
+        tool_detail: sequence.source.tool_detail.clone(),
     })
 }
 
@@ -3956,150 +4458,55 @@ fn encode_candidate_internal(
     timeline_frames: Option<&[ResolvedTimelineFrame]>,
     expected_source: Option<&SourceIdentity>,
 ) -> Result<EncodeResult, PipelineError> {
-    encode_candidate_with_checkpoint(
-        input_path,
-        output_directory,
-        locale,
-        crop_region,
-        input_width,
-        input_height,
-        candidate,
-        selected_frames,
-        timeline_frames,
-        expected_source,
-        None,
-        &mut || Ok(()),
-    )
-}
-
-fn encode_candidate_with_checkpoint(
-    input_path: &str,
-    output_directory: Option<&str>,
-    locale: UiLocale,
-    crop_region: Option<&CropRegion>,
-    input_width: Option<u32>,
-    input_height: Option<u32>,
-    candidate: &CandidatePreview,
-    selected_frames: Option<&[u32]>,
-    timeline_frames: Option<&[ResolvedTimelineFrame]>,
-    expected_source: Option<&SourceIdentity>,
-    context: Option<&OperationContext>,
-    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
-) -> Result<EncodeResult, PipelineError> {
-    let extension = lowercase_source_extension(input_path).unwrap_or_default();
-
-    if let Some(timeline_frames) = timeline_frames {
-        return match extension.as_str() {
-            "gif" | "apng" => encode_candidate_from_native_animation_internal(
-                input_path,
-                output_directory,
-                locale,
-                crop_region,
-                input_width,
-                input_height,
-                candidate,
-                timeline_frames,
-                expected_source,
-                checkpoint,
-            ),
-            _ => encode_candidate_from_video_timeline_internal(
-                input_path,
-                output_directory,
-                locale,
-                crop_region,
-                input_width,
-                input_height,
-                candidate,
-                timeline_frames,
-                expected_source,
-                context,
-                checkpoint,
-            ),
-        };
-    }
-
-    if matches!(extension.as_str(), "gif" | "apng") {
-        let output_directory = resolve_output_directory(output_directory, input_path, locale)
-            .map_err(|_| PipelineError::InvalidRequest {
-                reason: "invalid-output-directory",
-            })?;
-        let source_frames =
-            decode_native_animation_frames(input_path, MediaLimits::default(), || checkpoint())?;
-        let first_frame = source_frames
-            .first()
-            .ok_or_else(|| PipelineError::MalformedInput {
-                format: "animation",
-                reason: "native animation did not contain frames".into(),
-            })?;
-        let resolved_crop_region = resolve_crop_region(
+    let context = OperationContext::detached(MediaOperationKind::OptimizerSearch.timeout());
+    let input_path = Path::new(input_path);
+    let source_revision = expected_source
+        .map(SourceIdentity::revision)
+        .unwrap_or_default();
+    let source_duration_seconds = timeline_frames
+        .and_then(|frames| checked_timeline_duration(frames).ok())
+        .map(duration_us_to_seconds);
+    let plan = OptimizerPlanResponse {
+        ok: true,
+        fit_mode: CANONICAL_FIT_MODE.into(),
+        selected_duration_seconds: source_duration_seconds,
+        recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
+        search_budget: 1,
+        warnings: Vec::new(),
+        candidates: vec![candidate.clone()],
+        error_code: None,
+        reason_code: None,
+        error_message: None,
+    };
+    let loader = DefaultFrameSourceLoader;
+    let prepared = loader.prepare(
+        FramePreparationRequest {
+            input_path,
+            source_revision: &source_revision,
             crop_region,
-            Some(first_frame.pixels.width()),
-            Some(first_frame.pixels.height()),
+            input_width,
+            input_height,
+            base_frame_count: None,
+            timeline_frames: None,
+            resolved_timeline_frames: timeline_frames,
+            selected_frame_indexes: selected_frames,
+            source_duration_seconds,
+            avg_fps: Some(f64::from(candidate.fps.max(1))),
             locale,
-        )
-        .map_err(|_| PipelineError::InvalidRequest {
-            reason: "invalid-crop",
-        })?;
-        let frames =
-            build_native_selected_animation_frames(&source_frames, selected_frames, candidate.fps)
-                .map_err(|_| PipelineError::InvalidRequest {
-                    reason: "invalid-frame-selection",
-                })?
-                .into_iter()
-                .map(|frame| {
-                    checkpoint()?;
-                    let transformed = StickerFrame {
-                        pixels: transform_frame_for_candidate(
-                            &frame.pixels,
-                            candidate.content_scale,
-                            resolved_crop_region,
-                        ),
-                        duration_us: frame.duration_us,
-                    };
-                    checkpoint()?;
-                    Ok(transformed)
-                })
-                .collect::<Result<Vec<_>, PipelineError>>()?;
-        if let Some(expected_source) = expected_source {
-            ensure_source_unchanged(expected_source, MediaLimits::default())?;
-        }
-        let started = Instant::now();
-        let mut pending_output = PendingOutput::new(
-            &output_directory,
-            Path::new(input_path),
-            &candidate.id,
-            "png",
-        )?;
-        write_native_apng_with_checkpoint(
-            pending_output.writer(),
-            &frames,
-            &candidate.preset,
-            || checkpoint(),
-        )?;
-        let size_bytes = pending_output_size(&mut pending_output)?;
-
-        return Ok(EncodeResult {
-            pending_output,
-            size_bytes,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            tool_source: "native".into(),
-            tool_command: None,
-            tool_detail: Some(locale::native_apng_encode_detail(locale)),
-        });
-    }
-
-    encode_candidate_with_ffmpeg_frames_internal(
+            optimizer_goal: "balanced",
+        },
+        &plan,
+        &context,
+        MediaLimits::default(),
+    )?;
+    let sequence = build_candidate_output_sequence(&prepared, candidate, &context)?;
+    encode_prepared_candidate_with_checkpoint(
         input_path,
         output_directory,
         locale,
-        crop_region,
-        input_width,
-        input_height,
-        candidate,
-        selected_frames,
+        &sequence,
         expected_source,
-        context,
-        checkpoint,
+        &context,
     )
 }
 
@@ -6231,10 +6638,19 @@ fn optimizer_search_pipeline_error(
     warnings: Vec<String>,
     error: PipelineError,
 ) -> OptimizerSearchResponse {
+    optimizer_search_pipeline_error_with_duration(locale, warnings, error, None)
+}
+
+fn optimizer_search_pipeline_error_with_duration(
+    locale: UiLocale,
+    warnings: Vec<String>,
+    error: PipelineError,
+    selected_duration_seconds: Option<f64>,
+) -> OptimizerSearchResponse {
     OptimizerSearchResponse {
         ok: false,
         fit_mode: CANONICAL_FIT_MODE.into(),
-        selected_duration_seconds: None,
+        selected_duration_seconds,
         limit_bytes: DISCORD_MAX_STICKER_BYTES,
         search_budget: MAX_SEARCH_BUDGET,
         real_attempt_count: 0,
@@ -6279,12 +6695,29 @@ fn run_optimizer_search_with_operation(
 }
 
 fn run_optimizer_search_with_callbacks(
+    request: OptimizerSearchRequest,
+    locale: UiLocale,
+    context: Option<&OperationContext>,
+    checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    progress: impl FnMut(ProgressStage, u32, Option<u32>),
+) -> OptimizerSearchResponse {
+    let loader = DefaultFrameSourceLoader;
+    run_optimizer_search_with_loader(request, locale, context, &loader, checkpoint, progress)
+}
+
+fn run_optimizer_search_with_loader(
     mut request: OptimizerSearchRequest,
     locale: UiLocale,
     context: Option<&OperationContext>,
+    loader: &impl FrameSourceLoader,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> OptimizerSearchResponse {
+    let detached_context = context
+        .is_none()
+        .then(|| OperationContext::detached(MediaOperationKind::OptimizerSearch.timeout()));
+    let operation_context =
+        context.unwrap_or_else(|| detached_context.as_ref().expect("detached search context"));
     let (_, legacy_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
     let legacy_fit_warnings = legacy_fit_warning.into_iter().collect::<Vec<_>>();
     if let Err(error) = checkpoint() {
@@ -6309,6 +6742,7 @@ fn run_optimizer_search_with_callbacks(
             request.optimizer_goal.as_deref(),
             request.preset_strategy.as_deref(),
         );
+        let preset_strategy = normalized_preset_strategy(request.preset_strategy.as_deref());
         let quality_frame_drop_interval =
             normalized_quality_frame_drop_interval(request.quality_frame_drop_interval);
         let resolved_timeline_frames = match resolve_timeline_frames(
@@ -6500,7 +6934,7 @@ fn run_optimizer_search_with_callbacks(
         };
 
         progress(ProgressStage::Estimating, 0, None);
-        let plan = prepare_optimizer_plan_with_checkpoint(
+        let mut plan = prepare_optimizer_plan_with_checkpoint(
             &OptimizerPlanRequest {
                 locale: request.locale.clone(),
                 source_duration_seconds: request.source_duration_seconds,
@@ -6525,7 +6959,7 @@ fn run_optimizer_search_with_callbacks(
             return OptimizerSearchResponse {
                 ok: false,
                 fit_mode: plan.fit_mode,
-                selected_duration_seconds: None,
+                selected_duration_seconds: plan.selected_duration_seconds,
                 limit_bytes: DISCORD_MAX_STICKER_BYTES,
                 search_budget: MAX_SEARCH_BUDGET,
                 real_attempt_count: 0,
@@ -6548,6 +6982,70 @@ fn run_optimizer_search_with_callbacks(
             };
         }
 
+        progress(ProgressStage::Decoding, 0, Some(1));
+        let validated_revision = source_identity.revision();
+        let prepared_source = match loader.prepare(
+            FramePreparationRequest {
+                input_path: Path::new(&request.input_path),
+                source_revision: &validated_revision,
+                crop_region: request.crop_region.as_ref(),
+                input_width: request.input_width,
+                input_height: request.input_height,
+                base_frame_count: request.base_frame_count,
+                timeline_frames: request.timeline_frames.as_deref(),
+                resolved_timeline_frames: resolved_timeline_frames.as_deref(),
+                selected_frame_indexes: legacy_selected_frames
+                    .as_ref()
+                    .and_then(|frames| frames.as_deref()),
+                source_duration_seconds: request.source_duration_seconds,
+                avg_fps: request.avg_fps,
+                locale,
+                optimizer_goal,
+            },
+            &plan,
+            operation_context,
+            MediaLimits::default(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return optimizer_search_pipeline_error_with_duration(
+                    locale,
+                    plan.warnings.clone(),
+                    error,
+                    plan.selected_duration_seconds,
+                )
+            }
+        };
+        if let Err(error) = checkpoint()
+            .and_then(|_| operation_context.checkpoint())
+            .and_then(|_| ensure_source_unchanged(&source_identity, MediaLimits::default()))
+        {
+            return optimizer_search_pipeline_error_with_duration(
+                locale,
+                plan.warnings.clone(),
+                error,
+                plan.selected_duration_seconds,
+            );
+        }
+        if let Err(error) = synchronize_candidates_with_prepared_duration(
+            &mut plan,
+            &prepared_source,
+            request.input_width,
+            request.input_height,
+            preset_strategy,
+            optimizer_goal,
+            locale,
+            operation_context,
+        ) {
+            return optimizer_search_pipeline_error_with_duration(
+                locale,
+                plan.warnings.clone(),
+                error,
+                plan.selected_duration_seconds,
+            );
+        }
+        progress(ProgressStage::Decoding, 1, Some(1));
+
         let mut attempts = Vec::new();
         let mut best_within_limit_output: Option<PendingSelectedEncodeOutput> = None;
         let mut smallest_oversize_output: Option<PendingSelectedEncodeOutput> = None;
@@ -6557,10 +7055,20 @@ fn run_optimizer_search_with_callbacks(
         progress(ProgressStage::Encoding, 0, Some(total_candidates));
         for candidate in &plan.candidates {
             if let Err(error) = checkpoint() {
-                return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+                return optimizer_search_pipeline_error_with_duration(
+                    locale,
+                    plan.warnings.clone(),
+                    error,
+                    plan.selected_duration_seconds,
+                );
             }
             if let Err(error) = ensure_source_unchanged(&source_identity, MediaLimits::default()) {
-                return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+                return optimizer_search_pipeline_error_with_duration(
+                    locale,
+                    plan.warnings.clone(),
+                    error,
+                    plan.selected_duration_seconds,
+                );
             }
             if remaining_candidate_cannot_beat_within_limit(
                 best_within_limit_output
@@ -6572,53 +7080,30 @@ fn run_optimizer_search_with_callbacks(
                 break;
             }
 
-            let sampled_legacy_frames = if resolved_timeline_frames.is_none() {
-                sampled_frame_indexes(
-                    legacy_selected_frames
-                        .as_ref()
-                        .and_then(|frames| frames.as_deref()),
-                    request.base_frame_count,
-                    candidate.frame_sample_step,
-                )
-            } else {
-                None
+            let sequence = match build_candidate_output_sequence(
+                &prepared_source,
+                candidate,
+                operation_context,
+            ) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    return optimizer_search_pipeline_error_with_duration(
+                        locale,
+                        plan.warnings.clone(),
+                        error,
+                        plan.selected_duration_seconds,
+                    )
+                }
             };
-
-            let encode_result = if let Some(timeline_frames) = resolved_timeline_frames.as_deref() {
-                encode_candidate_with_checkpoint(
-                    &request.input_path,
-                    request.output_directory.as_deref(),
-                    locale,
-                    request.crop_region.as_ref(),
-                    request.input_width,
-                    request.input_height,
-                    candidate,
-                    None,
-                    Some(timeline_frames),
-                    Some(&source_identity),
-                    context,
-                    &mut checkpoint,
-                )
-            } else {
-                encode_candidate_with_checkpoint(
-                    &request.input_path,
-                    request.output_directory.as_deref(),
-                    locale,
-                    request.crop_region.as_ref(),
-                    request.input_width,
-                    request.input_height,
-                    candidate,
-                    sampled_legacy_frames.as_deref().or_else(|| {
-                        legacy_selected_frames
-                            .as_ref()
-                            .and_then(|frames| frames.as_deref())
-                    }),
-                    None,
-                    Some(&source_identity),
-                    context,
-                    &mut checkpoint,
-                )
-            };
+            let candidate_duration_seconds = duration_us_to_seconds(sequence.duration_us);
+            let encode_result = encode_prepared_candidate_with_checkpoint(
+                Path::new(&request.input_path),
+                request.output_directory.as_deref(),
+                locale,
+                &sequence,
+                Some(&source_identity),
+                operation_context,
+            );
 
             match encode_result {
                 Ok(result) => {
@@ -6636,7 +7121,7 @@ fn run_optimizer_search_with_callbacks(
                         canonical_candidate_id: candidate.id.clone(),
                         equivalent_to_candidate_id: None,
                         rank: candidate.rank,
-                        duration_seconds: candidate.duration_seconds,
+                        duration_seconds: candidate_duration_seconds,
                         fps: candidate.fps,
                         content_scale: candidate.content_scale,
                         preset: candidate.preset.clone(),
@@ -6662,7 +7147,7 @@ fn run_optimizer_search_with_callbacks(
                         selected: SelectedEncodeOutput {
                             candidate_id: candidate.id.clone(),
                             rank: candidate.rank,
-                            duration_seconds: candidate.duration_seconds,
+                            duration_seconds: candidate_duration_seconds,
                             size_bytes,
                             source_similarity_score: candidate.source_similarity_score,
                         },
@@ -6707,7 +7192,12 @@ fn run_optimizer_search_with_callbacks(
                     );
                 }
                 Err(error) => {
-                    return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+                    return optimizer_search_pipeline_error_with_duration(
+                        locale,
+                        plan.warnings.clone(),
+                        error,
+                        plan.selected_duration_seconds,
+                    );
                 }
             }
         }
@@ -6736,7 +7226,12 @@ fn run_optimizer_search_with_callbacks(
             Some(total_candidates),
         );
         if let Err(error) = checkpoint() {
-            return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+            return optimizer_search_pipeline_error_with_duration(
+                locale,
+                plan.warnings.clone(),
+                error,
+                plan.selected_duration_seconds,
+            );
         }
         let published_output = match publish_optimizer_selection(
             &source_identity,
@@ -6746,7 +7241,12 @@ fn run_optimizer_search_with_callbacks(
         ) {
             Ok(output) => output,
             Err(error) => {
-                return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error)
+                return optimizer_search_pipeline_error_with_duration(
+                    locale,
+                    plan.warnings.clone(),
+                    error,
+                    plan.selected_duration_seconds,
+                )
             }
         };
         let selected_output = published_output.as_ref();
@@ -6796,10 +7296,112 @@ mod tests {
     use crate::media_limits::MediaLimits;
     use std::cell::Cell;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct CountingFrameSourceLoader {
+        prepare_count: AtomicUsize,
+    }
+
+    impl CountingFrameSourceLoader {
+        fn new() -> Self {
+            Self {
+                prepare_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl FrameSourceLoader for CountingFrameSourceLoader {
+        fn prepare(
+            &self,
+            _request: FramePreparationRequest<'_>,
+            _plan: &OptimizerPlanResponse,
+            _context: &OperationContext,
+            _limits: MediaLimits,
+        ) -> Result<PreparedSearchSource, PipelineError> {
+            self.prepare_count.fetch_add(1, AtomicOrdering::SeqCst);
+            let noisy_frame = |seed: u32| {
+                Arc::new(RgbaImage::from_fn(320, 320, |x, y| {
+                    let mut value = x ^ y.rotate_left(16) ^ seed;
+                    value ^= value >> 16;
+                    value = value.wrapping_mul(0x7feb_352d);
+                    value ^= value >> 15;
+                    value = value.wrapping_mul(0x846c_a68b);
+                    value ^= value >> 16;
+                    Rgba([value as u8, (value >> 8) as u8, (value >> 16) as u8, 255])
+                }))
+            };
+            Ok(PreparedSearchSource {
+                frames: vec![
+                    PreparedFrame {
+                        source_frame_id: 1,
+                        pixels: noisy_frame(1),
+                        duration_us: 50_000,
+                    },
+                    PreparedFrame {
+                        source_frame_id: 2,
+                        pixels: noisy_frame(2),
+                        duration_us: 50_000,
+                    },
+                ],
+                base_sequence: vec![
+                    ResolvedTimelineFrame {
+                        source_frame_index: 0,
+                        duration_us: 50_000,
+                    },
+                    ResolvedTimelineFrame {
+                        source_frame_index: 1,
+                        duration_us: 50_000,
+                    },
+                ],
+                timing_authority: TimelineTimingAuthority::Inspected,
+                base_fps: 20,
+                decoded_bytes: 2 * 320 * 320 * 4,
+                tool_source: "counting-loader".into(),
+                tool_command: None,
+                tool_detail: None,
+            })
+        }
+    }
+
+    struct MutatingFrameSourceLoader;
+
+    impl FrameSourceLoader for MutatingFrameSourceLoader {
+        fn prepare(
+            &self,
+            request: FramePreparationRequest<'_>,
+            _plan: &OptimizerPlanResponse,
+            _context: &OperationContext,
+            _limits: MediaLimits,
+        ) -> Result<PreparedSearchSource, PipelineError> {
+            fs::write(request.input_path, b"source-mutated-after-preparation").map_err(
+                |error| PipelineError::Io {
+                    operation: "mutate source fixture",
+                    message: error.to_string(),
+                },
+            )?;
+            Ok(PreparedSearchSource {
+                frames: vec![PreparedFrame {
+                    source_frame_id: 1,
+                    pixels: Arc::new(RgbaImage::new(1, 1)),
+                    duration_us: 100_000,
+                }],
+                base_sequence: vec![ResolvedTimelineFrame {
+                    source_frame_index: 0,
+                    duration_us: 100_000,
+                }],
+                timing_authority: TimelineTimingAuthority::Inspected,
+                base_fps: 10,
+                decoded_bytes: 4,
+                tool_source: "mutating-loader".into(),
+                tool_command: None,
+                tool_detail: None,
+            })
+        }
+    }
 
     fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let start_offset = source.find(start).expect("source section start");
@@ -7105,22 +7707,17 @@ mod tests {
         assert!(inspection.contains("run_captured("));
         assert!(inspection.contains("context.unwrap_or"));
 
-        let resampled = source_section(
+        let prepared_video = source_section(
             lib_source,
-            "fn decode_video_frames_with_ffmpeg(",
-            "fn extract_video_source_frames_rgba(",
+            "fn prepare_video_search_source(",
+            "impl FrameSourceLoader for DefaultFrameSourceLoader",
         );
-        assert!(resampled.contains("stream_fixed_rgba_frames("));
-        assert!(resampled.contains("validate_resampled_frame_stream("));
-        assert!(resampled.contains("context.unwrap_or"));
-        let selected = source_section(
-            lib_source,
-            "fn extract_video_source_frames_rgba(",
-            "fn validate_resampled_frame_stream(",
+        assert_eq!(
+            prepared_video.matches("stream_fixed_rgba_frames(").count(),
+            1
         );
-        assert!(selected.contains("stream_fixed_rgba_frames("));
-        assert!(selected.contains("validate_exact_selected_frame_stream("));
-        assert!(selected.contains("context.unwrap_or"));
+        assert!(prepared_video.contains("validate_exact_selected_frame_stream("));
+        assert!(prepared_video.contains("context,"));
 
         let inspect_direct = source_section(
             lib_source,
@@ -7164,15 +7761,17 @@ mod tests {
         let encode_direct = source_section(
             lib_source,
             "fn encode_candidate_internal(",
-            "fn encode_candidate_with_checkpoint(",
+            "fn convert_static_image_to_png_internal(",
         );
         let encode_propagation = source_section(
             lib_source,
-            "fn encode_candidate_with_checkpoint(",
-            "fn convert_static_image_to_png_internal(",
+            "fn encode_prepared_candidate_with_checkpoint(",
+            "fn encode_candidate_internal(",
         );
-        assert!(encode_direct.contains("None,"));
-        assert!(encode_propagation.contains("context,"));
+        assert!(encode_direct.contains("loader.prepare("));
+        assert!(encode_direct.contains("build_candidate_output_sequence("));
+        assert!(encode_direct.contains("encode_prepared_candidate_with_checkpoint("));
+        assert!(encode_propagation.contains("sequence: &PreparedCandidateSequence"));
 
         let command_new = ["Command", "::new("].concat();
         let spawn = [".", "spawn()"].concat();
@@ -8567,11 +9166,20 @@ mod tests {
     }
 
     #[test]
-    fn normalize_selected_frame_indexes_converts_ui_ids_to_zero_based_indexes() {
+    fn normalize_selected_frame_indexes_preserves_ui_order_and_duplicates() {
         assert_eq!(
             normalize_selected_frame_indexes(Some(&vec![7, 1, 3, 7])),
-            Some(vec![0, 2, 6])
+            Some(vec![6, 0, 2, 6])
         );
+    }
+
+    #[test]
+    fn reordered_full_selection_is_not_collapsed_to_unedited_sequence() {
+        let selection = resolve_frame_selection(Some(&vec![3, 1, 2]), Some(3))
+            .expect("reordered full selection must resolve");
+
+        assert_eq!(selection.selected_frames, Some(vec![2, 0, 1]));
+        assert_eq!(selection.selected_frame_count, 3);
     }
 
     #[test]
@@ -10557,7 +11165,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_optimizer_plan_samples_long_frame_selection_to_fit_five_seconds() {
+    fn prepare_optimizer_plan_rejects_long_selection_instead_of_speeding_it_up() {
         let response = prepare_optimizer_plan(
             &OptimizerPlanRequest {
                 locale: Some("en".into()),
@@ -10578,12 +11186,53 @@ mod tests {
             UiLocale::En,
         );
 
+        assert!(!response.ok);
+        assert_eq!(response.reason_code.as_deref(), Some("duration-too-long"));
+        assert_eq!(response.selected_duration_seconds, Some(8.0));
+        assert!(response.candidates.is_empty());
+    }
+
+    #[test]
+    fn prepared_duration_is_identical_across_candidate_fps_and_sample_steps() {
+        let response = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: Some("en".into()),
+                source_duration_seconds: Some(4.8),
+                input_width: Some(48),
+                input_height: Some(48),
+                avg_fps: Some(25.0),
+                fit_mode: Some("contain".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: Some("deep".into()),
+                crop_region: None,
+                selected_frames: Some((1..=100).collect()),
+                base_frame_count: Some(120),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+        );
+
         assert!(response.ok);
+        assert_eq!(response.selected_duration_seconds, Some(4.0));
         assert!(response
             .candidates
             .iter()
-            .any(|candidate| candidate.frame_sample_step > 1
-                && candidate.duration_seconds <= duration_us_to_seconds(DISCORD_MAX_DURATION_US)));
+            .any(|candidate| candidate.frame_sample_step > 1));
+        assert!(
+            response
+                .candidates
+                .iter()
+                .map(|candidate| candidate.fps)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        );
+        assert!(response
+            .candidates
+            .iter()
+            .all(|candidate| approx_eq(candidate.duration_seconds, 4.0)));
     }
 
     #[test]
@@ -10644,7 +11293,7 @@ mod tests {
     }
 
     #[test]
-    fn motion_goal_keeps_frames_when_duration_can_fit() {
+    fn motion_goal_rejects_source_duration_over_five_seconds() {
         let response = prepare_optimizer_plan(
             &OptimizerPlanRequest {
                 locale: Some("en".into()),
@@ -10665,11 +11314,12 @@ mod tests {
             UiLocale::En,
         );
 
-        assert!(response.ok);
+        assert!(!response.ok);
+        assert_eq!(response.reason_code.as_deref(), Some("duration-too-long"));
         assert!(response
-            .candidates
-            .iter()
-            .all(|candidate| candidate.frame_sample_step == 1));
+            .selected_duration_seconds
+            .is_some_and(|duration| approx_eq(duration, 5.88)));
+        assert!(response.candidates.is_empty());
     }
 
     #[test]
@@ -10877,6 +11527,577 @@ mod tests {
             .candidates
             .iter()
             .all(|candidate| approx_eq(candidate.duration_seconds, 0.72)));
+    }
+
+    #[test]
+    fn animation_iterator_visits_decoded_frames_incrementally_in_order() {
+        let context = OperationContext::detached(Duration::from_secs(1));
+        let emitted = Rc::new(Cell::new(0_u8));
+        let observed = Rc::new(Cell::new(0_u8));
+        let iterator_emitted = Rc::clone(&emitted);
+        let iterator_observed = Rc::clone(&observed);
+        let frames = std::iter::from_fn(move || {
+            let value = iterator_emitted.get();
+            if value >= 3 {
+                return None;
+            }
+            assert_eq!(
+                value,
+                iterator_observed.get(),
+                "decoder iterator advanced before the previous frame was visited"
+            );
+            iterator_emitted.set(value + 1);
+            Some(Ok(image::Frame::new(RgbaImage::from_pixel(
+                1,
+                1,
+                Rgba([value, 0, 0, 255]),
+            ))))
+        });
+        let mut visited = Vec::new();
+
+        let count = visit_decoded_animation_frame_iterator(
+            "test",
+            frames,
+            Some(3),
+            MediaLimits::default(),
+            &context,
+            |source_frame_id, frame| {
+                visited.push((source_frame_id, frame.buffer().get_pixel(0, 0).0[0]));
+                observed.set(source_frame_id as u8);
+                Ok(())
+            },
+        )
+        .expect("incremental iterator must be accepted");
+
+        assert_eq!(count, 3);
+        assert_eq!(visited, vec![(1, 0), (2, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn animation_iterator_rejects_frame_301_before_visiting_it() {
+        let context = OperationContext::detached(Duration::from_secs(1));
+        let frames = (0..301).map(|_| Ok(image::Frame::new(RgbaImage::new(1, 1))));
+        let mut visited = 0_u32;
+
+        let error = visit_decoded_animation_frame_iterator(
+            "test",
+            frames,
+            Some(301),
+            MediaLimits::default(),
+            &context,
+            |_, _| {
+                visited += 1;
+                Ok(())
+            },
+        )
+        .expect_err("frame 301 must exceed the bounded iterator limit");
+
+        assert_eq!(visited, 300);
+        assert!(matches!(
+            error,
+            PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: 300,
+                actual: 301,
+            }
+        ));
+    }
+
+    #[test]
+    fn prepared_video_filter_selects_unique_indexes_then_crops_and_scales() {
+        let indexes = [0, 4, 7].into_iter().collect::<BTreeSet<_>>();
+        let filter = build_prepared_video_filter(
+            &indexes,
+            Some(ResolvedCropRegion {
+                x: 10,
+                y: 20,
+                width: 640,
+                height: 320,
+            }),
+            320,
+            160,
+        );
+
+        assert_eq!(
+            filter,
+            "select='eq(n,0)+eq(n,4)+eq(n,7)',crop=640:320:10:20,scale=320:160:flags=lanczos,format=rgba,setsar=1"
+        );
+    }
+
+    #[test]
+    fn video_preparation_maps_first_video_stream_without_cfr_duplication() {
+        let source = include_str!("lib.rs");
+        let preparation = source_section(
+            source,
+            "fn prepare_video_search_source(",
+            "impl FrameSourceLoader for DefaultFrameSourceLoader",
+        );
+
+        assert!(preparation.contains("OsString::from(\"-map\")"));
+        assert!(preparation.contains("OsString::from(\"0:v:0\")"));
+        assert!(preparation.contains("OsString::from(\"-fps_mode\")"));
+        assert!(preparation.contains("OsString::from(\"passthrough\")"));
+        assert_eq!(preparation.matches("stream_fixed_rgba_frames(").count(), 1);
+    }
+
+    #[test]
+    fn video_preparation_union_covers_the_full_temporal_candidate_universe() {
+        let base_sequence = (0..180)
+            .map(|index| ResolvedTimelineFrame {
+                source_frame_index: index,
+                duration_us: 10_000 + u64::from(index % 7) * 3_000,
+            })
+            .collect::<Vec<_>>();
+        let base_fps = prepared_sequence_base_fps(&base_sequence).expect("base FPS must resolve");
+        let context = OperationContext::detached(Duration::from_secs(1));
+        let required =
+            required_video_source_indexes(&base_sequence, base_fps, "balanced", &context)
+                .expect("preparation union must resolve");
+        let placeholder = PreparedSearchSource {
+            frames: Vec::new(),
+            base_sequence: base_sequence.clone(),
+            timing_authority: TimelineTimingAuthority::Inspected,
+            base_fps,
+            decoded_bytes: 0,
+            tool_source: "test".into(),
+            tool_command: None,
+            tool_detail: None,
+        };
+        let duration_seconds =
+            duration_us_to_seconds(checked_timeline_duration(&base_sequence).unwrap());
+        let candidates = build_candidate_universe_with_checkpoint(
+            base_sequence.len(),
+            f64::from(base_fps),
+            duration_seconds,
+            Some(640),
+            Some(320),
+            "balanced",
+            "balanced",
+            UiLocale::En,
+            &mut || Ok(()),
+        )
+        .expect("full candidate universe must build");
+
+        assert!(required.len() <= MAX_SEARCH_OUTPUT_FRAMES);
+        for candidate in &candidates {
+            let sequence = build_candidate_output_sequence(&placeholder, candidate, &context)
+                .expect("candidate sequence must build");
+            assert!(sequence
+                .frames
+                .iter()
+                .all(|frame| required.contains(&frame.source_frame_index)));
+        }
+        let authored_fps_candidate = build_test_candidate("authored-23fps", 23);
+        let authored_sequence =
+            build_candidate_output_sequence(&placeholder, &authored_fps_candidate, &context)
+                .expect("authored fixed-FPS candidate must build");
+        assert!(authored_sequence
+            .frames
+            .iter()
+            .all(|frame| required.contains(&frame.source_frame_index)));
+    }
+
+    #[test]
+    fn production_search_prepares_once_before_the_candidate_loop() {
+        let source = include_str!("lib.rs");
+        let search = source_section(
+            source,
+            "fn run_optimizer_search_with_loader(",
+            "mod tests {",
+        );
+        let prepare_offset = search.find("loader.prepare(").expect("prepare call");
+        let loop_offset = search
+            .find("for candidate in &plan.candidates")
+            .expect("candidate loop");
+
+        assert_eq!(search.matches("loader.prepare(").count(), 1);
+        assert!(prepare_offset < loop_offset);
+        assert!(!search[loop_offset..].contains("loader.prepare("));
+        assert!(!search[loop_offset..].contains("decode_native_animation_frames("));
+        assert!(!search[loop_offset..].contains("stream_fixed_rgba_frames("));
+    }
+
+    #[test]
+    fn native_preparation_deduplicates_pixels_and_uses_decoded_crop_dimensions() {
+        let test_dir = TestDir::new("native-prepared-dedup");
+        let input_path = test_dir.path.join("input.apng");
+        write_native_apng_file(
+            &input_path,
+            &[
+                StickerFrame {
+                    pixels: RgbaImage::new(640, 320),
+                    duration_us: 100_000,
+                },
+                StickerFrame {
+                    pixels: RgbaImage::new(640, 320),
+                    duration_us: 100_000,
+                },
+            ],
+            "standard",
+        )
+        .expect("native preparation fixture must be written");
+        let timeline = vec![
+            ResolvedTimelineFrame {
+                source_frame_index: 0,
+                duration_us: 120_000,
+            },
+            ResolvedTimelineFrame {
+                source_frame_index: 0,
+                duration_us: 240_000,
+            },
+        ];
+        let candidate = build_test_candidate("native-prepared", 10);
+        let plan = OptimizerPlanResponse {
+            ok: true,
+            fit_mode: CANONICAL_FIT_MODE.into(),
+            selected_duration_seconds: Some(0.36),
+            recommended_max_duration_seconds: 3.0,
+            search_budget: 1,
+            warnings: Vec::new(),
+            candidates: vec![candidate],
+            error_code: None,
+            reason_code: None,
+            error_message: None,
+        };
+        let crop = CropRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        let context = OperationContext::detached(Duration::from_secs(1));
+        let loader = DefaultFrameSourceLoader;
+
+        let prepared = loader
+            .prepare(
+                FramePreparationRequest {
+                    input_path: &input_path,
+                    source_revision: "test",
+                    crop_region: Some(&crop),
+                    input_width: Some(9_999),
+                    input_height: Some(9_999),
+                    base_frame_count: Some(2),
+                    timeline_frames: None,
+                    resolved_timeline_frames: Some(&timeline),
+                    selected_frame_indexes: None,
+                    source_duration_seconds: Some(0.2),
+                    avg_fps: Some(10.0),
+                    locale: UiLocale::En,
+                    optimizer_goal: "balanced",
+                },
+                &plan,
+                &context,
+                MediaLimits::default(),
+            )
+            .expect("native search source must prepare");
+
+        assert_eq!(prepared.frames.len(), 1);
+        assert_eq!(prepared.base_sequence, timeline);
+        assert_eq!(prepared.decoded_bytes, 320 * 320 * 4);
+        assert_eq!(prepared.frames[0].pixels.dimensions(), (320, 320));
+        let first = prepared
+            .pixels_for_source_index(0)
+            .expect("first duplicate must resolve");
+        let duplicate = prepared
+            .pixels_for_source_index(0)
+            .expect("second duplicate must resolve");
+        assert!(Arc::ptr_eq(first, duplicate));
+    }
+
+    #[test]
+    fn one_prepared_source_load_is_independent_of_candidate_count() {
+        let test_dir = TestDir::new("one-prepared-source");
+        let input_path = test_dir.path.join("input.mp4");
+        fs::write(&input_path, b"frame-source-loader-seam")
+            .expect("source identity fixture must be written");
+        let source_identity = SourceIdentity::from_path(&input_path, MediaLimits::default())
+            .expect("source identity must resolve");
+        let loader = CountingFrameSourceLoader::new();
+
+        let response = run_optimizer_search_with_loader(
+            OptimizerSearchRequest {
+                input_path: input_path.to_string_lossy().into_owned(),
+                source_revision: Some(source_identity.revision()),
+                output_directory: Some(test_dir.path.to_string_lossy().into_owned()),
+                locale: Some("en".into()),
+                source_duration_seconds: Some(0.1),
+                input_width: Some(1),
+                input_height: Some(1),
+                avg_fps: Some(10.0),
+                fit_mode: Some("contain".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: Some("deep".into()),
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: Some(1),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+            None,
+            &loader,
+            || Ok(()),
+            |_, _, _| {},
+        );
+
+        assert!(response.search_budget > 1);
+        assert_eq!(loader.prepare_count.load(AtomicOrdering::SeqCst), 1);
+        assert!(response.attempts.len() > 1);
+    }
+
+    #[test]
+    fn source_mutation_during_preparation_is_rejected_before_candidate_encoding() {
+        let test_dir = TestDir::new("prepared-source-mutation");
+        let input_path = test_dir.path.join("input.mp4");
+        fs::write(&input_path, b"original-source")
+            .expect("source mutation fixture must be written");
+        let source_identity = SourceIdentity::from_path(&input_path, MediaLimits::default())
+            .expect("source identity must resolve");
+
+        let response = run_optimizer_search_with_loader(
+            OptimizerSearchRequest {
+                input_path: input_path.to_string_lossy().into_owned(),
+                source_revision: Some(source_identity.revision()),
+                output_directory: Some(test_dir.path.to_string_lossy().into_owned()),
+                locale: Some("en".into()),
+                source_duration_seconds: Some(0.1),
+                input_width: Some(1),
+                input_height: Some(1),
+                avg_fps: Some(10.0),
+                fit_mode: Some("contain".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: Some(1),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+            None,
+            &MutatingFrameSourceLoader,
+            || Ok(()),
+            |_, _, _| {},
+        );
+
+        assert!(!response.ok);
+        assert_eq!(response.error_code.as_deref(), Some("source-changed"));
+        assert!(response.attempts.is_empty());
+    }
+
+    #[test]
+    fn prepared_duration_limit_error_keeps_authoritative_selected_duration() {
+        let mut plan = OptimizerPlanResponse {
+            ok: true,
+            fit_mode: CANONICAL_FIT_MODE.into(),
+            selected_duration_seconds: Some(2.0),
+            recommended_max_duration_seconds: 3.0,
+            search_budget: 1,
+            warnings: Vec::new(),
+            candidates: vec![build_test_candidate("stale-duration", 10)],
+            error_code: None,
+            reason_code: None,
+            error_message: None,
+        };
+        let prepared = PreparedSearchSource {
+            frames: vec![PreparedFrame {
+                source_frame_id: 1,
+                pixels: Arc::new(RgbaImage::new(1, 1)),
+                duration_us: 6_000_000,
+            }],
+            base_sequence: vec![ResolvedTimelineFrame {
+                source_frame_index: 0,
+                duration_us: 6_000_000,
+            }],
+            timing_authority: TimelineTimingAuthority::Native,
+            base_fps: 1,
+            decoded_bytes: 4,
+            tool_source: "native".into(),
+            tool_command: None,
+            tool_detail: None,
+        };
+        let context = OperationContext::detached(Duration::from_secs(1));
+
+        let error = synchronize_candidates_with_prepared_duration(
+            &mut plan,
+            &prepared,
+            Some(1),
+            Some(1),
+            "balanced",
+            "balanced",
+            UiLocale::En,
+            &context,
+        )
+        .expect_err("prepared duration above five seconds must be rejected");
+
+        assert_eq!(
+            error,
+            PipelineError::InvalidRequest {
+                reason: "duration-too-long"
+            }
+        );
+        assert_eq!(plan.selected_duration_seconds, Some(6.0));
+    }
+
+    #[test]
+    fn authored_candidate_universe_clamps_reported_fps_to_thirty() {
+        let mut plan = OptimizerPlanResponse {
+            ok: true,
+            fit_mode: CANONICAL_FIT_MODE.into(),
+            selected_duration_seconds: Some(1.0),
+            recommended_max_duration_seconds: 3.0,
+            search_budget: 20,
+            warnings: Vec::new(),
+            candidates: vec![build_test_candidate("stale-authored-fps", 30)],
+            error_code: None,
+            reason_code: None,
+            error_message: None,
+        };
+        let prepared = PreparedSearchSource {
+            frames: Vec::new(),
+            base_sequence: (0..300)
+                .map(|index| ResolvedTimelineFrame {
+                    source_frame_index: index,
+                    duration_us: 3_333,
+                })
+                .collect(),
+            timing_authority: TimelineTimingAuthority::Authored,
+            base_fps: 300,
+            decoded_bytes: 0,
+            tool_source: "test".into(),
+            tool_command: None,
+            tool_detail: None,
+        };
+        let context = OperationContext::detached(Duration::from_secs(1));
+
+        synchronize_candidates_with_prepared_duration(
+            &mut plan,
+            &prepared,
+            Some(320),
+            Some(320),
+            "balanced",
+            "balanced",
+            UiLocale::En,
+            &context,
+        )
+        .expect("authored universe must synchronize");
+
+        assert!(!plan.candidates.is_empty());
+        assert!(plan.candidates.iter().all(|candidate| candidate.fps == 30));
+    }
+
+    #[test]
+    fn streaming_apng_writer_rejects_short_and_long_iterators() {
+        let frame = StickerFrame {
+            pixels: RgbaImage::new(2, 2),
+            duration_us: 100_000,
+        };
+        let short = vec![Ok::<_, PipelineError>(frame.clone())].into_iter();
+        let short_error = write_native_apng_iterator_with_checkpoint(
+            Vec::new(),
+            2,
+            &[100_000, 100_000],
+            short,
+            "standard",
+            || Ok(()),
+        )
+        .expect_err("short frame iterator must be rejected");
+        assert!(matches!(
+            short_error,
+            PipelineError::MalformedProcessOutput { .. }
+        ));
+
+        let long = vec![
+            Ok::<_, PipelineError>(frame.clone()),
+            Ok::<_, PipelineError>(frame),
+        ]
+        .into_iter();
+        let long_error = write_native_apng_iterator_with_checkpoint(
+            Vec::new(),
+            1,
+            &[100_000],
+            long,
+            "standard",
+            || Ok(()),
+        )
+        .expect_err("long frame iterator must be rejected");
+        assert!(matches!(
+            long_error,
+            PipelineError::MalformedProcessOutput { .. }
+        ));
+    }
+
+    #[test]
+    fn streaming_apng_writer_checks_cancellation_before_each_frame() {
+        let frames = (0..3)
+            .map(|_| {
+                Ok::<_, PipelineError>(StickerFrame {
+                    pixels: RgbaImage::new(2, 2),
+                    duration_us: 100_000,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        let checkpoints = Cell::new(0_u32);
+
+        let error = write_native_apng_iterator_with_checkpoint(
+            Vec::new(),
+            3,
+            &[100_000; 3],
+            frames,
+            "standard",
+            || {
+                let next = checkpoints.get() + 1;
+                checkpoints.set(next);
+                if next >= 4 {
+                    Err(PipelineError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("cancellation must stop streaming APNG encoding");
+
+        assert_eq!(error, PipelineError::Cancelled);
+        assert!(checkpoints.get() >= 4);
+    }
+
+    #[test]
+    fn two_stage_prepared_resize_stays_within_visual_error_budget() {
+        let mut source = RgbaImage::new(640, 320);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            let gradient = ((x * 255) / 639) as u8;
+            let checker = if (x / 32 + y / 32) % 2 == 0 {
+                8_u8
+            } else {
+                0_u8
+            };
+            *pixel = Rgba([
+                gradient.saturating_add(checker),
+                ((y * 255) / 319) as u8,
+                255_u8.saturating_sub(gradient),
+                255,
+            ]);
+        }
+
+        let direct = transform_frame_for_candidate(&source, 0.5, None);
+        let prepared = prepare_frame_for_search(source, None);
+        let two_stage = scale_prepared_frame_for_candidate(&prepared, 0.5);
+        let absolute_error = direct
+            .as_raw()
+            .iter()
+            .zip(two_stage.as_raw())
+            .map(|(left, right)| left.abs_diff(*right) as f64)
+            .sum::<f64>();
+        let mean_absolute_channel_error = absolute_error / direct.as_raw().len() as f64;
+
+        assert_eq!(direct.dimensions(), two_stage.dimensions());
+        assert!(
+            mean_absolute_channel_error <= 1.5,
+            "two-stage resize MAE was {mean_absolute_channel_error}"
+        );
     }
 }
 
