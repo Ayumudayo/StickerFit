@@ -1,10 +1,13 @@
 mod locale;
+mod media_error;
+mod media_limits;
 
 use base64::{engine::general_purpose, Engine as _};
 use image::codecs::gif::GifDecoder as ImageGifDecoder;
 use image::codecs::png::PngDecoder as ImagePngDecoder;
+use image::error::LimitErrorKind as ImageLimitErrorKind;
 use image::imageops::{self, FilterType};
-use image::{AnimationDecoder, ImageReader, RgbaImage};
+use image::{AnimationDecoder, ImageDecoder, ImageReader, RgbaImage};
 #[cfg(test)]
 use image::{DynamicImage, ImageFormat, Rgba};
 use png::{
@@ -13,17 +16,20 @@ use png::{
     Encoder as NativePngEncoder, Filter as PngFilter,
 };
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::marker::PhantomData;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -42,8 +48,131 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 use crate::locale::{parse_ui_locale, UiLocale};
+use crate::media_error::PipelineError;
+use crate::media_limits::{
+    checked_rgba_bytes, image_decode_limits, validate_file_metadata, MediaLimits, SourceIdentity,
+};
 
 const CANONICAL_FIT_MODE: &str = "contain";
+const MAX_MEDIA_FRAME_COUNT: usize = 300;
+
+struct BoundedVecVisitor<T>(PhantomData<T>);
+
+impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "a sequence containing at most {MAX_MEDIA_FRAME_COUNT} frame items"
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if sequence
+            .size_hint()
+            .is_some_and(|size| size > MAX_MEDIA_FRAME_COUNT)
+        {
+            return Err(de::Error::custom("media frame count exceeds 300"));
+        }
+
+        let mut values = Vec::with_capacity(
+            sequence
+                .size_hint()
+                .unwrap_or_default()
+                .min(MAX_MEDIA_FRAME_COUNT),
+        );
+        while values.len() < MAX_MEDIA_FRAME_COUNT {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(values);
+            };
+            values.push(value);
+        }
+        if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::custom("media frame count exceeds 300"));
+        }
+        Ok(values)
+    }
+}
+
+fn deserialize_bounded_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
+}
+
+struct OptionalBoundedVecVisitor<T>(PhantomData<T>);
+
+impl<'de, T> Visitor<'de> for OptionalBoundedVecVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Option<Vec<T>>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("null or a frame sequence containing at most 300 items")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_bounded_vec(deserializer).map(Some)
+    }
+}
+
+fn deserialize_optional_bounded_vec<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_option(OptionalBoundedVecVisitor(PhantomData))
+}
+
+fn deserialize_optional_frame_count<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    if value.is_some_and(|count| count as usize > MAX_MEDIA_FRAME_COUNT) {
+        return Err(de::Error::custom("media frame count exceeds 300"));
+    }
+    Ok(value)
+}
+
+#[derive(Debug)]
+struct BoundedFrameIds(Vec<u32>);
+
+impl<'de> Deserialize<'de> for BoundedFrameIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_bounded_vec(deserializer).map(Self)
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +201,7 @@ struct ToolHealthReport {
 struct MediaInspection {
     ok: bool,
     input_path: String,
+    source_revision: Option<String>,
     tool_source: Option<String>,
     tool_command: Option<String>,
     tool_detail: Option<String>,
@@ -86,9 +216,11 @@ struct MediaInspection {
     frame_rate_label: Option<String>,
     estimated_frames: Option<u64>,
     frame_durations_seconds: Option<Vec<f64>>,
+    warnings: Vec<String>,
     is_static_image: bool,
     can_convert_to_png: bool,
     error_code: Option<String>,
+    reason_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -100,6 +232,7 @@ struct FramePreviewResponse {
     width: Option<u32>,
     height: Option<u32>,
     error_code: Option<String>,
+    reason_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -118,6 +251,7 @@ struct FramePreviewsResponse {
     ok: bool,
     previews: Vec<FramePreviewItem>,
     error_code: Option<String>,
+    reason_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -144,8 +278,11 @@ struct OptimizerPlanRequest {
     quality_frame_drop_interval: Option<u32>,
     search_depth: Option<String>,
     crop_region: Option<CropRegion>,
+    #[serde(default, deserialize_with = "deserialize_optional_bounded_vec")]
     selected_frames: Option<Vec<u32>>,
+    #[serde(default, deserialize_with = "deserialize_optional_frame_count")]
     base_frame_count: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_bounded_vec")]
     timeline_frames: Option<Vec<EditedTimelineFrame>>,
 }
 
@@ -184,6 +321,7 @@ struct OptimizerPlanResponse {
     warnings: Vec<String>,
     candidates: Vec<CandidatePreview>,
     error_code: Option<String>,
+    reason_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -191,6 +329,8 @@ struct OptimizerPlanResponse {
 #[serde(rename_all = "camelCase")]
 struct StaticImageConversionRequest {
     input_path: String,
+    #[serde(default)]
+    source_revision: Option<String>,
     output_directory: Option<String>,
     locale: Option<String>,
     crop_region: Option<CropRegion>,
@@ -208,6 +348,7 @@ struct StaticImageConversionResult {
     tool_detail: Option<String>,
     warnings: Vec<String>,
     error_code: Option<String>,
+    reason_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -215,6 +356,8 @@ struct StaticImageConversionResult {
 #[serde(rename_all = "camelCase")]
 struct OptimizerSearchRequest {
     input_path: String,
+    #[serde(default)]
+    source_revision: Option<String>,
     output_directory: Option<String>,
     locale: Option<String>,
     source_duration_seconds: Option<f64>,
@@ -227,8 +370,11 @@ struct OptimizerSearchRequest {
     quality_frame_drop_interval: Option<u32>,
     search_depth: Option<String>,
     crop_region: Option<CropRegion>,
+    #[serde(default, deserialize_with = "deserialize_optional_bounded_vec")]
     selected_frames: Option<Vec<u32>>,
+    #[serde(default, deserialize_with = "deserialize_optional_frame_count")]
     base_frame_count: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_bounded_vec")]
     timeline_frames: Option<Vec<EditedTimelineFrame>>,
 }
 
@@ -257,6 +403,7 @@ struct SearchAttemptResult {
     tool_detail: Option<String>,
     warnings: Vec<String>,
     error_code: Option<String>,
+    reason_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -280,6 +427,7 @@ struct OptimizerSearchResponse {
     best_size_bytes: Option<u64>,
     best_within_limit: bool,
     error_code: Option<String>,
+    reason_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -343,7 +491,7 @@ struct SelectedEncodeOutput {
     output_path: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct StickerFrame {
     pixels: RgbaImage,
     duration_us: u64,
@@ -363,6 +511,13 @@ struct PngAnimationMetadata {
     height: u32,
     frame_count: Option<u64>,
     frame_durations: Vec<f64>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PngFileMetadata {
+    animation: Option<PngAnimationMetadata>,
+    warnings: Vec<String>,
 }
 
 const RECOMMENDED_MAX_DURATION_US: u64 = 3_000_000;
@@ -866,19 +1021,53 @@ fn sidecar_candidate_paths(tool: &str) -> Vec<PathBuf> {
     sidecar_candidate_paths_for_exe(tool, std::env::current_exe().ok().as_deref())
 }
 
+fn safe_tool_path_label(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn safe_tool_version_line(tool: &str, stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let line = first_output_line(stdout, stderr)?;
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if word.eq_ignore_ascii_case("version") {
+            let version = words.next().unwrap_or("available");
+            let safe_version = version
+                .chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+')
+                })
+                .take(48)
+                .collect::<String>();
+            return Some(format!(
+                "{tool} {}",
+                if safe_version.is_empty() {
+                    "available"
+                } else {
+                    &safe_version
+                }
+            ));
+        }
+    }
+    Some(format!("{tool} available"))
+}
+
 fn resolve_tool(tool: &str, locale: UiLocale) -> Result<ToolResolution, String> {
     let expected = expected_sidecar_name(tool);
     let candidate_paths = sidecar_candidate_paths(tool);
     let attempted_paths: Vec<String> = candidate_paths
         .iter()
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| safe_tool_path_label(path, &expected))
         .collect();
 
     if let Some(existing_path) = candidate_paths.iter().find(|path| path.is_file()).cloned() {
         return Ok(ToolResolution {
             source: "sidecar",
             command: existing_path.as_os_str().to_os_string(),
-            command_display: existing_path.to_string_lossy().into_owned(),
+            command_display: safe_tool_path_label(&existing_path, tool),
             attempted_sidecar_paths: attempted_paths,
             fallback_reason: None,
         });
@@ -900,6 +1089,9 @@ fn run_resolved_command(
     let mut command = Command::new(&resolution.command);
     configure_child_process(&mut command);
 
+    // Task 9 owns streaming/capping child stdout and stderr before allocation.
+    // Task 6 keeps the existing Command::output boundary; only raw-frame callers
+    // post-validate returned frame/count/total buffers.
     let output = command
         .args(args)
         .output()
@@ -935,7 +1127,7 @@ fn run_sidecar_tool(
                     command_display: tool.into(),
                     attempted_sidecar_paths: sidecar_candidate_paths(tool)
                         .iter()
-                        .map(|path| path.to_string_lossy().into_owned())
+                        .map(|path| safe_tool_path_label(path, tool))
                         .collect(),
                     fallback_reason: None,
                 },
@@ -971,7 +1163,7 @@ fn check_tool(tool: &str, locale: UiLocale) -> ToolCheck {
             source: output.resolution.source.to_string(),
             resolved_command: Some(output.resolution.command_display.clone()),
             fallback_reason: output.resolution.fallback_reason.clone(),
-            version_line: first_output_line(&output.stdout, &output.stderr),
+            version_line: safe_tool_version_line(tool, &output.stdout, &output.stderr),
             detail: locale::tool_check_sidecar_ok_detail(
                 locale,
                 tool,
@@ -987,7 +1179,7 @@ fn check_tool(tool: &str, locale: UiLocale) -> ToolCheck {
             resolved_command: None,
             fallback_reason: error.resolution.fallback_reason.clone(),
             version_line: None,
-            detail: error.system_error,
+            detail: locale::media_pipeline_diagnostic(locale, "tool-missing"),
             expected_sidecar_name: expected,
             attempted_sidecar_paths: error.resolution.attempted_sidecar_paths,
         },
@@ -1088,6 +1280,11 @@ fn resolve_frame_selection(
     selected_frames: Option<&Vec<u32>>,
     base_frame_count: Option<u32>,
 ) -> Result<ResolvedFrameSelection, &'static str> {
+    if selected_frames.is_some_and(|frames| frames.len() > MAX_MEDIA_FRAME_COUNT)
+        || base_frame_count.is_some_and(|count| count as usize > MAX_MEDIA_FRAME_COUNT)
+    {
+        return Err("invalid-frame-selection");
+    }
     let normalized_selected_frames = normalize_selected_frame_indexes(selected_frames);
 
     match normalized_selected_frames {
@@ -1136,6 +1333,12 @@ fn resolve_timeline_frames(
         return Err("no-frames-selected");
     }
 
+    if timeline_frames.len() > MAX_MEDIA_FRAME_COUNT
+        || base_frame_count.is_some_and(|count| count as usize > MAX_MEDIA_FRAME_COUNT)
+    {
+        return Err("invalid-frame-selection");
+    }
+
     let Some(base_frame_count) = base_frame_count.filter(|count| *count > 0) else {
         return Err("invalid-frame-selection");
     };
@@ -1147,8 +1350,8 @@ fn resolve_timeline_frames(
             return Err("invalid-frame-selection");
         }
 
-        if frame.duration_us == 0 {
-            return Err("invalid-frame-selection");
+        if frame.duration_us < 100 {
+            return Err("invalid-frame-duration");
         }
 
         resolved.push(ResolvedTimelineFrame {
@@ -1591,32 +1794,319 @@ fn transform_frame_for_static_png(
     imageops::resize(&cropped, target_width, target_height, FilterType::Lanczos3)
 }
 
-fn decode_still_rgba_image(input_path: &str) -> Result<RgbaImage, String> {
-    ImageReader::open(input_path)
-        .map_err(|error| error.to_string())?
-        .decode()
-        .map_err(|error| error.to_string())
-        .map(|image| image.into_rgba8())
+fn malformed_decoder_error(format: &'static str, error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::MalformedInput {
+        format,
+        reason: error.to_string(),
+    }
 }
 
-fn decode_gif_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, String> {
-    let file = File::open(input_path).map_err(|error| error.to_string())?;
-    let decoder = ImageGifDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
-    let frames = decoder
-        .into_frames()
-        .collect_frames()
-        .map_err(|error| error.to_string())?;
+fn image_decoder_error(
+    format: &'static str,
+    error: image::ImageError,
+    limits: MediaLimits,
+) -> PipelineError {
+    match error {
+        image::ImageError::Limits(limit_error) => match limit_error.kind() {
+            ImageLimitErrorKind::DimensionError => PipelineError::LimitExceeded {
+                resource: "image-dimensions",
+                limit: u64::from(limits.max_dimension),
+                actual: u64::from(limits.max_dimension).saturating_add(1),
+            },
+            ImageLimitErrorKind::InsufficientMemory => PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: limits.max_single_rgba_bytes,
+                actual: limits.max_single_rgba_bytes.saturating_add(1),
+            },
+            _ => malformed_decoder_error(format, "decoder does not support the requested limits"),
+        },
+        error => malformed_decoder_error(format, error),
+    }
+}
 
-    Ok(frames
-        .into_iter()
-        .map(|frame| {
-            let (delay_ms, delay_den_ms) = frame.delay().numer_denom_ms();
-            StickerFrame {
-                pixels: frame.into_buffer(),
-                duration_us: frame_delay_microseconds(delay_ms, delay_den_ms),
+fn run_decoder_boundary<T>(
+    format: &'static str,
+    operation: impl FnOnce() -> Result<T, PipelineError>,
+) -> Result<T, PipelineError> {
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(result) => result,
+        Err(_) => Err(PipelineError::MalformedInput {
+            format,
+            reason: "decoder panicked".into(),
+        }),
+    }
+}
+
+fn checked_total_decoded_bytes(
+    current: u64,
+    frame_bytes: usize,
+    limits: MediaLimits,
+) -> Result<u64, PipelineError> {
+    let actual = current
+        .checked_add(u64::try_from(frame_bytes).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX);
+    if actual > limits.max_total_decoded_bytes {
+        return Err(PipelineError::LimitExceeded {
+            resource: "decoded-bytes",
+            limit: limits.max_total_decoded_bytes,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
+fn preflight_animation_decoded_bytes(
+    frame_bytes: usize,
+    frame_count: u64,
+    limits: MediaLimits,
+) -> Result<u64, PipelineError> {
+    if frame_count > u64::from(limits.max_frame_count) {
+        return Err(PipelineError::LimitExceeded {
+            resource: "frame-count",
+            limit: u64::from(limits.max_frame_count),
+            actual: frame_count,
+        });
+    }
+    let actual = u64::try_from(frame_bytes)
+        .unwrap_or(u64::MAX)
+        .checked_mul(frame_count)
+        .unwrap_or(u64::MAX);
+    if actual > limits.max_total_decoded_bytes {
+        return Err(PipelineError::LimitExceeded {
+            resource: "decoded-bytes",
+            limit: limits.max_total_decoded_bytes,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
+fn collect_decoded_animation_frames<I>(
+    format: &'static str,
+    mut frames: I,
+    preflight_frame_bytes: usize,
+    preflight_frame_count: u64,
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<Vec<StickerFrame>, PipelineError>
+where
+    I: Iterator<Item = image::ImageResult<image::Frame>>,
+{
+    preflight_animation_decoded_bytes(preflight_frame_bytes, preflight_frame_count, limits)?;
+    let mut decoded = Vec::new();
+    let mut total_decoded_bytes = 0u64;
+    loop {
+        checkpoint()?;
+        let Some(frame) = frames.next() else {
+            if u64::try_from(decoded.len()).unwrap_or(u64::MAX) != preflight_frame_count {
+                return Err(PipelineError::MalformedInput {
+                    format,
+                    reason: "decoded frame count did not match metadata".into(),
+                });
             }
-        })
-        .collect())
+            return Ok(decoded);
+        };
+        let next_count = u64::try_from(decoded.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if next_count > u64::from(limits.max_frame_count) {
+            return Err(PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: u64::from(limits.max_frame_count),
+                actual: next_count,
+            });
+        }
+        if next_count > preflight_frame_count {
+            return Err(PipelineError::MalformedInput {
+                format,
+                reason: "decoder produced more frames than metadata declared".into(),
+            });
+        }
+
+        let frame = frame.map_err(|error| image_decoder_error(format, error, limits))?;
+        let frame = image_frame_to_sticker_frame(frame);
+        let frame_bytes = checked_rgba_bytes(frame.pixels.width(), frame.pixels.height(), limits)?;
+        total_decoded_bytes =
+            checked_total_decoded_bytes(total_decoded_bytes, frame_bytes, limits)?;
+        decoded.push(frame);
+    }
+}
+
+fn select_decoded_animation_frame<I>(
+    format: &'static str,
+    mut frames: I,
+    frame_index: usize,
+    preflight_frame_bytes: usize,
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<StickerFrame, PipelineError>
+where
+    I: Iterator<Item = image::ImageResult<image::Frame>>,
+{
+    let requested_count = u64::try_from(frame_index)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    if requested_count > u64::from(limits.max_frame_count) {
+        return Err(PipelineError::LimitExceeded {
+            resource: "frame-count",
+            limit: u64::from(limits.max_frame_count),
+            actual: requested_count,
+        });
+    }
+    preflight_animation_decoded_bytes(preflight_frame_bytes, requested_count, limits)?;
+
+    let mut total_decoded_bytes = 0u64;
+    for current_index in 0..=frame_index {
+        checkpoint()?;
+        let frame = frames
+            .next()
+            .ok_or(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            })?
+            .map_err(|error| image_decoder_error(format, error, limits))?;
+        let frame = image_frame_to_sticker_frame(frame);
+        let frame_bytes = checked_rgba_bytes(frame.pixels.width(), frame.pixels.height(), limits)?;
+        total_decoded_bytes =
+            checked_total_decoded_bytes(total_decoded_bytes, frame_bytes, limits)?;
+        if current_index == frame_index {
+            checkpoint()?;
+            return Ok(frame);
+        }
+    }
+
+    Err(PipelineError::InvalidRequest {
+        reason: "invalid-frame-selection",
+    })
+}
+
+fn open_limited_image_reader(
+    input_path: &str,
+    limits: MediaLimits,
+) -> Result<(ImageReader<BufReader<File>>, fs::Metadata), PipelineError> {
+    let file = File::open(input_path).map_err(|error| PipelineError::Io {
+        operation: "open image input",
+        message: error.to_string(),
+    })?;
+    let metadata = file.metadata().map_err(|error| PipelineError::Io {
+        operation: "read image input metadata",
+        message: error.to_string(),
+    })?;
+    let metadata = validate_file_metadata(metadata, limits)?;
+    let mut reader = ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|error| PipelineError::Io {
+            operation: "detect image format",
+            message: error.to_string(),
+        })?;
+    reader.limits(image_decode_limits(limits));
+    Ok((reader, metadata))
+}
+
+fn validate_still_decoder_allocation(
+    width: u32,
+    height: u32,
+    color_type: image::ColorType,
+    native_total_bytes: u64,
+    limits: MediaLimits,
+) -> Result<(), PipelineError> {
+    let rgba_bytes = u64::try_from(checked_rgba_bytes(width, height, limits)?).unwrap_or(u64::MAX);
+    if native_total_bytes > limits.max_total_decoded_bytes {
+        return Err(PipelineError::LimitExceeded {
+            resource: "decoded-bytes",
+            limit: limits.max_total_decoded_bytes,
+            actual: native_total_bytes,
+        });
+    }
+
+    let peak_bytes = if color_type == image::ColorType::Rgba8 {
+        native_total_bytes
+    } else {
+        native_total_bytes
+            .checked_add(rgba_bytes)
+            .unwrap_or(u64::MAX)
+    };
+    if peak_bytes > limits.max_total_decoded_bytes {
+        return Err(PipelineError::LimitExceeded {
+            resource: "decoded-bytes",
+            limit: limits.max_total_decoded_bytes,
+            actual: peak_bytes,
+        });
+    }
+
+    Ok(())
+}
+
+fn decode_still_rgba_image(
+    input_path: &str,
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<RgbaImage, PipelineError> {
+    run_decoder_boundary("image", || {
+        checkpoint()?;
+        let (reader, _) = open_limited_image_reader(input_path, limits)?;
+        let decoder = reader
+            .into_decoder()
+            .map_err(|error| image_decoder_error("image", error, limits))?;
+        let (width, height) = decoder.dimensions();
+        validate_still_decoder_allocation(
+            width,
+            height,
+            decoder.color_type(),
+            decoder.total_bytes(),
+            limits,
+        )?;
+        checkpoint()?;
+        let image = image::DynamicImage::from_decoder(decoder)
+            .map_err(|error| image_decoder_error("image", error, limits))?;
+        checked_rgba_bytes(image.width(), image.height(), limits)?;
+        let pixels = image.into_rgba8();
+        checkpoint()?;
+        Ok(pixels)
+    })
+}
+
+fn decode_gif_animation_frames(
+    input_path: &str,
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<Vec<StickerFrame>, PipelineError> {
+    run_decoder_boundary("gif", || {
+        checkpoint()?;
+        let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+            operation: "open GIF input",
+            message: error.to_string(),
+        })?;
+        let metadata = file.metadata().map_err(|error| PipelineError::Io {
+            operation: "read GIF input metadata",
+            message: error.to_string(),
+        })?;
+        validate_file_metadata(metadata, limits)?;
+        let (metadata_width, metadata_height, frame_count) = {
+            let mut metadata_reader = BufReader::new(&mut file);
+            read_gif_frame_metadata(&mut metadata_reader, limits, &mut checkpoint)?
+        };
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| pipeline_io_error("rewind GIF input", error))?;
+        let mut decoder = ImageGifDecoder::new(BufReader::new(file))
+            .map_err(|error| image_decoder_error("gif", error, limits))?;
+        decoder
+            .set_limits(image_decode_limits(limits))
+            .map_err(|error| image_decoder_error("gif", error, limits))?;
+        let (width, height) = decoder.dimensions();
+        if (width, height) != (metadata_width, metadata_height) {
+            return Err(malformed_gif("GIF dimensions changed during decode setup"));
+        }
+        let frame_bytes = checked_rgba_bytes(width, height, limits)?;
+        preflight_animation_decoded_bytes(frame_bytes, u64::from(frame_count), limits)?;
+        collect_decoded_animation_frames(
+            "gif",
+            decoder.into_frames(),
+            frame_bytes,
+            u64::from(frame_count),
+            limits,
+            || checkpoint(),
+        )
+    })
 }
 
 fn image_frame_to_sticker_frame(frame: image::Frame) -> StickerFrame {
@@ -1627,98 +2117,350 @@ fn image_frame_to_sticker_frame(frame: image::Frame) -> StickerFrame {
     }
 }
 
+fn malformed_gif(reason: impl Into<String>) -> PipelineError {
+    PipelineError::MalformedInput {
+        format: "gif",
+        reason: reason.into(),
+    }
+}
+
+fn read_gif_exact<R: Read>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    context: &'static str,
+) -> Result<(), PipelineError> {
+    reader
+        .read_exact(buffer)
+        .map_err(|_| malformed_gif(format!("truncated {context}")))
+}
+
+fn skip_gif_bytes<R: Read>(
+    reader: &mut R,
+    mut remaining: usize,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> Result<(), PipelineError> {
+    let mut scratch = [0u8; 64 * 1024];
+    while remaining > 0 {
+        checkpoint()?;
+        let count = remaining.min(scratch.len());
+        read_gif_exact(reader, &mut scratch[..count], "GIF block")?;
+        remaining -= count;
+    }
+    Ok(())
+}
+
+fn skip_gif_sub_blocks<R: Read>(
+    reader: &mut R,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> Result<(), PipelineError> {
+    loop {
+        checkpoint()?;
+        let mut length = [0u8; 1];
+        read_gif_exact(reader, &mut length, "GIF sub-block length")?;
+        if length[0] == 0 {
+            return Ok(());
+        }
+        skip_gif_bytes(reader, usize::from(length[0]), checkpoint)?;
+    }
+}
+
+fn read_gif_frame_metadata<R: Read>(
+    reader: &mut R,
+    limits: MediaLimits,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> Result<(u32, u32, u32), PipelineError> {
+    let mut signature = [0u8; 6];
+    read_gif_exact(reader, &mut signature, "GIF signature")?;
+    if !matches!(&signature, b"GIF87a" | b"GIF89a") {
+        return Err(malformed_gif("invalid GIF signature"));
+    }
+
+    let mut logical_screen = [0u8; 7];
+    read_gif_exact(reader, &mut logical_screen, "GIF logical screen descriptor")?;
+    let width = u32::from(u16::from_le_bytes([logical_screen[0], logical_screen[1]]));
+    let height = u32::from(u16::from_le_bytes([logical_screen[2], logical_screen[3]]));
+    if width == 0 || height == 0 {
+        return Err(malformed_gif("GIF dimensions must be non-zero"));
+    }
+    checked_rgba_bytes(width, height, limits)?;
+
+    let packed = logical_screen[4];
+    if packed & 0x80 != 0 {
+        let entries = 1usize << (usize::from(packed & 0x07) + 1);
+        skip_gif_bytes(reader, entries * 3, checkpoint)?;
+    }
+
+    let mut frame_count = 0u32;
+    loop {
+        checkpoint()?;
+        let mut introducer = [0u8; 1];
+        read_gif_exact(reader, &mut introducer, "GIF block introducer")?;
+        match introducer[0] {
+            0x3b => {
+                if frame_count == 0 {
+                    return Err(malformed_gif("GIF did not contain an image frame"));
+                }
+                return Ok((width, height, frame_count));
+            }
+            0x21 => {
+                let mut extension_label = [0u8; 1];
+                read_gif_exact(reader, &mut extension_label, "GIF extension label")?;
+                skip_gif_sub_blocks(reader, checkpoint)?;
+            }
+            0x2c => {
+                frame_count =
+                    frame_count
+                        .checked_add(1)
+                        .ok_or_else(|| PipelineError::LimitExceeded {
+                            resource: "frame-count",
+                            limit: u64::from(limits.max_frame_count),
+                            actual: u64::MAX,
+                        })?;
+                if frame_count > limits.max_frame_count {
+                    return Err(PipelineError::LimitExceeded {
+                        resource: "frame-count",
+                        limit: u64::from(limits.max_frame_count),
+                        actual: u64::from(frame_count),
+                    });
+                }
+                let mut descriptor = [0u8; 9];
+                read_gif_exact(reader, &mut descriptor, "GIF image descriptor")?;
+                let frame_width = u32::from(u16::from_le_bytes([descriptor[4], descriptor[5]]));
+                let frame_height = u32::from(u16::from_le_bytes([descriptor[6], descriptor[7]]));
+                if frame_width == 0 || frame_height == 0 {
+                    return Err(malformed_gif("GIF frame dimensions must be non-zero"));
+                }
+                if descriptor[8] & 0x80 != 0 {
+                    let entries = 1usize << (usize::from(descriptor[8] & 0x07) + 1);
+                    skip_gif_bytes(reader, entries * 3, checkpoint)?;
+                }
+                let mut lzw_minimum_code_size = [0u8; 1];
+                read_gif_exact(
+                    reader,
+                    &mut lzw_minimum_code_size,
+                    "GIF LZW minimum code size",
+                )?;
+                skip_gif_sub_blocks(reader, checkpoint)?;
+            }
+            _ => return Err(malformed_gif("invalid GIF block introducer")),
+        }
+    }
+}
+
 fn decode_gif_animation_frame(
     input_path: &str,
     frame_index: usize,
-) -> Result<StickerFrame, String> {
-    let file = File::open(input_path).map_err(|error| error.to_string())?;
-    let decoder = ImageGifDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
-    let frame = decoder
-        .into_frames()
-        .nth(frame_index)
-        .ok_or_else(|| "source frame id is out of range".to_string())?
-        .map_err(|error| error.to_string())?;
-
-    Ok(image_frame_to_sticker_frame(frame))
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<StickerFrame, PipelineError> {
+    run_decoder_boundary("gif", || {
+        checkpoint()?;
+        let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+            operation: "open GIF input",
+            message: error.to_string(),
+        })?;
+        let metadata = file.metadata().map_err(|error| PipelineError::Io {
+            operation: "read GIF input metadata",
+            message: error.to_string(),
+        })?;
+        validate_file_metadata(metadata, limits)?;
+        let (metadata_width, metadata_height, frame_count) = {
+            let mut metadata_reader = BufReader::new(&mut file);
+            read_gif_frame_metadata(&mut metadata_reader, limits, &mut checkpoint)?
+        };
+        if u64::try_from(frame_index).unwrap_or(u64::MAX) >= u64::from(frame_count) {
+            return Err(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            });
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| pipeline_io_error("rewind GIF input", error))?;
+        let mut decoder = ImageGifDecoder::new(BufReader::new(file))
+            .map_err(|error| image_decoder_error("gif", error, limits))?;
+        decoder
+            .set_limits(image_decode_limits(limits))
+            .map_err(|error| image_decoder_error("gif", error, limits))?;
+        let (width, height) = decoder.dimensions();
+        if (width, height) != (metadata_width, metadata_height) {
+            return Err(malformed_gif("GIF dimensions changed during decode setup"));
+        }
+        let frame_bytes = checked_rgba_bytes(width, height, limits)?;
+        select_decoded_animation_frame(
+            "gif",
+            decoder.into_frames(),
+            frame_index,
+            frame_bytes,
+            limits,
+            || checkpoint(),
+        )
+    })
 }
 
-fn decode_apng_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, String> {
-    let file = File::open(input_path).map_err(|error| error.to_string())?;
-    let decoder = ImagePngDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
-    let apng_decoder = decoder.apng().map_err(|error| error.to_string())?;
-    let frames = apng_decoder
-        .into_frames()
-        .collect_frames()
-        .map_err(|error| error.to_string())?;
-
-    Ok(frames
-        .into_iter()
-        .map(|frame| {
-            let (delay_ms, delay_den_ms) = frame.delay().numer_denom_ms();
-            StickerFrame {
-                pixels: frame.into_buffer(),
-                duration_us: frame_delay_microseconds(delay_ms, delay_den_ms),
-            }
-        })
-        .collect())
+fn decode_apng_animation_frames(
+    input_path: &str,
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<Vec<StickerFrame>, PipelineError> {
+    run_decoder_boundary("png", || {
+        checkpoint()?;
+        let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+            operation: "open PNG input",
+            message: error.to_string(),
+        })?;
+        let metadata = file.metadata().map_err(|error| PipelineError::Io {
+            operation: "read PNG input metadata",
+            message: error.to_string(),
+        })?;
+        let file_length = validate_file_metadata(metadata, limits)?.len();
+        let animation_metadata = {
+            let mut metadata_reader = BufReader::new(&mut file);
+            read_png_metadata_from_reader(&mut metadata_reader, file_length, limits, || {
+                checkpoint()
+            })?
+            .animation
+        };
+        let frame_count = animation_metadata
+            .and_then(|metadata| metadata.frame_count)
+            .ok_or_else(|| malformed_decoder_error("png", "missing APNG animation control"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| pipeline_io_error("rewind PNG input", error))?;
+        let decoder =
+            ImagePngDecoder::with_limits(BufReader::new(file), image_decode_limits(limits))
+                .map_err(|error| image_decoder_error("png", error, limits))?;
+        let (width, height) = decoder.dimensions();
+        let frame_bytes = checked_rgba_bytes(width, height, limits)?;
+        preflight_animation_decoded_bytes(frame_bytes, frame_count, limits)?;
+        let apng_decoder = decoder
+            .apng()
+            .map_err(|error| image_decoder_error("png", error, limits))?;
+        collect_decoded_animation_frames(
+            "png",
+            apng_decoder.into_frames(),
+            frame_bytes,
+            frame_count,
+            limits,
+            || checkpoint(),
+        )
+    })
 }
 
 fn decode_apng_animation_frame(
     input_path: &str,
     frame_index: usize,
-) -> Result<StickerFrame, String> {
-    let file = File::open(input_path).map_err(|error| error.to_string())?;
-    let decoder = ImagePngDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
-    let apng_decoder = decoder.apng().map_err(|error| error.to_string())?;
-    let frame = apng_decoder
-        .into_frames()
-        .nth(frame_index)
-        .ok_or_else(|| "source frame id is out of range".to_string())?
-        .map_err(|error| error.to_string())?;
-
-    Ok(image_frame_to_sticker_frame(frame))
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<StickerFrame, PipelineError> {
+    run_decoder_boundary("png", || {
+        checkpoint()?;
+        let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+            operation: "open PNG input",
+            message: error.to_string(),
+        })?;
+        let metadata = file.metadata().map_err(|error| PipelineError::Io {
+            operation: "read PNG input metadata",
+            message: error.to_string(),
+        })?;
+        let file_length = validate_file_metadata(metadata, limits)?.len();
+        let animation_metadata = {
+            let mut metadata_reader = BufReader::new(&mut file);
+            read_png_metadata_from_reader(&mut metadata_reader, file_length, limits, || {
+                checkpoint()
+            })?
+            .animation
+        };
+        let frame_count = animation_metadata
+            .and_then(|metadata| metadata.frame_count)
+            .ok_or_else(|| malformed_decoder_error("png", "missing APNG animation control"))?;
+        let requested_count = u64::try_from(frame_index)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if requested_count > frame_count {
+            return Err(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            });
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| pipeline_io_error("rewind PNG input", error))?;
+        let decoder =
+            ImagePngDecoder::with_limits(BufReader::new(file), image_decode_limits(limits))
+                .map_err(|error| image_decoder_error("png", error, limits))?;
+        let (width, height) = decoder.dimensions();
+        let frame_bytes = checked_rgba_bytes(width, height, limits)?;
+        let apng_decoder = decoder
+            .apng()
+            .map_err(|error| image_decoder_error("png", error, limits))?;
+        select_decoded_animation_frame(
+            "png",
+            apng_decoder.into_frames(),
+            frame_index,
+            frame_bytes,
+            limits,
+            || checkpoint(),
+        )
+    })
 }
 
-fn decode_native_animation_frames(input_path: &str) -> Result<Vec<StickerFrame>, String> {
+fn decode_native_animation_frames(
+    input_path: &str,
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<Vec<StickerFrame>, PipelineError> {
     match lowercase_source_extension(input_path).as_deref() {
-        Some("gif") => decode_gif_animation_frames(input_path),
-        Some("apng") | Some("png") => decode_apng_animation_frames(input_path),
-        _ => Err("unsupported native animation source".into()),
+        Some("gif") => decode_gif_animation_frames(input_path, limits, || checkpoint()),
+        Some("apng") | Some("png") => {
+            decode_apng_animation_frames(input_path, limits, || checkpoint())
+        }
+        _ => Err(PipelineError::InvalidRequest {
+            reason: "unsupported-source-format",
+        }),
     }
 }
 
 fn decode_native_animation_frame(
     input_path: &str,
     source_frame_id: u32,
-) -> Result<StickerFrame, String> {
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<StickerFrame, PipelineError> {
     if source_frame_id == 0 {
-        return Err("source frame id must be one-based".into());
+        return Err(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        });
     }
 
     let frame_index = (source_frame_id - 1) as usize;
     match lowercase_source_extension(input_path).as_deref() {
-        Some("gif") => decode_gif_animation_frame(input_path, frame_index),
-        Some("apng") | Some("png") => decode_apng_animation_frame(input_path, frame_index),
-        _ => Err("unsupported native animation source".into()),
+        Some("gif") => decode_gif_animation_frame(input_path, frame_index, limits, || checkpoint()),
+        Some("apng") | Some("png") => {
+            decode_apng_animation_frame(input_path, frame_index, limits, || checkpoint())
+        }
+        _ => Err(PipelineError::InvalidRequest {
+            reason: "unsupported-source-format",
+        }),
     }
 }
 
-fn write_native_png(output_path: &Path, pixels: &RgbaImage) -> Result<(), String> {
-    let file = File::create(output_path).map_err(|error| error.to_string())?;
+fn write_native_png(output_path: &Path, pixels: &RgbaImage) -> Result<(), PipelineError> {
+    let file =
+        File::create(output_path).map_err(|error| pipeline_io_error("create PNG output", error))?;
     let writer = BufWriter::new(file);
     let mut encoder = NativePngEncoder::new(writer, pixels.width(), pixels.height());
     encoder.set_color(PngColorType::Rgba);
     encoder.set_depth(PngBitDepth::Eight);
     encoder.set_deflate_compression(PngDeflateCompression::Level(9));
     encoder.set_filter(PngFilter::Adaptive);
-    let mut png_writer = encoder.write_header().map_err(|error| error.to_string())?;
+    let mut png_writer = encoder
+        .write_header()
+        .map_err(|error| pipeline_io_error("write PNG header", error))?;
     png_writer
         .write_image_data(pixels.as_raw())
-        .map_err(|error| error.to_string())?;
-    png_writer.finish().map_err(|error| error.to_string())
+        .map_err(|error| pipeline_io_error("write PNG pixels", error))?;
+    png_writer
+        .finish()
+        .map_err(|error| pipeline_io_error("finish PNG output", error))
 }
 
-fn encode_native_png_bytes(pixels: &RgbaImage) -> Result<Vec<u8>, String> {
+fn encode_native_png_bytes(pixels: &RgbaImage) -> Result<Vec<u8>, PipelineError> {
     let mut bytes = Vec::new();
     {
         let mut encoder = NativePngEncoder::new(&mut bytes, pixels.width(), pixels.height());
@@ -1726,17 +2468,21 @@ fn encode_native_png_bytes(pixels: &RgbaImage) -> Result<Vec<u8>, String> {
         encoder.set_depth(PngBitDepth::Eight);
         encoder.set_deflate_compression(PngDeflateCompression::Level(9));
         encoder.set_filter(PngFilter::Adaptive);
-        let mut png_writer = encoder.write_header().map_err(|error| error.to_string())?;
+        let mut png_writer = encoder
+            .write_header()
+            .map_err(|error| pipeline_io_error("encode preview PNG header", error))?;
         png_writer
             .write_image_data(pixels.as_raw())
-            .map_err(|error| error.to_string())?;
-        png_writer.finish().map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("encode preview PNG pixels", error))?;
+        png_writer
+            .finish()
+            .map_err(|error| pipeline_io_error("finish preview PNG", error))?;
     }
 
     Ok(bytes)
 }
 
-fn encode_native_png_data_url(pixels: &RgbaImage) -> Result<String, String> {
+fn encode_native_png_data_url(pixels: &RgbaImage) -> Result<String, PipelineError> {
     let bytes = encode_native_png_bytes(pixels)?;
     Ok(format!(
         "data:image/png;base64,{}",
@@ -1750,52 +2496,40 @@ fn extract_frame_preview_internal(
     locale: UiLocale,
 ) -> FramePreviewResponse {
     let Some(extension) = lowercase_source_extension(input_path) else {
-        return FramePreviewResponse {
-            ok: false,
-            data_url: None,
-            width: None,
-            height: None,
-            error_code: Some("unsupported-source-format".into()),
-            error_message: Some(locale::unsupported_still_image_error(locale)),
-        };
+        return frame_preview_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "unsupported-source-format",
+            },
+            locale,
+        );
     };
 
     if source_frame_id == 0 {
-        return FramePreviewResponse {
-            ok: false,
-            data_url: None,
-            width: None,
-            height: None,
-            error_code: Some("invalid-frame-selection".into()),
-            error_message: Some("source frame id must be one-based".into()),
-        };
+        return frame_preview_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            },
+            locale,
+        );
     }
 
     if !matches!(extension.as_str(), "gif" | "apng" | "png") {
-        return FramePreviewResponse {
-            ok: false,
-            data_url: None,
-            width: None,
-            height: None,
-            error_code: Some("unsupported-frame-preview".into()),
-            error_message: Some(
-                "frame preview extraction is available for native animation sources".into(),
-            ),
-        };
+        return frame_preview_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "unsupported-frame-preview",
+            },
+            locale,
+        );
     }
 
-    let frame = match decode_native_animation_frame(input_path, source_frame_id) {
+    let frame = match decode_native_animation_frame(
+        input_path,
+        source_frame_id,
+        MediaLimits::default(),
+        || Ok(()),
+    ) {
         Ok(frame) => frame,
-        Err(error) => {
-            return FramePreviewResponse {
-                ok: false,
-                data_url: None,
-                width: None,
-                height: None,
-                error_code: Some("frame-preview-decode-failed".into()),
-                error_message: Some(error),
-            };
-        }
+        Err(error) => return frame_preview_pipeline_error(&error, locale),
     };
 
     match encode_native_png_data_url(&frame.pixels) {
@@ -1804,26 +2538,33 @@ fn extract_frame_preview_internal(
             data_url: Some(data_url),
             width: Some(frame.pixels.width()),
             height: Some(frame.pixels.height()),
+            reason_code: None,
             error_code: None,
             error_message: None,
         },
-        Err(error) => FramePreviewResponse {
-            ok: false,
-            data_url: None,
-            width: None,
-            height: None,
-            error_code: Some("frame-preview-encode-failed".into()),
-            error_message: Some(error),
-        },
+        Err(error) => frame_preview_pipeline_error(&error, locale),
     }
 }
 
-fn frame_previews_error(error_code: &str, error_message: String) -> FramePreviewsResponse {
+fn frame_preview_pipeline_error(error: &PipelineError, locale: UiLocale) -> FramePreviewResponse {
+    FramePreviewResponse {
+        ok: false,
+        data_url: None,
+        width: None,
+        height: None,
+        reason_code: error.reason_code().map(str::to_string),
+        error_code: Some(error.code().into()),
+        error_message: Some(pipeline_error_diagnostic(error, locale)),
+    }
+}
+
+fn frame_previews_pipeline_error(error: &PipelineError, locale: UiLocale) -> FramePreviewsResponse {
     FramePreviewsResponse {
         ok: false,
         previews: Vec::new(),
-        error_code: Some(error_code.into()),
-        error_message: Some(error_message),
+        reason_code: error.reason_code().map(str::to_string),
+        error_code: Some(error.code().into()),
+        error_message: Some(pipeline_error_diagnostic(error, locale)),
     }
 }
 
@@ -1832,49 +2573,76 @@ fn extract_frame_previews_internal(
     source_frame_ids: &[u32],
     locale: UiLocale,
 ) -> FramePreviewsResponse {
+    if source_frame_ids.len() > MAX_MEDIA_FRAME_COUNT {
+        return frame_previews_pipeline_error(
+            &PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: MAX_MEDIA_FRAME_COUNT as u64,
+                actual: u64::try_from(source_frame_ids.len()).unwrap_or(u64::MAX),
+            },
+            locale,
+        );
+    }
+    if source_frame_ids
+        .iter()
+        .any(|source_frame_id| *source_frame_id == 0)
+    {
+        return frame_previews_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            },
+            locale,
+        );
+    }
+
     let Some(extension) = lowercase_source_extension(input_path) else {
-        return frame_previews_error(
-            "unsupported-source-format",
-            locale::unsupported_still_image_error(locale),
+        return frame_previews_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "unsupported-source-format",
+            },
+            locale,
         );
     };
 
     if !matches!(extension.as_str(), "gif" | "apng" | "png") {
-        return frame_previews_error(
-            "unsupported-frame-preview",
-            "frame preview extraction is available for native animation sources".into(),
+        return frame_previews_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "unsupported-frame-preview",
+            },
+            locale,
         );
     }
 
-    let requested_frame_ids = source_frame_ids
-        .iter()
-        .copied()
-        .filter(|source_frame_id| *source_frame_id > 0)
-        .collect::<BTreeSet<_>>();
+    let requested_frame_ids = source_frame_ids.iter().copied().collect::<BTreeSet<_>>();
     if requested_frame_ids.is_empty() {
-        return frame_previews_error(
-            "invalid-frame-selection",
-            "at least one source frame id is required".into(),
+        return frame_previews_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            },
+            locale,
         );
     }
 
-    let frames = match decode_native_animation_frames(input_path) {
+    let frames = match decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))
+    {
         Ok(frames) => frames,
-        Err(error) => return frame_previews_error("frame-preview-decode-failed", error),
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
     };
 
     let mut previews = Vec::with_capacity(requested_frame_ids.len());
     for source_frame_id in requested_frame_ids {
         let Some(frame) = frames.get((source_frame_id - 1) as usize) else {
-            return frame_previews_error(
-                "invalid-frame-selection",
-                "source frame id is out of range".into(),
+            return frame_previews_pipeline_error(
+                &PipelineError::InvalidRequest {
+                    reason: "invalid-frame-selection",
+                },
+                locale,
             );
         };
 
         let data_url = match encode_native_png_data_url(&frame.pixels) {
             Ok(data_url) => data_url,
-            Err(error) => return frame_previews_error("frame-preview-encode-failed", error),
+            Err(error) => return frame_previews_pipeline_error(&error, locale),
         };
 
         previews.push(FramePreviewItem {
@@ -1888,6 +2656,7 @@ fn extract_frame_previews_internal(
     FramePreviewsResponse {
         ok: true,
         previews,
+        reason_code: None,
         error_code: None,
         error_message: None,
     }
@@ -1953,13 +2722,22 @@ fn frame_region_pixels(pixels: &RgbaImage, region: FrameRegion) -> Vec<u8> {
     data
 }
 
+fn pipeline_io_error(operation: &'static str, error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Io {
+        operation,
+        message: error.to_string(),
+    }
+}
+
 fn write_native_apng(
     output_path: &Path,
     frames: &[StickerFrame],
     preset: &str,
-) -> Result<(), String> {
+) -> Result<(), PipelineError> {
     if frames.is_empty() {
-        return Err("no frames available for APNG output".into());
+        return Err(PipelineError::InvalidRequest {
+            reason: "no-frames-selected",
+        });
     }
 
     let width = frames[0].pixels.width();
@@ -1968,74 +2746,82 @@ fn write_native_apng(
         .iter()
         .any(|frame| frame.pixels.width() != width || frame.pixels.height() != height)
     {
-        return Err("APNG frames must share one canvas size".into());
+        return Err(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        });
     }
 
     let durations_us = frames
         .iter()
         .map(|frame| frame.duration_us)
         .collect::<Vec<_>>();
-    let frame_delays = quantize_apng_delays(&durations_us).map_err(str::to_string)?;
+    let frame_delays = quantize_apng_delays(&durations_us)
+        .map_err(|reason| PipelineError::InvalidRequest { reason })?;
 
-    let file = File::create(output_path).map_err(|error| error.to_string())?;
+    let file = File::create(output_path)
+        .map_err(|error| pipeline_io_error("create APNG output", error))?;
     let writer = BufWriter::new(file);
     let mut encoder = NativePngEncoder::new(writer, width, height);
     encoder.set_color(PngColorType::Rgba);
     encoder.set_depth(PngBitDepth::Eight);
     encoder
         .set_animated(frames.len() as u32, 0)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
     encoder
         .set_sep_def_img(false)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
     encoder.set_deflate_compression(native_png_deflate_for_preset(preset));
     encoder.set_filter(native_png_filter_for_preset(preset));
     encoder
         .set_blend_op(PngBlendOp::Source)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
     encoder
         .set_dispose_op(PngDisposeOp::None)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
     let (delay_num, delay_den) = frame_delays[0];
     encoder
         .set_frame_delay(delay_num, delay_den)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
     encoder.validate_sequence(true);
 
-    let mut png_writer = encoder.write_header().map_err(|error| error.to_string())?;
+    let mut png_writer = encoder
+        .write_header()
+        .map_err(|error| pipeline_io_error("write APNG header", error))?;
     png_writer
         .write_image_data(frames[0].pixels.as_raw())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| pipeline_io_error("write APNG frame", error))?;
 
     let mut previous_frame = frames[0].pixels.clone();
     for (frame, &(delay_num, delay_den)) in frames[1..].iter().zip(&frame_delays[1..]) {
         let region = changed_frame_region(&previous_frame, &frame.pixels);
         png_writer
             .reset_frame_position()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
         png_writer
             .set_frame_dimension(region.width, region.height)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
         png_writer
             .set_frame_position(region.x, region.y)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
         png_writer
             .set_frame_delay(delay_num, delay_den)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
         png_writer
             .set_blend_op(PngBlendOp::Source)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
         png_writer
             .set_dispose_op(PngDisposeOp::None)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
         let region_pixels = frame_region_pixels(&frame.pixels, region);
         png_writer
             .write_image_data(&region_pixels)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| pipeline_io_error("write APNG frame", error))?;
         previous_frame = frame.pixels.clone();
     }
 
-    png_writer.finish().map_err(|error| error.to_string())
+    png_writer
+        .finish()
+        .map_err(|error| pipeline_io_error("finish APNG output", error))
 }
 
 fn build_native_selected_animation_frames(
@@ -2086,17 +2872,63 @@ fn build_native_timeline_frames(
         .collect()
 }
 
-fn raw_rgba_frame_size(width: u32, height: u32) -> Result<usize, String> {
-    usize::try_from(width)
-        .ok()
-        .and_then(|width| width.checked_mul(height as usize))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "raw frame size overflow".to_string())
+fn validate_raw_rgba_output(
+    width: u32,
+    height: u32,
+    output_len: usize,
+    expected_frame_count: Option<usize>,
+    limits: MediaLimits,
+) -> Result<(usize, usize), PipelineError> {
+    let frame_size = checked_rgba_bytes(width, height, limits)?;
+    if frame_size == 0 || output_len == 0 || output_len % frame_size != 0 {
+        return Err(PipelineError::MalformedProcessOutput {
+            reason: "raw RGBA output is not a whole frame sequence".into(),
+        });
+    }
+    let frame_count = output_len / frame_size;
+    if frame_count > limits.max_frame_count as usize {
+        return Err(PipelineError::LimitExceeded {
+            resource: "frame-count",
+            limit: u64::from(limits.max_frame_count),
+            actual: u64::try_from(frame_count).unwrap_or(u64::MAX),
+        });
+    }
+    let total_bytes = u64::try_from(output_len).unwrap_or(u64::MAX);
+    if total_bytes > limits.max_total_decoded_bytes {
+        return Err(PipelineError::LimitExceeded {
+            resource: "decoded-bytes",
+            limit: limits.max_total_decoded_bytes,
+            actual: total_bytes,
+        });
+    }
+    if expected_frame_count.is_some_and(|expected| expected != frame_count) {
+        return Err(PipelineError::MalformedProcessOutput {
+            reason: "raw RGBA output frame count did not match the request".into(),
+        });
+    }
+    Ok((frame_size, frame_count))
 }
 
-fn rgba_frame_from_bytes(width: u32, height: u32, bytes: Vec<u8>) -> Result<RgbaImage, String> {
-    RgbaImage::from_raw(width, height, bytes)
-        .ok_or_else(|| "ffmpeg raw frame buffer size did not match image dimensions".to_string())
+fn tool_run_pipeline_error(tool: &'static str, error: ToolRunError) -> PipelineError {
+    if error.resolution.source == "missing" {
+        PipelineError::ToolMissing { tool }
+    } else {
+        PipelineError::ProcessFailed {
+            command: tool.into(),
+            exit_code: None,
+            stderr: error.system_error,
+        }
+    }
+}
+
+fn rgba_frame_from_bytes(
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+) -> Result<RgbaImage, PipelineError> {
+    RgbaImage::from_raw(width, height, bytes).ok_or_else(|| PipelineError::MalformedProcessOutput {
+        reason: "raw RGBA frame size did not match image dimensions".into(),
+    })
 }
 
 fn decode_video_frames_with_ffmpeg(
@@ -2105,7 +2937,9 @@ fn decode_video_frames_with_ffmpeg(
     frame_width: u32,
     frame_height: u32,
     locale: UiLocale,
-) -> Result<(Vec<RgbaImage>, ToolResolution), String> {
+) -> Result<(Vec<RgbaImage>, ToolResolution), PipelineError> {
+    let frame_bytes = checked_rgba_bytes(frame_width, frame_height, MediaLimits::default())?;
+    preflight_animation_decoded_bytes(frame_bytes, 1, MediaLimits::default())?;
     let args = [
         "-v",
         "error",
@@ -2121,11 +2955,15 @@ fn decode_video_frames_with_ffmpeg(
         "-",
     ];
 
-    let output = run_with_fallback("ffmpeg", &args, locale).map_err(|error| error.system_error)?;
-    let frame_size = raw_rgba_frame_size(frame_width, frame_height)?;
-    if frame_size == 0 || output.stdout.is_empty() || output.stdout.len() % frame_size != 0 {
-        return Err("ffmpeg did not return a whole sequence of RGBA frames".into());
-    }
+    let output = run_with_fallback("ffmpeg", &args, locale)
+        .map_err(|error| tool_run_pipeline_error("ffmpeg", error))?;
+    let (frame_size, _) = validate_raw_rgba_output(
+        frame_width,
+        frame_height,
+        output.stdout.len(),
+        None,
+        MediaLimits::default(),
+    )?;
 
     let frames = output
         .stdout
@@ -2142,10 +2980,18 @@ fn extract_video_source_frames_rgba(
     frame_width: u32,
     frame_height: u32,
     locale: UiLocale,
-) -> Result<(BTreeMap<u32, RgbaImage>, ToolResolution), String> {
+) -> Result<(BTreeMap<u32, RgbaImage>, ToolResolution), PipelineError> {
     if frame_indexes.is_empty() {
-        return Err("no timeline frames requested for extraction".into());
+        return Err(PipelineError::InvalidRequest {
+            reason: "no-frames-selected",
+        });
     }
+    let frame_bytes = checked_rgba_bytes(frame_width, frame_height, MediaLimits::default())?;
+    preflight_animation_decoded_bytes(
+        frame_bytes,
+        u64::try_from(frame_indexes.len()).unwrap_or(u64::MAX),
+        MediaLimits::default(),
+    )?;
 
     let select_filter = build_source_frame_select_filter(frame_indexes);
     let args = [
@@ -2163,11 +3009,15 @@ fn extract_video_source_frames_rgba(
         "-",
     ];
 
-    let output = run_with_fallback("ffmpeg", &args, locale).map_err(|error| error.system_error)?;
-    let frame_size = raw_rgba_frame_size(frame_width, frame_height)?;
-    if frame_size == 0 || output.stdout.len() != frame_size * frame_indexes.len() {
-        return Err("ffmpeg did not return the requested RGBA source frames".into());
-    }
+    let output = run_with_fallback("ffmpeg", &args, locale)
+        .map_err(|error| tool_run_pipeline_error("ffmpeg", error))?;
+    let (frame_size, _) = validate_raw_rgba_output(
+        frame_width,
+        frame_height,
+        output.stdout.len(),
+        Some(frame_indexes.len()),
+        MediaLimits::default(),
+    )?;
 
     let frames = frame_indexes
         .iter()
@@ -2318,7 +3168,8 @@ fn prepare_optimizer_plan(
                 search_budget,
                 warnings,
                 candidates: Vec::new(),
-                error_code: Some("invalid-crop".into()),
+                reason_code: Some("invalid-crop".into()),
+                error_code: Some("invalid-request".into()),
                 error_message: Some(error),
             }
         }
@@ -2351,7 +3202,8 @@ fn prepare_optimizer_plan(
                                 search_budget,
                                 warnings,
                                 candidates: Vec::new(),
-                                error_code: Some(error.into()),
+                                reason_code: Some(error.into()),
+                                error_code: Some("invalid-request".into()),
                                 error_message: Some(locale::frame_selection_required_error(locale)),
                             }
                         }
@@ -2370,11 +3222,17 @@ fn prepare_optimizer_plan(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    error_code: Some("no-frames-selected".into()),
+                    reason_code: Some("no-frames-selected".into()),
+                    error_code: Some("invalid-request".into()),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 };
             }
-            Err(_) => {
+            Err(reason) => {
+                let error_message = if reason == "invalid-frame-duration" {
+                    locale::invalid_frame_duration_error(locale)
+                } else {
+                    locale::invalid_frame_selection_error(locale)
+                };
                 return OptimizerPlanResponse {
                     ok: false,
                     fit_mode: fit_mode.into(),
@@ -2385,8 +3243,9 @@ fn prepare_optimizer_plan(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    error_code: Some("invalid-frame-selection".into()),
-                    error_message: Some(locale::invalid_frame_selection_error(locale)),
+                    reason_code: Some(reason.into()),
+                    error_code: Some("invalid-request".into()),
+                    error_message: Some(error_message),
                 };
             }
         }
@@ -2404,7 +3263,8 @@ fn prepare_optimizer_plan(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    error_code: Some(error.into()),
+                    reason_code: Some(error.into()),
+                    error_code: Some("invalid-request".into()),
                     error_message: Some(locale::invalid_frame_selection_error(locale)),
                 };
             }
@@ -2422,7 +3282,8 @@ fn prepare_optimizer_plan(
                 search_budget,
                 warnings,
                 candidates: Vec::new(),
-                error_code: Some("duration-too-long".into()),
+                reason_code: Some("duration-too-long".into()),
+                error_code: Some("invalid-request".into()),
                 error_message: Some(locale::selected_duration_limit_error(locale)),
             };
         }
@@ -2452,6 +3313,7 @@ fn prepare_optimizer_plan(
                 search_budget,
                 locale,
             ),
+            reason_code: None,
             error_code: None,
             error_message: None,
         };
@@ -2471,7 +3333,8 @@ fn prepare_optimizer_plan(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    error_code: Some("no-frames-selected".into()),
+                    reason_code: Some("no-frames-selected".into()),
+                    error_code: Some("invalid-request".into()),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 };
             }
@@ -2486,7 +3349,8 @@ fn prepare_optimizer_plan(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    error_code: Some("invalid-frame-selection".into()),
+                    reason_code: Some("invalid-frame-selection".into()),
+                    error_code: Some("invalid-request".into()),
                     error_message: Some(locale::invalid_frame_selection_error(locale)),
                 };
             }
@@ -2505,7 +3369,8 @@ fn prepare_optimizer_plan(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    error_code: Some(error.into()),
+                    reason_code: Some(error.into()),
+                    error_code: Some("invalid-request".into()),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 }
             }
@@ -2538,7 +3403,8 @@ fn prepare_optimizer_plan(
             search_budget,
             warnings,
             candidates: Vec::new(),
-            error_code: Some("duration-too-long".into()),
+            reason_code: Some("duration-too-long".into()),
+            error_code: Some("invalid-request".into()),
             error_message: Some(locale::selected_duration_limit_error(locale)),
         };
     }
@@ -2564,6 +3430,7 @@ fn prepare_optimizer_plan(
             search_budget,
             locale,
         ),
+        reason_code: None,
         error_code: None,
         error_message: None,
     }
@@ -2593,16 +3460,40 @@ fn encode_candidate_from_native_animation_internal(
     output_directory: Option<&str>,
     locale: UiLocale,
     crop_region: Option<&CropRegion>,
-    input_width: Option<u32>,
-    input_height: Option<u32>,
+    _input_width: Option<u32>,
+    _input_height: Option<u32>,
     candidate: &CandidatePreview,
     timeline_frames: &[ResolvedTimelineFrame],
-) -> Result<EncodeResult, String> {
-    let output_directory = resolve_output_directory(output_directory, input_path, locale)?;
+    expected_source: Option<&SourceIdentity>,
+) -> Result<EncodeResult, PipelineError> {
+    let output_directory =
+        resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
+            PipelineError::InvalidRequest {
+                reason: "invalid-output-directory",
+            }
+        })?;
     let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
-    let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)?;
-    let source_frames = decode_native_animation_frames(input_path)?;
-    let frames = build_native_timeline_frames(&source_frames, timeline_frames)?
+    let source_frames =
+        decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))?;
+    let first_frame = source_frames
+        .first()
+        .ok_or_else(|| PipelineError::MalformedInput {
+            format: "animation",
+            reason: "native animation did not contain frames".into(),
+        })?;
+    let resolved_crop_region = resolve_crop_region(
+        crop_region,
+        Some(first_frame.pixels.width()),
+        Some(first_frame.pixels.height()),
+        locale,
+    )
+    .map_err(|_| PipelineError::InvalidRequest {
+        reason: "invalid-crop",
+    })?;
+    let frames = build_native_timeline_frames(&source_frames, timeline_frames)
+        .map_err(|_| PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        })?
         .into_iter()
         .map(|frame| StickerFrame {
             pixels: transform_frame_for_candidate(
@@ -2613,9 +3504,13 @@ fn encode_candidate_from_native_animation_internal(
             duration_us: frame.duration_us,
         })
         .collect::<Vec<_>>();
+    if let Some(expected_source) = expected_source {
+        ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    }
     let started = Instant::now();
     write_native_apng(&output_path, &frames, &candidate.preset)?;
-    let metadata = fs::metadata(&output_path).map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(&output_path)
+        .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
 
     Ok(EncodeResult {
         output_path,
@@ -2636,16 +3531,31 @@ fn encode_candidate_from_video_timeline_internal(
     input_height: Option<u32>,
     candidate: &CandidatePreview,
     timeline_frames: &[ResolvedTimelineFrame],
-) -> Result<EncodeResult, String> {
-    let output_directory = resolve_output_directory(output_directory, input_path, locale)?;
+    expected_source: Option<&SourceIdentity>,
+) -> Result<EncodeResult, PipelineError> {
+    let output_directory =
+        resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
+            PipelineError::InvalidRequest {
+                reason: "invalid-output-directory",
+            }
+        })?;
     let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
-    let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)?;
-    let source_width = input_width
-        .filter(|width| *width > 0)
-        .ok_or_else(|| locale::crop_needs_source_width_error(locale))?;
-    let source_height = input_height
-        .filter(|height| *height > 0)
-        .ok_or_else(|| locale::crop_needs_source_height_error(locale))?;
+    let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)
+        .map_err(|_| PipelineError::InvalidRequest {
+            reason: "invalid-crop",
+        })?;
+    let source_width =
+        input_width
+            .filter(|width| *width > 0)
+            .ok_or(PipelineError::InvalidRequest {
+                reason: "invalid-crop",
+            })?;
+    let source_height =
+        input_height
+            .filter(|height| *height > 0)
+            .ok_or(PipelineError::InvalidRequest {
+                reason: "invalid-crop",
+            })?;
     let unique_frame_indexes = timeline_frames
         .iter()
         .map(|frame| frame.source_frame_index)
@@ -2671,12 +3581,18 @@ fn encode_candidate_from_video_timeline_internal(
                     ),
                     duration_us: frame.duration_us,
                 })
-                .ok_or_else(|| "timeline frame index is out of range".to_string())
+                .ok_or(PipelineError::InvalidRequest {
+                    reason: "invalid-frame-selection",
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Some(expected_source) = expected_source {
+        ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    }
     let started = Instant::now();
     write_native_apng(&output_path, &frames, &candidate.preset)?;
-    let metadata = fs::metadata(&output_path).map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(&output_path)
+        .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
 
     Ok(EncodeResult {
         output_path,
@@ -2697,10 +3613,19 @@ fn encode_candidate_with_ffmpeg_frames_internal(
     input_height: Option<u32>,
     candidate: &CandidatePreview,
     selected_frames: Option<&[u32]>,
-) -> Result<EncodeResult, String> {
-    let output_directory = resolve_output_directory(output_directory, input_path, locale)?;
+    expected_source: Option<&SourceIdentity>,
+) -> Result<EncodeResult, PipelineError> {
+    let output_directory =
+        resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
+            PipelineError::InvalidRequest {
+                reason: "invalid-output-directory",
+            }
+        })?;
     let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
-    let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)?;
+    let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)
+        .map_err(|_| PipelineError::InvalidRequest {
+            reason: "invalid-crop",
+        })?;
     let filter_graph = build_filter_graph(
         candidate.fps,
         candidate.content_scale,
@@ -2729,9 +3654,13 @@ fn encode_candidate_with_ffmpeg_frames_internal(
             duration_us: frame_duration_us_for_fps(candidate.fps),
         })
         .collect::<Vec<_>>();
+    if let Some(expected_source) = expected_source {
+        ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    }
     let started = Instant::now();
     write_native_apng(&output_path, &frames, &candidate.preset)?;
-    let metadata = fs::metadata(&output_path).map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(&output_path)
+        .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
 
     Ok(EncodeResult {
         output_path,
@@ -2753,7 +3682,8 @@ fn encode_candidate_internal(
     candidate: &CandidatePreview,
     selected_frames: Option<&[u32]>,
     timeline_frames: Option<&[ResolvedTimelineFrame]>,
-) -> Result<EncodeResult, String> {
+    expected_source: Option<&SourceIdentity>,
+) -> Result<EncodeResult, PipelineError> {
     let extension = lowercase_source_extension(input_path).unwrap_or_default();
 
     if let Some(timeline_frames) = timeline_frames {
@@ -2767,6 +3697,7 @@ fn encode_candidate_internal(
                 input_height,
                 candidate,
                 timeline_frames,
+                expected_source,
             ),
             _ => encode_candidate_from_video_timeline_internal(
                 input_path,
@@ -2777,18 +3708,39 @@ fn encode_candidate_internal(
                 input_height,
                 candidate,
                 timeline_frames,
+                expected_source,
             ),
         };
     }
 
     if matches!(extension.as_str(), "gif" | "apng") {
-        let output_directory = resolve_output_directory(output_directory, input_path, locale)?;
+        let output_directory = resolve_output_directory(output_directory, input_path, locale)
+            .map_err(|_| PipelineError::InvalidRequest {
+                reason: "invalid-output-directory",
+            })?;
         let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
-        let resolved_crop_region =
-            resolve_crop_region(crop_region, input_width, input_height, locale)?;
-        let source_frames = decode_native_animation_frames(input_path)?;
+        let source_frames =
+            decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))?;
+        let first_frame = source_frames
+            .first()
+            .ok_or_else(|| PipelineError::MalformedInput {
+                format: "animation",
+                reason: "native animation did not contain frames".into(),
+            })?;
+        let resolved_crop_region = resolve_crop_region(
+            crop_region,
+            Some(first_frame.pixels.width()),
+            Some(first_frame.pixels.height()),
+            locale,
+        )
+        .map_err(|_| PipelineError::InvalidRequest {
+            reason: "invalid-crop",
+        })?;
         let frames =
-            build_native_selected_animation_frames(&source_frames, selected_frames, candidate.fps)?
+            build_native_selected_animation_frames(&source_frames, selected_frames, candidate.fps)
+                .map_err(|_| PipelineError::InvalidRequest {
+                    reason: "invalid-frame-selection",
+                })?
                 .into_iter()
                 .map(|frame| StickerFrame {
                     pixels: transform_frame_for_candidate(
@@ -2799,9 +3751,13 @@ fn encode_candidate_internal(
                     duration_us: frame.duration_us,
                 })
                 .collect::<Vec<_>>();
+        if let Some(expected_source) = expected_source {
+            ensure_source_unchanged(expected_source, MediaLimits::default())?;
+        }
         let started = Instant::now();
         write_native_apng(&output_path, &frames, &candidate.preset)?;
-        let metadata = fs::metadata(&output_path).map_err(|error| error.to_string())?;
+        let metadata = fs::metadata(&output_path)
+            .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
 
         return Ok(EncodeResult {
             output_path,
@@ -2822,6 +3778,7 @@ fn encode_candidate_internal(
         input_height,
         candidate,
         selected_frames,
+        expected_source,
     )
 }
 
@@ -2830,6 +3787,7 @@ fn convert_static_image_to_png_internal(
     output_directory: Option<&str>,
     crop_region: Option<&CropRegion>,
     locale: UiLocale,
+    expected_source: Option<&SourceIdentity>,
 ) -> StaticImageConversionResult {
     let inspection = inspect_input_media_internal(input_path, locale);
 
@@ -2843,6 +3801,7 @@ fn convert_static_image_to_png_internal(
             tool_command: inspection.tool_command,
             tool_detail: inspection.tool_detail,
             warnings: Vec::new(),
+            reason_code: inspection.reason_code,
             error_code: inspection.error_code,
             error_message: inspection.error_message,
         };
@@ -2858,26 +3817,21 @@ fn convert_static_image_to_png_internal(
             tool_command: inspection.tool_command,
             tool_detail: inspection.tool_detail,
             warnings: Vec::new(),
-            error_code: Some("unsupported-source-format".into()),
+            reason_code: Some("unsupported-source-format".into()),
+            error_code: Some("invalid-request".into()),
             error_message: Some(locale::unsupported_still_image_error(locale)),
         };
     }
 
     let output_directory = match resolve_output_directory(output_directory, input_path, locale) {
         Ok(directory) => directory,
-        Err(error) => {
-            return StaticImageConversionResult {
-                ok: false,
-                output_path: None,
-                size_bytes: None,
-                elapsed_ms: None,
-                tool_source: inspection.tool_source,
-                tool_command: inspection.tool_command,
-                tool_detail: inspection.tool_detail,
-                warnings: Vec::new(),
-                error_code: Some("invalid-output-directory".into()),
-                error_message: Some(error),
-            }
+        Err(_) => {
+            return static_conversion_pipeline_error(
+                &PipelineError::InvalidRequest {
+                    reason: "invalid-output-directory",
+                },
+                locale,
+            )
         }
     };
 
@@ -2895,14 +3849,16 @@ fn convert_static_image_to_png_internal(
                     tool_command: inspection.tool_command,
                     tool_detail: inspection.tool_detail,
                     warnings: Vec::new(),
-                    error_code: Some("invalid-crop".into()),
+                    reason_code: Some("invalid-crop".into()),
+                    error_code: Some("invalid-request".into()),
                     error_message: Some(error),
                 }
             }
         };
 
     let started = Instant::now();
-    let source_pixels = match decode_still_rgba_image(input_path) {
+    let source_pixels = match decode_still_rgba_image(input_path, MediaLimits::default(), || Ok(()))
+    {
         Ok(pixels) => pixels,
         Err(error) => {
             return StaticImageConversionResult {
@@ -2914,11 +3870,29 @@ fn convert_static_image_to_png_internal(
                 tool_command: None,
                 tool_detail: Some(locale::native_image_detail(locale)),
                 warnings: Vec::new(),
-                error_code: Some("decode-failed".into()),
-                error_message: Some(error),
+                reason_code: error.reason_code().map(str::to_string),
+                error_code: Some(error.code().into()),
+                error_message: Some(pipeline_error_diagnostic(&error, locale)),
             }
         }
     };
+    if let Some(expected_source) = expected_source {
+        if let Err(error) = ensure_source_unchanged(expected_source, MediaLimits::default()) {
+            return StaticImageConversionResult {
+                ok: false,
+                output_path: None,
+                size_bytes: None,
+                elapsed_ms: None,
+                tool_source: Some("native".into()),
+                tool_command: None,
+                tool_detail: Some(locale::native_image_detail(locale)),
+                warnings: Vec::new(),
+                reason_code: error.reason_code().map(str::to_string),
+                error_code: Some(error.code().into()),
+                error_message: Some(pipeline_error_diagnostic(&error, locale)),
+            };
+        }
+    }
     let output_pixels = transform_frame_for_static_png(&source_pixels, resolved_crop_region);
 
     match write_native_png(&output_path, &output_pixels) {
@@ -2926,18 +3900,8 @@ fn convert_static_image_to_png_internal(
             let metadata = match fs::metadata(&output_path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    return StaticImageConversionResult {
-                        ok: false,
-                        output_path: None,
-                        size_bytes: None,
-                        elapsed_ms: None,
-                        tool_source: Some("native".into()),
-                        tool_command: None,
-                        tool_detail: Some(locale::native_png_encode_detail(locale)),
-                        warnings: Vec::new(),
-                        error_code: Some("missing-output".into()),
-                        error_message: Some(error.to_string()),
-                    }
+                    let error = pipeline_io_error("read PNG output metadata", error);
+                    return static_conversion_pipeline_error(&error, locale);
                 }
             };
 
@@ -2950,22 +3914,31 @@ fn convert_static_image_to_png_internal(
                 tool_command: None,
                 tool_detail: Some(locale::native_png_encode_detail(locale)),
                 warnings: Vec::new(),
+                reason_code: None,
                 error_code: None,
                 error_message: None,
             }
         }
-        Err(error) => StaticImageConversionResult {
-            ok: false,
-            output_path: None,
-            size_bytes: None,
-            elapsed_ms: None,
-            tool_source: Some("native".into()),
-            tool_command: None,
-            tool_detail: Some(locale::native_png_encode_detail(locale)),
-            warnings: Vec::new(),
-            error_code: Some("encode-failed".into()),
-            error_message: Some(error),
-        },
+        Err(error) => static_conversion_pipeline_error(&error, locale),
+    }
+}
+
+fn static_conversion_pipeline_error(
+    error: &PipelineError,
+    locale: UiLocale,
+) -> StaticImageConversionResult {
+    StaticImageConversionResult {
+        ok: false,
+        output_path: None,
+        size_bytes: None,
+        elapsed_ms: None,
+        tool_source: None,
+        tool_command: None,
+        tool_detail: None,
+        warnings: Vec::new(),
+        reason_code: error.reason_code().map(str::to_string),
+        error_code: Some(error.code().into()),
+        error_message: Some(pipeline_error_diagnostic(error, locale)),
     }
 }
 
@@ -2977,9 +3950,11 @@ fn inspection_error(
     error_code: &str,
     error_message: String,
 ) -> MediaInspection {
+    let (error_code, reason_code) = normalize_backend_error_code(error_code);
     MediaInspection {
         ok: false,
         input_path: input_path.to_string(),
+        source_revision: None,
         tool_source,
         tool_command,
         tool_detail,
@@ -2994,150 +3969,806 @@ fn inspection_error(
         frame_rate_label: None,
         estimated_frames: None,
         frame_durations_seconds: None,
+        warnings: Vec::new(),
         is_static_image: false,
         can_convert_to_png: false,
+        reason_code: reason_code.map(str::to_string),
         error_code: Some(error_code.into()),
         error_message: Some(error_message),
     }
 }
 
-fn skip_png_chunk_payload<R: Seek>(reader: &mut R, length: u32) -> Result<(), String> {
-    reader
-        .seek(SeekFrom::Current(i64::from(length) + 4))
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+fn apply_inspection_source_revision(
+    identity: &SourceIdentity,
+    input_path: &str,
+    mut inspection: MediaInspection,
+) -> MediaInspection {
+    inspection.input_path = input_path.to_string();
+    inspection.source_revision = inspection.ok.then(|| identity.revision());
+    inspection
 }
 
-fn read_png_chunk_payload<R: Read>(reader: &mut R, length: u32) -> Result<Vec<u8>, String> {
-    let mut data = vec![0u8; length as usize];
-    reader
-        .read_exact(&mut data)
-        .map_err(|error| error.to_string())?;
-    let mut crc = [0u8; 4];
-    reader
-        .read_exact(&mut crc)
-        .map_err(|error| error.to_string())?;
-    Ok(data)
+fn enforce_desktop_inspection_frame_limit(
+    inspection: MediaInspection,
+    locale: UiLocale,
+) -> MediaInspection {
+    let limit = u64::from(MediaLimits::default().max_frame_count);
+    let Some(actual) = inspection.estimated_frames.filter(|count| *count > limit) else {
+        return inspection;
+    };
+    let error = PipelineError::LimitExceeded {
+        resource: "frame-count",
+        limit,
+        actual,
+    };
+    let MediaInspection {
+        input_path,
+        tool_source,
+        tool_command,
+        tool_detail,
+        ..
+    } = inspection;
+
+    inspection_error(
+        &input_path,
+        tool_source,
+        tool_command,
+        tool_detail,
+        error.code(),
+        pipeline_error_diagnostic(&error, locale),
+    )
 }
 
-fn read_png_animation_metadata(input_path: &Path) -> Result<Option<PngAnimationMetadata>, String> {
+fn normalize_backend_error_code(error_code: &str) -> (&'static str, Option<&'static str>) {
+    match error_code {
+        "cancelled"
+        | "timed-out"
+        | "operation-conflict"
+        | "invalid-request"
+        | "source-changed"
+        | "media-input-too-large"
+        | "media-dimensions-too-large"
+        | "media-frame-limit"
+        | "decoded-byte-limit"
+        | "png-chunk-limit"
+        | "malformed-media"
+        | "malformed-process-output"
+        | "tool-missing"
+        | "process-failed"
+        | "output-conflict"
+        | "internal-task-failed" => (canonical_error_code(error_code), None),
+        "no-frames-selected"
+        | "invalid-frame-selection"
+        | "invalid-frame-duration"
+        | "duration-too-long"
+        | "invalid-crop"
+        | "invalid-output-directory"
+        | "unsupported-source-format"
+        | "unsupported-frame-preview"
+        | "frame-preview-decode-failed"
+        | "frame-preview-encode-failed"
+        | "decode-failed"
+        | "encode-failed"
+        | "missing-output"
+        | "plan-invalid"
+        | "invoke-failed" => ("invalid-request", canonical_reason_code(error_code)),
+        "inspect-failed" => ("malformed-media", Some("decode-failed")),
+        "tool-unavailable" => ("tool-missing", None),
+        _ => ("internal-task-failed", None),
+    }
+}
+
+fn pipeline_error_diagnostic(error: &PipelineError, locale: UiLocale) -> String {
+    let base = locale::media_pipeline_diagnostic(locale, error.code());
+    let detail = match error {
+        PipelineError::MalformedInput { reason, .. } if reason == "decoder panicked" => {
+            Some("decoder-panic".to_string())
+        }
+        PipelineError::MalformedInput {
+            format: "png",
+            reason,
+        } if reason.starts_with("CRC mismatch") => Some("png-parser-crc".to_string()),
+        PipelineError::MalformedInput { format: "png", .. } => {
+            Some("png-parser-validation".to_string())
+        }
+        PipelineError::MalformedInput { .. } => Some("decoder-validation".to_string()),
+        PipelineError::MalformedProcessOutput { .. } => {
+            Some("process-output-validation".to_string())
+        }
+        PipelineError::LimitExceeded {
+            resource,
+            limit,
+            actual,
+        } => {
+            let resource = match *resource {
+                "input-bytes" => "input-bytes",
+                "image-dimensions" => "image-dimensions",
+                "image-pixels" => "image-pixels",
+                "frame-count" => "frame-count",
+                "decoded-bytes" => "decoded-bytes",
+                "png-chunk-bytes" => "png-chunk-bytes",
+                _ => "unknown-limit",
+            };
+            Some(format!("limit:{resource}:{actual}>{limit}"))
+        }
+        _ => None,
+    };
+
+    match detail {
+        Some(detail) => format!("{base} [{detail}]"),
+        None => base,
+    }
+}
+
+fn ffmpeg_inspection_failure_diagnostic(locale: UiLocale, process_succeeded: bool) -> String {
+    if process_succeeded {
+        locale::no_usable_video_stream_error(locale)
+    } else {
+        locale::media_pipeline_diagnostic(locale, "malformed-media")
+    }
+}
+
+fn ffmpeg_inspection_process_failure(
+    input_path: &str,
+    tool: &ToolResolution,
+    process_succeeded: bool,
+    _stderr: &[u8],
+    locale: UiLocale,
+) -> Option<MediaInspection> {
+    (!process_succeeded).then(|| {
+        inspection_error(
+            input_path,
+            Some("sidecar".into()),
+            Some(tool.command_display.clone()),
+            tool.fallback_reason.clone(),
+            "inspect-failed",
+            ffmpeg_inspection_failure_diagnostic(locale, false),
+        )
+    })
+}
+
+fn canonical_error_code(error_code: &str) -> &'static str {
+    match error_code {
+        "cancelled" => "cancelled",
+        "timed-out" => "timed-out",
+        "operation-conflict" => "operation-conflict",
+        "invalid-request" => "invalid-request",
+        "source-changed" => "source-changed",
+        "media-input-too-large" => "media-input-too-large",
+        "media-dimensions-too-large" => "media-dimensions-too-large",
+        "media-frame-limit" => "media-frame-limit",
+        "decoded-byte-limit" => "decoded-byte-limit",
+        "png-chunk-limit" => "png-chunk-limit",
+        "malformed-media" => "malformed-media",
+        "malformed-process-output" => "malformed-process-output",
+        "tool-missing" => "tool-missing",
+        "process-failed" => "process-failed",
+        "output-conflict" => "output-conflict",
+        _ => "internal-task-failed",
+    }
+}
+
+fn canonical_reason_code(reason_code: &str) -> Option<&'static str> {
+    match reason_code {
+        "no-frames-selected" => Some("no-frames-selected"),
+        "invalid-frame-selection" => Some("invalid-frame-selection"),
+        "invalid-frame-duration" => Some("invalid-frame-duration"),
+        "duration-too-long" => Some("duration-too-long"),
+        "invalid-crop" => Some("invalid-crop"),
+        "invalid-output-directory" => Some("invalid-output-directory"),
+        "unsupported-source-format" => Some("unsupported-source-format"),
+        "unsupported-frame-preview" => Some("unsupported-frame-preview"),
+        "frame-preview-decode-failed" => Some("frame-preview-decode-failed"),
+        "frame-preview-encode-failed" => Some("frame-preview-encode-failed"),
+        "decode-failed" => Some("decode-failed"),
+        "encode-failed" => Some("encode-failed"),
+        "missing-output" => Some("missing-output"),
+        "plan-invalid" => Some("plan-invalid"),
+        "invoke-failed" => Some("invoke-failed"),
+        _ => None,
+    }
+}
+
+fn validate_source_revision(
+    input_path: &Path,
+    source_revision: Option<&str>,
+    limits: MediaLimits,
+) -> Result<SourceIdentity, PipelineError> {
+    let source_revision = source_revision
+        .filter(|revision| !revision.trim().is_empty())
+        .ok_or(PipelineError::InvalidRequestWithoutReason)?;
+    let identity =
+        SourceIdentity::from_path(input_path, limits).map_err(|_| PipelineError::SourceChanged)?;
+    if identity.revision() != source_revision {
+        return Err(PipelineError::SourceChanged);
+    }
+    Ok(identity)
+}
+
+fn ensure_source_unchanged(
+    expected: &SourceIdentity,
+    limits: MediaLimits,
+) -> Result<(), PipelineError> {
+    let current = SourceIdentity::from_path(&expected.canonical_path, limits)
+        .map_err(|_| PipelineError::SourceChanged)?;
+    if &current != expected {
+        return Err(PipelineError::SourceChanged);
+    }
+    Ok(())
+}
+
+fn finalize_source_checked<T>(
+    expected: &SourceIdentity,
+    response: T,
+    limits: MediaLimits,
+    on_source_error: impl FnOnce(PipelineError) -> T,
+) -> T {
+    match ensure_source_unchanged(expected, limits) {
+        Ok(()) => response,
+        Err(error) => on_source_error(error),
+    }
+}
+
+fn finalize_static_conversion_source(
+    expected: &SourceIdentity,
+    response: StaticImageConversionResult,
+    locale: UiLocale,
+) -> StaticImageConversionResult {
+    finalize_source_checked(expected, response, MediaLimits::default(), |error| {
+        static_conversion_pipeline_error(&error, locale)
+    })
+}
+
+fn finalize_optimizer_search_source(
+    expected: &SourceIdentity,
+    response: OptimizerSearchResponse,
+    locale: UiLocale,
+) -> OptimizerSearchResponse {
+    let warnings = response.warnings.clone();
+    finalize_source_checked(expected, response, MediaLimits::default(), |error| {
+        optimizer_search_pipeline_error(locale, warnings, error)
+    })
+}
+
+fn finalize_frame_preview_source(
+    expected: &SourceIdentity,
+    response: FramePreviewResponse,
+    locale: UiLocale,
+) -> FramePreviewResponse {
+    finalize_source_checked(expected, response, MediaLimits::default(), |error| {
+        frame_preview_pipeline_error(&error, locale)
+    })
+}
+
+fn finalize_frame_previews_source(
+    expected: &SourceIdentity,
+    response: FramePreviewsResponse,
+    locale: UiLocale,
+) -> FramePreviewsResponse {
+    finalize_source_checked(expected, response, MediaLimits::default(), |error| {
+        frame_previews_pipeline_error(&error, locale)
+    })
+}
+
+fn malformed_png(reason: impl Into<String>) -> PipelineError {
+    PipelineError::MalformedInput {
+        format: "png",
+        reason: reason.into(),
+    }
+}
+
+fn read_png_exact<R: Read>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    context: &'static str,
+) -> Result<(), PipelineError> {
+    reader
+        .read_exact(buffer)
+        .map_err(|_| malformed_png(format!("truncated {context}")))
+}
+
+fn read_png_metadata_from_reader<R: Read>(
+    reader: &mut R,
+    file_length: u64,
+    limits: MediaLimits,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<PngFileMetadata, PipelineError> {
     const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    const SCRATCH_BYTES: usize = 64 * 1024;
 
-    let file = File::open(input_path).map_err(|error| error.to_string())?;
-    let mut reader = BufReader::new(file);
     let mut signature = [0u8; 8];
-    reader
-        .read_exact(&mut signature)
-        .map_err(|error| error.to_string())?;
+    read_png_exact(reader, &mut signature, "PNG signature")?;
     if &signature != PNG_SIGNATURE {
-        return Ok(None);
+        return Err(malformed_png("invalid PNG signature"));
     }
 
+    let mut offset = 8u64;
     let mut width = None;
     let mut height = None;
+    let mut bit_depth = None;
+    let mut color_type = None;
     let mut frame_count = None;
     let mut frame_durations = Vec::new();
     let mut saw_animation_control = false;
+    let mut saw_image_data = false;
+    let mut saw_nonempty_idat = false;
+    let mut saw_ihdr = false;
+    let mut saw_plte = false;
+    let mut saw_iend = false;
+    let mut frame_control_count = 0u64;
+    let mut expected_apng_sequence = 0u32;
+    let mut pending_frame_data: Option<&'static str> = None;
+    let mut active_fdat_frame = false;
+    let mut saw_fdat = false;
+    let mut last_chunk_was_idat = false;
+    let mut saw_palette_follower = false;
+    let mut seen_singleton_ancillary_chunks = BTreeSet::new();
+    let mut warnings = Vec::new();
 
-    loop {
-        let mut length_bytes = [0u8; 4];
-        match reader.read_exact(&mut length_bytes) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(error.to_string()),
+    while !saw_iend {
+        checkpoint()?;
+        if offset == file_length {
+            return Err(malformed_png("missing IEND chunk"));
+        }
+        if file_length.saturating_sub(offset) < 8 {
+            return Err(malformed_png("truncated PNG chunk header"));
         }
 
+        let mut length_bytes = [0u8; 4];
+        read_png_exact(reader, &mut length_bytes, "PNG chunk length")?;
         let length = u32::from_be_bytes(length_bytes);
         let mut chunk_type = [0u8; 4];
-        reader
-            .read_exact(&mut chunk_type)
-            .map_err(|error| error.to_string())?;
+        read_png_exact(reader, &mut chunk_type, "PNG chunk type")?;
+        offset = offset
+            .checked_add(8)
+            .ok_or_else(|| malformed_png("PNG offset overflow"))?;
+
+        if !saw_ihdr && &chunk_type != b"IHDR" {
+            return Err(malformed_png("IHDR must be the first chunk"));
+        }
+        if !chunk_type.iter().all(u8::is_ascii_alphabetic) || !chunk_type[2].is_ascii_uppercase() {
+            return Err(malformed_png("PNG chunk type is invalid"));
+        }
+        if length > 0x7fff_ffff {
+            return Err(malformed_png("PNG chunk length exceeds the 31-bit maximum"));
+        }
+        if chunk_type[0].is_ascii_uppercase()
+            && !matches!(&chunk_type, b"IHDR" | b"PLTE" | b"IDAT" | b"IEND")
+        {
+            return Err(malformed_png("unknown critical PNG chunk"));
+        }
+        if !matches!(&chunk_type, b"IDAT" | b"fdAT") && length > limits.max_png_chunk_bytes {
+            return Err(PipelineError::LimitExceeded {
+                resource: "png-chunk-bytes",
+                limit: u64::from(limits.max_png_chunk_bytes),
+                actual: u64::from(length),
+            });
+        }
+
+        let payload_and_crc = u64::from(length)
+            .checked_add(4)
+            .ok_or_else(|| malformed_png("PNG chunk length overflow"))?;
+        if payload_and_crc > file_length.saturating_sub(offset) {
+            return Err(malformed_png("truncated PNG chunk payload or CRC"));
+        }
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&chunk_type);
+
+        if matches!(
+            &chunk_type,
+            b"cHRM"
+                | b"cICP"
+                | b"gAMA"
+                | b"iCCP"
+                | b"mDCV"
+                | b"cLLI"
+                | b"sBIT"
+                | b"sRGB"
+                | b"bKGD"
+                | b"hIST"
+                | b"tRNS"
+                | b"eXIf"
+                | b"pHYs"
+                | b"tIME"
+        ) && !seen_singleton_ancillary_chunks.insert(chunk_type)
+        {
+            return Err(malformed_png(format!(
+                "duplicate {} chunk",
+                String::from_utf8_lossy(&chunk_type)
+            )));
+        }
+
+        if matches!(
+            &chunk_type,
+            b"cHRM" | b"cICP" | b"gAMA" | b"iCCP" | b"mDCV" | b"cLLI" | b"sBIT" | b"sRGB"
+        ) && (saw_plte || saw_image_data)
+        {
+            return Err(malformed_png(format!(
+                "{} must precede PLTE and IDAT",
+                String::from_utf8_lossy(&chunk_type)
+            )));
+        }
+
+        if matches!(&chunk_type, b"eXIf" | b"pHYs" | b"sPLT") && saw_image_data {
+            return Err(malformed_png(format!(
+                "{} must precede IDAT",
+                String::from_utf8_lossy(&chunk_type)
+            )));
+        }
+
+        if matches!(&chunk_type, b"bKGD" | b"hIST" | b"tRNS") {
+            if saw_image_data {
+                return Err(malformed_png(format!(
+                    "{} must precede IDAT",
+                    String::from_utf8_lossy(&chunk_type)
+                )));
+            }
+            if &chunk_type == b"hIST" && !saw_plte {
+                return Err(malformed_png("hIST requires a preceding PLTE chunk"));
+            }
+            saw_palette_follower = true;
+        }
+
+        if &chunk_type == b"PLTE" {
+            if saw_plte {
+                return Err(malformed_png("duplicate PLTE chunk"));
+            }
+            if saw_image_data {
+                return Err(malformed_png("PLTE must precede IDAT"));
+            }
+            if saw_palette_follower {
+                return Err(malformed_png("PLTE must precede bKGD, hIST, and tRNS"));
+            }
+            if length == 0 || length % 3 != 0 || length > 768 {
+                return Err(malformed_png("PLTE length is invalid"));
+            }
+            if matches!(color_type, Some(0) | Some(4)) {
+                return Err(malformed_png("PLTE is forbidden for grayscale PNG"));
+            }
+            if color_type == Some(3) {
+                let max_entries = 1u32
+                    .checked_shl(u32::from(bit_depth.unwrap_or_default()))
+                    .unwrap_or(0);
+                if length / 3 > max_entries {
+                    return Err(malformed_png(
+                        "PLTE has more entries than indexed bit depth permits",
+                    ));
+                }
+            }
+            saw_plte = true;
+        }
 
         match &chunk_type {
             b"IHDR" => {
-                let data = read_png_chunk_payload(&mut reader, length)?;
-                if data.len() >= 8 {
-                    width = Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
-                    height = Some(u32::from_be_bytes([data[4], data[5], data[6], data[7]]));
+                if saw_ihdr {
+                    return Err(malformed_png("duplicate IHDR chunk"));
                 }
+                if length != 13 {
+                    return Err(malformed_png("IHDR length must be 13"));
+                }
+                let mut data = [0u8; 13];
+                read_png_exact(reader, &mut data, "IHDR payload")?;
+                crc.update(&data);
+                let parsed_width = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                let parsed_height = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                if parsed_width == 0 || parsed_height == 0 {
+                    return Err(malformed_png("IHDR dimensions must be non-zero"));
+                }
+                checked_rgba_bytes(parsed_width, parsed_height, limits)?;
+                let parsed_bit_depth = data[8];
+                let parsed_color_type = data[9];
+                let valid_bit_depth = match parsed_color_type {
+                    0 => matches!(parsed_bit_depth, 1 | 2 | 4 | 8 | 16),
+                    2 | 4 | 6 => matches!(parsed_bit_depth, 8 | 16),
+                    3 => matches!(parsed_bit_depth, 1 | 2 | 4 | 8),
+                    _ => false,
+                };
+                if !valid_bit_depth || data[10] != 0 || data[11] != 0 || data[12] > 1 {
+                    return Err(malformed_png("IHDR control fields are invalid"));
+                }
+                width = Some(parsed_width);
+                height = Some(parsed_height);
+                bit_depth = Some(parsed_bit_depth);
+                color_type = Some(parsed_color_type);
+                saw_ihdr = true;
             }
             b"acTL" => {
-                let data = read_png_chunk_payload(&mut reader, length)?;
-                saw_animation_control = true;
-                if data.len() >= 4 {
-                    frame_count =
-                        Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64);
+                if saw_animation_control {
+                    return Err(malformed_png("duplicate acTL chunk"));
                 }
+                if saw_image_data {
+                    return Err(malformed_png("acTL must precede IDAT"));
+                }
+                if length != 8 {
+                    return Err(malformed_png("acTL length must be 8"));
+                }
+                let mut data = [0u8; 8];
+                read_png_exact(reader, &mut data, "acTL payload")?;
+                crc.update(&data);
+                saw_animation_control = true;
+                let parsed_frame_count = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                let parsed_play_count = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                if parsed_frame_count == 0 {
+                    return Err(malformed_png("acTL frame count must be non-zero"));
+                }
+                if parsed_frame_count > limits.max_frame_count {
+                    return Err(PipelineError::LimitExceeded {
+                        resource: "frame-count",
+                        limit: u64::from(limits.max_frame_count),
+                        actual: u64::from(parsed_frame_count),
+                    });
+                }
+                if parsed_play_count > i32::MAX as u32 {
+                    return Err(malformed_png("acTL play count exceeds PNG integer range"));
+                }
+                frame_count = Some(u64::from(parsed_frame_count));
             }
             b"fcTL" => {
-                let data = read_png_chunk_payload(&mut reader, length)?;
-                if data.len() >= 26 {
-                    let delay_num = u16::from_be_bytes([data[20], data[21]]);
-                    let delay_den = u16::from_be_bytes([data[22], data[23]]);
-                    let denominator = if delay_den == 0 { 100 } else { delay_den };
-                    let delay = if delay_num == 0 {
-                        0.01
-                    } else {
-                        f64::from(delay_num) / f64::from(denominator)
-                    };
-                    frame_durations.push(delay);
+                if pending_frame_data.is_some() {
+                    return Err(malformed_png("fcTL was not followed by frame data"));
+                }
+                if length != 26 {
+                    return Err(malformed_png("fcTL length must be 26"));
+                }
+                let mut data = [0u8; 26];
+                read_png_exact(reader, &mut data, "fcTL payload")?;
+                crc.update(&data);
+                let sequence = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                if sequence != expected_apng_sequence {
+                    return Err(malformed_png("APNG sequence number is out of order"));
+                }
+                expected_apng_sequence = expected_apng_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| malformed_png("APNG sequence number overflow"))?;
+                let frame_width = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                let frame_height = u32::from_be_bytes(data[8..12].try_into().unwrap());
+                let frame_x = u32::from_be_bytes(data[12..16].try_into().unwrap());
+                let frame_y = u32::from_be_bytes(data[16..20].try_into().unwrap());
+                let canvas_width = width.ok_or_else(|| malformed_png("missing IHDR width"))?;
+                let canvas_height = height.ok_or_else(|| malformed_png("missing IHDR height"))?;
+                let frame_right = frame_x
+                    .checked_add(frame_width)
+                    .ok_or_else(|| malformed_png("fcTL horizontal rectangle overflow"))?;
+                let frame_bottom = frame_y
+                    .checked_add(frame_height)
+                    .ok_or_else(|| malformed_png("fcTL vertical rectangle overflow"))?;
+                if frame_width == 0
+                    || frame_height == 0
+                    || frame_right > canvas_width
+                    || frame_bottom > canvas_height
+                {
+                    return Err(malformed_png("fcTL frame rectangle is outside the canvas"));
+                }
+                if !saw_image_data
+                    && frame_control_count == 0
+                    && (frame_width != canvas_width
+                        || frame_height != canvas_height
+                        || frame_x != 0
+                        || frame_y != 0)
+                {
+                    return Err(malformed_png(
+                        "the first animated IDAT frame must cover the full canvas",
+                    ));
+                }
+                if data[24] > 2 || data[25] > 1 {
+                    return Err(malformed_png("fcTL dispose or blend operation is invalid"));
+                }
+                let next_frame_control_count = frame_control_count.saturating_add(1);
+                if next_frame_control_count > u64::from(limits.max_frame_count) {
+                    return Err(PipelineError::LimitExceeded {
+                        resource: "frame-count",
+                        limit: u64::from(limits.max_frame_count),
+                        actual: next_frame_control_count,
+                    });
+                }
+                frame_control_count = next_frame_control_count;
+                let delay_num = u16::from_be_bytes([data[20], data[21]]);
+                let delay_den = u16::from_be_bytes([data[22], data[23]]);
+                let denominator = if delay_den == 0 { 100 } else { delay_den };
+                let delay = if delay_num == 0 {
+                    0.01
+                } else {
+                    f64::from(delay_num) / f64::from(denominator)
+                };
+                frame_durations.push(delay);
+                pending_frame_data = Some(if saw_image_data { "fdAT" } else { "IDAT" });
+                active_fdat_frame = false;
+            }
+            b"IDAT" => {
+                if color_type == Some(3) && !saw_plte {
+                    return Err(malformed_png("indexed PNG requires PLTE before IDAT"));
+                }
+                if saw_fdat {
+                    return Err(malformed_png("IDAT cannot follow fdAT"));
+                }
+                if saw_image_data && !last_chunk_was_idat {
+                    return Err(malformed_png("IDAT chunks must be consecutive"));
+                }
+                if pending_frame_data == Some("fdAT") {
+                    return Err(malformed_png("frame requires fdAT data"));
+                }
+                if pending_frame_data == Some("IDAT") && length > 0 {
+                    pending_frame_data = None;
+                }
+                saw_image_data = true;
+                if length > 0 {
+                    saw_nonempty_idat = true;
+                }
+                let mut remaining = usize::try_from(length)
+                    .map_err(|_| malformed_png("IDAT length is not addressable"))?;
+                let mut scratch = [0u8; SCRATCH_BYTES];
+                while remaining > 0 {
+                    checkpoint()?;
+                    let count = remaining.min(scratch.len());
+                    read_png_exact(reader, &mut scratch[..count], "IDAT payload")?;
+                    crc.update(&scratch[..count]);
+                    remaining -= count;
                 }
             }
-            b"IDAT" if !saw_animation_control => {
-                return Ok(None);
+            b"fdAT" => {
+                if !saw_animation_control {
+                    return Err(malformed_png("fdAT requires a preceding acTL chunk"));
+                }
+                if !saw_image_data {
+                    return Err(malformed_png("fdAT cannot precede IDAT"));
+                }
+                if length < 4 {
+                    return Err(malformed_png("fdAT length must include a sequence number"));
+                }
+                if pending_frame_data == Some("IDAT") {
+                    return Err(malformed_png("frame requires IDAT data"));
+                }
+                if pending_frame_data != Some("fdAT") && !active_fdat_frame {
+                    return Err(malformed_png("fdAT requires a preceding fcTL chunk"));
+                }
+                let mut sequence_bytes = [0u8; 4];
+                read_png_exact(reader, &mut sequence_bytes, "fdAT sequence number")?;
+                crc.update(&sequence_bytes);
+                let sequence = u32::from_be_bytes(sequence_bytes);
+                if sequence != expected_apng_sequence {
+                    return Err(malformed_png("APNG sequence number is out of order"));
+                }
+                expected_apng_sequence = expected_apng_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| malformed_png("APNG sequence number overflow"))?;
+                let mut remaining = usize::try_from(length - 4)
+                    .map_err(|_| malformed_png("fdAT length is not addressable"))?;
+                let mut scratch = [0u8; SCRATCH_BYTES];
+                while remaining > 0 {
+                    checkpoint()?;
+                    let count = remaining.min(scratch.len());
+                    read_png_exact(reader, &mut scratch[..count], "fdAT payload")?;
+                    crc.update(&scratch[..count]);
+                    remaining -= count;
+                }
+                if length > 4 {
+                    pending_frame_data = None;
+                }
+                active_fdat_frame = true;
+                saw_fdat = true;
             }
             b"IEND" => {
-                skip_png_chunk_payload(&mut reader, length)?;
-                break;
+                if length != 0 {
+                    return Err(malformed_png("IEND length must be zero"));
+                }
+                if !saw_image_data || !saw_nonempty_idat {
+                    return Err(malformed_png("IEND requires non-empty IDAT data"));
+                }
+                if pending_frame_data.is_some() {
+                    return Err(malformed_png("fcTL was not followed by frame data"));
+                }
+                saw_iend = true;
             }
             _ => {
-                skip_png_chunk_payload(&mut reader, length)?;
+                let mut remaining = usize::try_from(length)
+                    .map_err(|_| malformed_png("PNG chunk length is not addressable"))?;
+                let mut scratch = [0u8; SCRATCH_BYTES];
+                while remaining > 0 {
+                    checkpoint()?;
+                    let count = remaining.min(scratch.len());
+                    read_png_exact(reader, &mut scratch[..count], "PNG chunk payload")?;
+                    crc.update(&scratch[..count]);
+                    remaining -= count;
+                }
             }
         }
+
+        let mut stored_crc = [0u8; 4];
+        read_png_exact(reader, &mut stored_crc, "PNG chunk CRC")?;
+        let expected_crc = u32::from_be_bytes(stored_crc);
+        let actual_crc = crc.finalize();
+        if actual_crc != expected_crc {
+            return Err(malformed_png(format!(
+                "CRC mismatch for {} chunk",
+                String::from_utf8_lossy(&chunk_type)
+            )));
+        }
+        offset = offset
+            .checked_add(payload_and_crc)
+            .ok_or_else(|| malformed_png("PNG offset overflow"))?;
+        last_chunk_was_idat = &chunk_type == b"IDAT";
     }
 
+    if offset < file_length {
+        warnings.push("png-trailing-bytes".into());
+    }
+    if !saw_animation_control && frame_control_count > 0 {
+        return Err(malformed_png("fcTL requires an acTL chunk before IDAT"));
+    }
     if !saw_animation_control {
-        return Ok(None);
+        return Ok(PngFileMetadata {
+            animation: None,
+            warnings,
+        });
+    }
+    if frame_count != Some(frame_control_count) {
+        return Err(malformed_png("fcTL count does not match acTL frame count"));
     }
 
-    Ok(Some(PngAnimationMetadata {
-        width: width.unwrap_or(0),
-        height: height.unwrap_or(0),
-        frame_count,
-        frame_durations,
-    }))
+    Ok(PngFileMetadata {
+        animation: Some(PngAnimationMetadata {
+            width: width.ok_or_else(|| malformed_png("missing IHDR width"))?,
+            height: height.ok_or_else(|| malformed_png("missing IHDR height"))?,
+            frame_count,
+            frame_durations,
+            warnings: warnings.clone(),
+        }),
+        warnings,
+    })
+}
+
+fn read_png_metadata(
+    input_path: &Path,
+    limits: MediaLimits,
+    checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<PngFileMetadata, PipelineError> {
+    let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+        operation: "open PNG input",
+        message: error.to_string(),
+    })?;
+    let metadata = file.metadata().map_err(|error| PipelineError::Io {
+        operation: "read PNG input metadata",
+        message: error.to_string(),
+    })?;
+    let file_length = validate_file_metadata(metadata, limits)?.len();
+    let mut reader = BufReader::new(&mut file);
+    read_png_metadata_from_reader(&mut reader, file_length, limits, checkpoint)
+}
+
+fn read_png_animation_metadata(
+    input_path: &Path,
+    limits: MediaLimits,
+    checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<Option<PngAnimationMetadata>, PipelineError> {
+    read_png_metadata(input_path, limits, checkpoint).map(|metadata| metadata.animation)
 }
 
 fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
-    let metadata = match fs::metadata(input_path) {
-        Ok(metadata) => metadata,
+    let limits = MediaLimits::default();
+    let (reader, metadata) = match open_limited_image_reader(input_path, limits) {
+        Ok(result) => result,
         Err(error) => {
             return inspection_error(
                 input_path,
                 Some("native".into()),
                 None,
                 Some(locale::native_image_detail(locale)),
-                "inspect-failed",
-                error.to_string(),
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
             );
         }
     };
 
-    let reader = match ImageReader::open(input_path) {
-        Ok(reader) => reader,
-        Err(error) => {
-            return inspection_error(
-                input_path,
-                Some("native".into()),
-                None,
-                Some(locale::native_image_detail(locale)),
-                "inspect-failed",
-                error.to_string(),
-            );
-        }
-    };
-
-    let (width, height) = match reader.into_dimensions() {
+    let dimensions = run_decoder_boundary("image", || {
+        let decoder = reader
+            .into_decoder()
+            .map_err(|error| image_decoder_error("image", error, limits))?;
+        let dimensions = decoder.dimensions();
+        checked_rgba_bytes(dimensions.0, dimensions.1, limits)?;
+        Ok(dimensions)
+    });
+    let (width, height) = match dimensions {
         Ok(dimensions) => dimensions,
         Err(error) => {
             return inspection_error(
@@ -3145,8 +4776,8 @@ fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> 
                 Some("native".into()),
                 None,
                 Some(locale::native_image_detail(locale)),
-                "inspect-failed",
-                error.to_string(),
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
             );
         }
     };
@@ -3156,6 +4787,7 @@ fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> 
     MediaInspection {
         ok: true,
         input_path: input_path.to_string(),
+        source_revision: None,
         tool_source: Some("native".into()),
         tool_command: None,
         tool_detail: Some(locale::native_image_detail(locale)),
@@ -3170,8 +4802,10 @@ fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> 
         frame_rate_label: None,
         estimated_frames: None,
         frame_durations_seconds: None,
+        warnings: Vec::new(),
         is_static_image: true,
         can_convert_to_png: true,
+        reason_code: None,
         error_code: None,
         error_message: None,
     }
@@ -3181,18 +4815,19 @@ fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIns
     let metadata = match fs::metadata(input_path) {
         Ok(metadata) => metadata,
         Err(error) => {
+            let error = pipeline_io_error("read GIF input metadata", error);
             return inspection_error(
                 input_path,
                 Some("native".into()),
                 None,
                 Some(locale::native_animation_detail(locale, "gif")),
-                "inspect-failed",
-                error.to_string(),
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
             );
         }
     };
 
-    let frames = match decode_gif_animation_frames(input_path) {
+    let frames = match decode_gif_animation_frames(input_path, MediaLimits::default(), || Ok(())) {
         Ok(frames) => frames,
         Err(error) => {
             return inspection_error(
@@ -3200,8 +4835,8 @@ fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIns
                 Some("native".into()),
                 None,
                 Some(locale::native_animation_detail(locale, "gif")),
-                "inspect-failed",
-                error,
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
             );
         }
     };
@@ -3242,6 +4877,7 @@ fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIns
     MediaInspection {
         ok: true,
         input_path: input_path.to_string(),
+        source_revision: None,
         tool_source: Some("native".into()),
         tool_command: None,
         tool_detail: Some(locale::native_animation_detail(locale, "gif")),
@@ -3256,49 +4892,63 @@ fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIns
         frame_rate_label: avg_fps.map(|fps| format!("{fps:.2}")),
         estimated_frames: Some(estimated_frames),
         frame_durations_seconds: Some(frame_durations),
+        warnings: Vec::new(),
         is_static_image: false,
         can_convert_to_png: false,
+        reason_code: None,
         error_code: None,
         error_message: None,
     }
 }
 
-fn inspect_apng_metadata_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
+fn inspect_apng_metadata_internal(
+    input_path: &str,
+    locale: UiLocale,
+    preparsed_metadata: Option<PngAnimationMetadata>,
+) -> MediaInspection {
     let metadata = match fs::metadata(input_path) {
         Ok(metadata) => metadata,
         Err(error) => {
+            let error = pipeline_io_error("read APNG input metadata", error);
             return inspection_error(
                 input_path,
                 Some("native".into()),
                 None,
                 Some(locale::native_animation_detail(locale, "apng")),
-                "inspect-failed",
-                error.to_string(),
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
             );
         }
     };
 
-    let animation_metadata = match read_png_animation_metadata(Path::new(input_path)) {
-        Ok(Some(metadata)) => metadata,
-        Ok(None) => {
-            return inspection_error(
-                input_path,
-                Some("native".into()),
-                None,
-                Some(locale::native_animation_detail(locale, "apng")),
-                "inspect-failed",
-                locale::invalid_apng_error(locale),
-            );
-        }
-        Err(error) => {
-            return inspection_error(
-                input_path,
-                Some("native".into()),
-                None,
-                Some(locale::native_animation_detail(locale, "apng")),
-                "inspect-failed",
-                error.to_string(),
-            );
+    let animation_metadata = match preparsed_metadata {
+        Some(metadata) => metadata,
+        None => {
+            match read_png_animation_metadata(Path::new(input_path), MediaLimits::default(), || {
+                Ok(())
+            }) {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => {
+                    return inspection_error(
+                        input_path,
+                        Some("native".into()),
+                        None,
+                        Some(locale::native_animation_detail(locale, "apng")),
+                        "malformed-media",
+                        locale::invalid_apng_error(locale),
+                    );
+                }
+                Err(error) => {
+                    return inspection_error(
+                        input_path,
+                        Some("native".into()),
+                        None,
+                        Some(locale::native_animation_detail(locale, "apng")),
+                        error.code(),
+                        pipeline_error_diagnostic(&error, locale),
+                    );
+                }
+            }
         }
     };
 
@@ -3346,12 +4996,23 @@ fn inspect_apng_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIn
         None
     };
 
+    let tool_detail = if animation_metadata.warnings.is_empty() {
+        locale::native_animation_detail(locale, "apng")
+    } else {
+        format!(
+            "{} ({})",
+            locale::native_animation_detail(locale, "apng"),
+            animation_metadata.warnings.join(", ")
+        )
+    };
+
     MediaInspection {
         ok: true,
         input_path: input_path.to_string(),
+        source_revision: None,
         tool_source: Some("native".into()),
         tool_command: None,
-        tool_detail: Some(locale::native_animation_detail(locale, "apng")),
+        tool_detail: Some(tool_detail),
         format_name: Some("apng".into()),
         duration_seconds: Some(duration_seconds),
         size_bytes: Some(metadata.len()),
@@ -3363,8 +5024,10 @@ fn inspect_apng_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIn
         frame_rate_label: avg_fps.map(|fps| format!("{fps:.2}")),
         estimated_frames: Some(estimated_frames),
         frame_durations_seconds: Some(animation_metadata.frame_durations),
+        warnings: animation_metadata.warnings,
         is_static_image: false,
         can_convert_to_png: false,
+        reason_code: None,
         error_code: None,
         error_message: None,
     }
@@ -3394,7 +5057,7 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
                 None,
                 Some(detail),
                 "inspect-failed",
-                com_result.to_string(),
+                locale::media_pipeline_diagnostic(locale, "malformed-media"),
             );
         }
 
@@ -3446,6 +5109,7 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
             Ok(MediaInspection {
                 ok: true,
                 input_path: input_path.to_string(),
+                source_revision: None,
                 tool_source: Some("native".into()),
                 tool_command: None,
                 tool_detail: Some(locale::native_video_detail(locale, &format_name)),
@@ -3460,8 +5124,10 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
                 frame_rate_label: avg_fps.map(|fps| format!("{fps:.2}")),
                 estimated_frames,
                 frame_durations_seconds: None,
+                warnings: Vec::new(),
                 is_static_image: false,
                 can_convert_to_png: false,
+                reason_code: None,
                 error_code: None,
                 error_message: None,
             })
@@ -3479,13 +5145,13 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
 
     match result {
         Ok(inspection) => inspection,
-        Err(error) => inspection_error(
+        Err(_) => inspection_error(
             input_path,
             Some("native".into()),
             None,
             Some(locale::native_video_detail(locale, &format_name)),
             "inspect-failed",
-            error,
+            locale::media_pipeline_diagnostic(locale, "malformed-media"),
         ),
     }
 }
@@ -3498,14 +5164,14 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
 fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspection {
     let tool = match resolve_tool("ffmpeg", locale) {
         Ok(tool) => tool,
-        Err(error) => {
+        Err(_) => {
             return inspection_error(
                 input_path,
                 Some("missing".into()),
                 None,
                 None,
                 "tool-unavailable",
-                error,
+                locale::media_pipeline_diagnostic(locale, "tool-missing"),
             );
         }
     };
@@ -3525,19 +5191,30 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
 
     let mut command = Command::new(&tool.command);
     configure_child_process(&mut command);
+    // Task 9 replaces this direct child buffering with the shared bounded
+    // stdout/stderr streaming and kill/reap process runner.
     let output = match command.args(args).output() {
         Ok(output) => output,
-        Err(error) => {
+        Err(_) => {
             return inspection_error(
                 input_path,
                 Some("sidecar".into()),
                 Some(tool.command_display.clone()),
                 tool.fallback_reason.clone(),
-                "tool-unavailable",
-                error.to_string(),
+                "process-failed",
+                locale::media_pipeline_diagnostic(locale, "process-failed"),
             );
         }
     };
+    if let Some(failure) = ffmpeg_inspection_process_failure(
+        input_path,
+        &tool,
+        output.status.success(),
+        &output.stderr,
+        locale,
+    ) {
+        return failure;
+    }
 
     static FORMAT_REGEX: OnceLock<Regex> = OnceLock::new();
     static DURATION_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -3565,11 +5242,7 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
     let stream_captures = match stream_regex.captures(&stderr) {
         Some(captures) => captures,
         None => {
-            let message = if output.status.success() {
-                locale::no_usable_video_stream_error(locale)
-            } else {
-                String::from_utf8_lossy(&output.stderr).trim().to_string()
-            };
+            let message = ffmpeg_inspection_failure_diagnostic(locale, output.status.success());
 
             return inspection_error(
                 input_path,
@@ -3605,6 +5278,7 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
     MediaInspection {
         ok: true,
         input_path: input_path.to_string(),
+        source_revision: None,
         tool_source: Some("sidecar".into()),
         tool_command: Some(tool.command_display),
         tool_detail: tool.fallback_reason,
@@ -3619,14 +5293,16 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
         frame_rate_label: avg_fps.map(|fps| format!("{fps:.2}")),
         estimated_frames,
         frame_durations_seconds: None,
+        warnings: Vec::new(),
         is_static_image: false,
         can_convert_to_png: false,
+        reason_code: None,
         error_code: None,
         error_message: None,
     }
 }
 
-fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
+fn inspect_input_media_canonical_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
     let Some(extension) = lowercase_source_extension(input_path) else {
         return inspection_error(
             input_path,
@@ -3639,14 +5315,26 @@ fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInsp
     };
 
     if extension == "png" {
-        if matches!(
-            read_png_animation_metadata(Path::new(input_path)),
-            Ok(Some(_))
-        ) {
-            return inspect_apng_metadata_internal(input_path, locale);
+        match read_png_metadata(Path::new(input_path), MediaLimits::default(), || Ok(())) {
+            Ok(metadata) => {
+                if let Some(animation) = metadata.animation {
+                    return inspect_apng_metadata_internal(input_path, locale, Some(animation));
+                }
+                let mut inspection = inspect_still_image_metadata_internal(input_path, locale);
+                inspection.warnings = metadata.warnings;
+                return inspection;
+            }
+            Err(error) => {
+                return inspection_error(
+                    input_path,
+                    Some("native".into()),
+                    None,
+                    Some(locale::native_image_detail(locale)),
+                    error.code(),
+                    pipeline_error_diagnostic(&error, locale),
+                );
+            }
         }
-
-        return inspect_still_image_metadata_internal(input_path, locale);
     }
 
     if is_supported_static_image_extension(&extension) {
@@ -3658,7 +5346,7 @@ fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInsp
     }
 
     if extension == "apng" {
-        return inspect_apng_metadata_internal(input_path, locale);
+        return inspect_apng_metadata_internal(input_path, locale, None);
     }
 
     if matches!(extension.as_str(), "mp4" | "m4v" | "mov") {
@@ -3679,6 +5367,38 @@ fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInsp
     )
 }
 
+fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
+    let limits = MediaLimits::default();
+    let identity = match SourceIdentity::from_path(Path::new(input_path), limits) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return inspection_error(
+                input_path,
+                Some("native".into()),
+                None,
+                None,
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
+            );
+        }
+    };
+    let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
+    let inspection = inspect_input_media_canonical_internal(&canonical_path, locale);
+    let inspection = apply_inspection_source_revision(&identity, input_path, inspection);
+    let inspection = enforce_desktop_inspection_frame_limit(inspection, locale);
+    let tool_detail = inspection.tool_detail.clone();
+    finalize_source_checked(&identity, inspection, limits, |error| {
+        inspection_error(
+            input_path,
+            Some("native".into()),
+            None,
+            tool_detail,
+            error.code(),
+            pipeline_error_diagnostic(&error, locale),
+        )
+    })
+}
+
 fn check_media_tools_internal(locale: UiLocale) -> ToolHealthReport {
     let ffmpeg = check_tool("ffmpeg", locale);
     let ready = ffmpeg.available;
@@ -3696,11 +5416,11 @@ async fn check_media_tools(locale: Option<String>) -> ToolHealthReport {
 
     match run_blocking_task(move || check_media_tools_internal(locale)).await {
         Ok(report) => report,
-        Err(error) => ToolHealthReport {
+        Err(_) => ToolHealthReport {
             ready: false,
             checks: Vec::new(),
             summary: format!(
-                "{} {} ({error})",
+                "{} {}",
                 locale::tool_health_check_failed_summary(locale),
                 locale::internal_task_error_message(locale)
             ),
@@ -3715,9 +5435,10 @@ async fn inspect_input_media(input_path: String, locale: Option<String>) -> Medi
 
     match run_blocking_task(move || inspect_input_media_internal(&input_path, locale)).await {
         Ok(result) => result,
-        Err(error) => MediaInspection {
+        Err(_) => MediaInspection {
             ok: false,
             input_path: input_path_for_error,
+            source_revision: None,
             tool_source: None,
             tool_command: None,
             tool_detail: None,
@@ -3732,13 +5453,12 @@ async fn inspect_input_media(input_path: String, locale: Option<String>) -> Medi
             frame_rate_label: None,
             estimated_frames: None,
             frame_durations_seconds: None,
+            warnings: Vec::new(),
             is_static_image: false,
             can_convert_to_png: false,
+            reason_code: None,
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(format!(
-                "{} ({error})",
-                locale::internal_task_error_message(locale)
-            )),
+            error_message: Some(locale::internal_task_error_message(locale)),
         },
     }
 }
@@ -3750,7 +5470,7 @@ async fn build_optimizer_plan(request: OptimizerPlanRequest) -> OptimizerPlanRes
 
     match run_blocking_task(move || prepare_optimizer_plan(&request, locale)).await {
         Ok(result) => result,
-        Err(error) => OptimizerPlanResponse {
+        Err(_) => OptimizerPlanResponse {
             ok: false,
             fit_mode: CANONICAL_FIT_MODE.into(),
             selected_duration_seconds: None,
@@ -3758,11 +5478,9 @@ async fn build_optimizer_plan(request: OptimizerPlanRequest) -> OptimizerPlanRes
             search_budget: MAX_SEARCH_BUDGET,
             warnings: fallback_fit_warning.into_iter().collect(),
             candidates: Vec::new(),
+            reason_code: None,
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(format!(
-                "{} ({error})",
-                locale::internal_task_error_message(locale)
-            )),
+            error_message: Some(locale::internal_task_error_message(locale)),
         },
     }
 }
@@ -3774,17 +5492,28 @@ async fn convert_static_image_to_png(
     let locale = parse_ui_locale(request.locale.as_deref());
 
     match run_blocking_task(move || {
-        convert_static_image_to_png_internal(
-            &request.input_path,
+        let identity = match validate_source_revision(
+            Path::new(&request.input_path),
+            request.source_revision.as_deref(),
+            MediaLimits::default(),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return static_conversion_pipeline_error(&error, locale),
+        };
+        let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
+        let response = convert_static_image_to_png_internal(
+            &canonical_path,
             request.output_directory.as_deref(),
             request.crop_region.as_ref(),
             locale,
-        )
+            Some(&identity),
+        );
+        finalize_static_conversion_source(&identity, response, locale)
     })
     .await
     {
         Ok(result) => result,
-        Err(error) => StaticImageConversionResult {
+        Err(_) => StaticImageConversionResult {
             ok: false,
             output_path: None,
             size_bytes: None,
@@ -3793,29 +5522,72 @@ async fn convert_static_image_to_png(
             tool_command: None,
             tool_detail: None,
             warnings: Vec::new(),
+            reason_code: None,
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(format!(
-                "{} ({error})",
-                locale::internal_task_error_message(locale)
-            )),
+            error_message: Some(locale::internal_task_error_message(locale)),
         },
     }
 }
 
+fn optimizer_search_pipeline_error(
+    locale: UiLocale,
+    warnings: Vec<String>,
+    error: PipelineError,
+) -> OptimizerSearchResponse {
+    OptimizerSearchResponse {
+        ok: false,
+        fit_mode: CANONICAL_FIT_MODE.into(),
+        selected_duration_seconds: None,
+        limit_bytes: DISCORD_MAX_STICKER_BYTES,
+        search_budget: MAX_SEARCH_BUDGET,
+        real_attempt_count: 0,
+        stop_reason: Some(error.code().into()),
+        selection_reason: "no_fit_found".into(),
+        summary: locale::optimizer_search_summary(locale, "no_fit_found"),
+        warnings,
+        attempts: Vec::new(),
+        winning_candidate_id: None,
+        closest_candidate_id: None,
+        best_output_path: None,
+        best_size_bytes: None,
+        best_within_limit: false,
+        reason_code: error.reason_code().map(str::to_string),
+        error_code: Some(error.code().into()),
+        error_message: Some(pipeline_error_diagnostic(&error, locale)),
+    }
+}
+
 fn run_optimizer_search_internal(
-    request: OptimizerSearchRequest,
+    mut request: OptimizerSearchRequest,
     locale: UiLocale,
 ) -> OptimizerSearchResponse {
     let (_, legacy_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
     let legacy_fit_warnings = legacy_fit_warning.into_iter().collect::<Vec<_>>();
-    let optimizer_goal = normalized_optimizer_goal(
-        request.optimizer_goal.as_deref(),
-        request.preset_strategy.as_deref(),
-    );
-    let quality_frame_drop_interval =
-        normalized_quality_frame_drop_interval(request.quality_frame_drop_interval);
-    let resolved_timeline_frames =
-        match resolve_timeline_frames(request.timeline_frames.as_ref(), request.base_frame_count) {
+    let source_identity = match validate_source_revision(
+        Path::new(&request.input_path),
+        request.source_revision.as_deref(),
+        MediaLimits::default(),
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return optimizer_search_pipeline_error(locale, legacy_fit_warnings, error);
+        }
+    };
+    request.input_path = source_identity
+        .canonical_path
+        .to_string_lossy()
+        .into_owned();
+    let response = (|| {
+        let optimizer_goal = normalized_optimizer_goal(
+            request.optimizer_goal.as_deref(),
+            request.preset_strategy.as_deref(),
+        );
+        let quality_frame_drop_interval =
+            normalized_quality_frame_drop_interval(request.quality_frame_drop_interval);
+        let resolved_timeline_frames = match resolve_timeline_frames(
+            request.timeline_frames.as_ref(),
+            request.base_frame_count,
+        ) {
             Ok(timeline_frames) => match (timeline_frames, optimizer_goal) {
                 (Some(timeline_frames), "quality") => {
                     match apply_quality_frame_drop_to_timeline_frames(
@@ -3841,7 +5613,8 @@ fn run_optimizer_search_internal(
                                 best_output_path: None,
                                 best_size_bytes: None,
                                 best_within_limit: false,
-                                error_code: Some(error.into()),
+                                reason_code: Some(error.into()),
+                                error_code: Some("invalid-request".into()),
                                 error_message: Some(locale::frame_selection_required_error(locale)),
                             };
                         }
@@ -3867,11 +5640,17 @@ fn run_optimizer_search_internal(
                     best_output_path: None,
                     best_size_bytes: None,
                     best_within_limit: false,
-                    error_code: Some("no-frames-selected".into()),
+                    reason_code: Some("no-frames-selected".into()),
+                    error_code: Some("invalid-request".into()),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 };
             }
-            Err(_) => {
+            Err(reason) => {
+                let error_message = if reason == "invalid-frame-duration" {
+                    locale::invalid_frame_duration_error(locale)
+                } else {
+                    locale::invalid_frame_selection_error(locale)
+                };
                 return OptimizerSearchResponse {
                     ok: false,
                     fit_mode: CANONICAL_FIT_MODE.into(),
@@ -3879,7 +5658,7 @@ fn run_optimizer_search_internal(
                     limit_bytes: DISCORD_MAX_STICKER_BYTES,
                     search_budget: MAX_SEARCH_BUDGET,
                     real_attempt_count: 0,
-                    stop_reason: Some("invalid-frame-selection".into()),
+                    stop_reason: Some(reason.into()),
                     selection_reason: "no_fit_found".into(),
                     summary: locale::plan_failed_message(locale),
                     warnings: legacy_fit_warnings.clone(),
@@ -3889,371 +5668,410 @@ fn run_optimizer_search_internal(
                     best_output_path: None,
                     best_size_bytes: None,
                     best_within_limit: false,
-                    error_code: Some("invalid-frame-selection".into()),
-                    error_message: Some(locale::invalid_frame_selection_error(locale)),
+                    reason_code: Some(reason.into()),
+                    error_code: Some("invalid-request".into()),
+                    error_message: Some(error_message),
                 };
             }
         };
 
-    let legacy_selected_frames = if resolved_timeline_frames.is_none() {
-        Some(
-            match resolve_frame_selection(
-                request.selected_frames.as_ref(),
-                request.base_frame_count,
-            ) {
-                Ok(selection) => {
-                    let selection = if optimizer_goal == "quality" {
-                        match apply_quality_frame_drop_to_selection(
-                            selection,
-                            quality_frame_drop_interval,
-                        ) {
-                            Ok(selection) => selection,
-                            Err(error) => {
-                                return OptimizerSearchResponse {
-                                    ok: false,
-                                    fit_mode: CANONICAL_FIT_MODE.into(),
-                                    selected_duration_seconds: None,
-                                    limit_bytes: DISCORD_MAX_STICKER_BYTES,
-                                    search_budget: MAX_SEARCH_BUDGET,
-                                    real_attempt_count: 0,
-                                    stop_reason: Some(error.into()),
-                                    selection_reason: "no_fit_found".into(),
-                                    summary: locale::plan_failed_message(locale),
-                                    warnings: legacy_fit_warnings.clone(),
-                                    attempts: Vec::new(),
-                                    winning_candidate_id: None,
-                                    closest_candidate_id: None,
-                                    best_output_path: None,
-                                    best_size_bytes: None,
-                                    best_within_limit: false,
-                                    error_code: Some(error.into()),
-                                    error_message: Some(locale::frame_selection_required_error(
-                                        locale,
-                                    )),
-                                };
+        let legacy_selected_frames = if resolved_timeline_frames.is_none() {
+            Some(
+                match resolve_frame_selection(
+                    request.selected_frames.as_ref(),
+                    request.base_frame_count,
+                ) {
+                    Ok(selection) => {
+                        let selection = if optimizer_goal == "quality" {
+                            match apply_quality_frame_drop_to_selection(
+                                selection,
+                                quality_frame_drop_interval,
+                            ) {
+                                Ok(selection) => selection,
+                                Err(error) => {
+                                    return OptimizerSearchResponse {
+                                        ok: false,
+                                        fit_mode: CANONICAL_FIT_MODE.into(),
+                                        selected_duration_seconds: None,
+                                        limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                                        search_budget: MAX_SEARCH_BUDGET,
+                                        real_attempt_count: 0,
+                                        stop_reason: Some(error.into()),
+                                        selection_reason: "no_fit_found".into(),
+                                        summary: locale::plan_failed_message(locale),
+                                        warnings: legacy_fit_warnings.clone(),
+                                        attempts: Vec::new(),
+                                        winning_candidate_id: None,
+                                        closest_candidate_id: None,
+                                        best_output_path: None,
+                                        best_size_bytes: None,
+                                        best_within_limit: false,
+                                        reason_code: Some(error.into()),
+                                        error_code: Some("invalid-request".into()),
+                                        error_message: Some(
+                                            locale::frame_selection_required_error(locale),
+                                        ),
+                                    };
+                                }
                             }
-                        }
-                    } else {
-                        selection
-                    };
+                        } else {
+                            selection
+                        };
 
-                    selection.selected_frames
-                }
-                Err("no-frames-selected") => {
-                    return OptimizerSearchResponse {
-                        ok: false,
-                        fit_mode: CANONICAL_FIT_MODE.into(),
-                        selected_duration_seconds: None,
-                        limit_bytes: DISCORD_MAX_STICKER_BYTES,
-                        search_budget: MAX_SEARCH_BUDGET,
-                        real_attempt_count: 0,
-                        stop_reason: Some("no-frames-selected".into()),
-                        selection_reason: "no_fit_found".into(),
-                        summary: locale::plan_failed_message(locale),
-                        warnings: legacy_fit_warnings.clone(),
-                        attempts: Vec::new(),
-                        winning_candidate_id: None,
-                        closest_candidate_id: None,
-                        best_output_path: None,
-                        best_size_bytes: None,
-                        best_within_limit: false,
-                        error_code: Some("no-frames-selected".into()),
-                        error_message: Some(locale::frame_selection_required_error(locale)),
-                    };
-                }
-                Err(_) => {
-                    return OptimizerSearchResponse {
-                        ok: false,
-                        fit_mode: CANONICAL_FIT_MODE.into(),
-                        selected_duration_seconds: None,
-                        limit_bytes: DISCORD_MAX_STICKER_BYTES,
-                        search_budget: MAX_SEARCH_BUDGET,
-                        real_attempt_count: 0,
-                        stop_reason: Some("invalid-frame-selection".into()),
-                        selection_reason: "no_fit_found".into(),
-                        summary: locale::plan_failed_message(locale),
-                        warnings: legacy_fit_warnings.clone(),
-                        attempts: Vec::new(),
-                        winning_candidate_id: None,
-                        closest_candidate_id: None,
-                        best_output_path: None,
-                        best_size_bytes: None,
-                        best_within_limit: false,
-                        error_code: Some("invalid-frame-selection".into()),
-                        error_message: Some(locale::invalid_frame_selection_error(locale)),
-                    };
-                }
-            },
-        )
-    } else {
-        None
-    };
-
-    let plan = prepare_optimizer_plan(
-        &OptimizerPlanRequest {
-            locale: request.locale.clone(),
-            source_duration_seconds: request.source_duration_seconds,
-            input_width: request.input_width,
-            input_height: request.input_height,
-            avg_fps: request.avg_fps,
-            fit_mode: request.fit_mode.clone(),
-            preset_strategy: request.preset_strategy.clone(),
-            optimizer_goal: request.optimizer_goal.clone(),
-            quality_frame_drop_interval: request.quality_frame_drop_interval,
-            search_depth: request.search_depth.clone(),
-            crop_region: request.crop_region.clone(),
-            selected_frames: request.selected_frames.clone(),
-            base_frame_count: request.base_frame_count,
-            timeline_frames: request.timeline_frames.clone(),
-        },
-        locale,
-    );
-
-    if !plan.ok {
-        return OptimizerSearchResponse {
-            ok: false,
-            fit_mode: plan.fit_mode,
-            selected_duration_seconds: None,
-            limit_bytes: DISCORD_MAX_STICKER_BYTES,
-            search_budget: MAX_SEARCH_BUDGET,
-            real_attempt_count: 0,
-            stop_reason: Some("plan-invalid".into()),
-            selection_reason: "no_fit_found".into(),
-            summary: plan
-                .error_message
-                .clone()
-                .unwrap_or_else(|| locale::plan_failed_message(locale)),
-            warnings: plan.warnings,
-            attempts: Vec::new(),
-            winning_candidate_id: None,
-            closest_candidate_id: None,
-            best_output_path: None,
-            best_size_bytes: None,
-            best_within_limit: false,
-            error_code: plan.error_code,
-            error_message: plan.error_message,
-        };
-    }
-
-    let mut attempts = Vec::new();
-    let mut best_within_limit_output: Option<SelectedEncodeOutput> = None;
-    let mut smallest_oversize_output: Option<SelectedEncodeOutput> = None;
-    let mut stopped_after_best_within_limit = false;
-    for candidate in &plan.candidates {
-        if remaining_candidate_cannot_beat_within_limit(
-            best_within_limit_output.as_ref(),
-            candidate,
-        ) {
-            stopped_after_best_within_limit = true;
-            break;
-        }
-
-        let sampled_legacy_frames = if resolved_timeline_frames.is_none() {
-            sampled_frame_indexes(
-                legacy_selected_frames
-                    .as_ref()
-                    .and_then(|frames| frames.as_deref()),
-                request.base_frame_count,
-                candidate.frame_sample_step,
+                        selection.selected_frames
+                    }
+                    Err("no-frames-selected") => {
+                        return OptimizerSearchResponse {
+                            ok: false,
+                            fit_mode: CANONICAL_FIT_MODE.into(),
+                            selected_duration_seconds: None,
+                            limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                            search_budget: MAX_SEARCH_BUDGET,
+                            real_attempt_count: 0,
+                            stop_reason: Some("no-frames-selected".into()),
+                            selection_reason: "no_fit_found".into(),
+                            summary: locale::plan_failed_message(locale),
+                            warnings: legacy_fit_warnings.clone(),
+                            attempts: Vec::new(),
+                            winning_candidate_id: None,
+                            closest_candidate_id: None,
+                            best_output_path: None,
+                            best_size_bytes: None,
+                            best_within_limit: false,
+                            reason_code: Some("no-frames-selected".into()),
+                            error_code: Some("invalid-request".into()),
+                            error_message: Some(locale::frame_selection_required_error(locale)),
+                        };
+                    }
+                    Err(_) => {
+                        return OptimizerSearchResponse {
+                            ok: false,
+                            fit_mode: CANONICAL_FIT_MODE.into(),
+                            selected_duration_seconds: None,
+                            limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                            search_budget: MAX_SEARCH_BUDGET,
+                            real_attempt_count: 0,
+                            stop_reason: Some("invalid-frame-selection".into()),
+                            selection_reason: "no_fit_found".into(),
+                            summary: locale::plan_failed_message(locale),
+                            warnings: legacy_fit_warnings.clone(),
+                            attempts: Vec::new(),
+                            winning_candidate_id: None,
+                            closest_candidate_id: None,
+                            best_output_path: None,
+                            best_size_bytes: None,
+                            best_within_limit: false,
+                            reason_code: Some("invalid-frame-selection".into()),
+                            error_code: Some("invalid-request".into()),
+                            error_message: Some(locale::invalid_frame_selection_error(locale)),
+                        };
+                    }
+                },
             )
         } else {
             None
         };
 
-        let encode_result = if let Some(timeline_frames) = resolved_timeline_frames.as_deref() {
-            encode_candidate_internal(
-                &request.input_path,
-                request.output_directory.as_deref(),
-                locale,
-                request.crop_region.as_ref(),
-                request.input_width,
-                request.input_height,
+        let plan = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: request.locale.clone(),
+                source_duration_seconds: request.source_duration_seconds,
+                input_width: request.input_width,
+                input_height: request.input_height,
+                avg_fps: request.avg_fps,
+                fit_mode: request.fit_mode.clone(),
+                preset_strategy: request.preset_strategy.clone(),
+                optimizer_goal: request.optimizer_goal.clone(),
+                quality_frame_drop_interval: request.quality_frame_drop_interval,
+                search_depth: request.search_depth.clone(),
+                crop_region: request.crop_region.clone(),
+                selected_frames: request.selected_frames.clone(),
+                base_frame_count: request.base_frame_count,
+                timeline_frames: request.timeline_frames.clone(),
+            },
+            locale,
+        );
+
+        if !plan.ok {
+            return OptimizerSearchResponse {
+                ok: false,
+                fit_mode: plan.fit_mode,
+                selected_duration_seconds: None,
+                limit_bytes: DISCORD_MAX_STICKER_BYTES,
+                search_budget: MAX_SEARCH_BUDGET,
+                real_attempt_count: 0,
+                stop_reason: Some("plan-invalid".into()),
+                selection_reason: "no_fit_found".into(),
+                summary: plan
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| locale::plan_failed_message(locale)),
+                warnings: plan.warnings,
+                attempts: Vec::new(),
+                winning_candidate_id: None,
+                closest_candidate_id: None,
+                best_output_path: None,
+                best_size_bytes: None,
+                best_within_limit: false,
+                reason_code: plan.reason_code,
+                error_code: plan.error_code,
+                error_message: plan.error_message,
+            };
+        }
+
+        let mut attempts = Vec::new();
+        let mut best_within_limit_output: Option<SelectedEncodeOutput> = None;
+        let mut smallest_oversize_output: Option<SelectedEncodeOutput> = None;
+        let mut stopped_after_best_within_limit = false;
+        for candidate in &plan.candidates {
+            if let Err(error) = ensure_source_unchanged(&source_identity, MediaLimits::default()) {
+                return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+            }
+            if remaining_candidate_cannot_beat_within_limit(
+                best_within_limit_output.as_ref(),
                 candidate,
-                None,
-                Some(timeline_frames),
-            )
-        } else {
-            encode_candidate_internal(
-                &request.input_path,
-                request.output_directory.as_deref(),
-                locale,
-                request.crop_region.as_ref(),
-                request.input_width,
-                request.input_height,
-                candidate,
-                sampled_legacy_frames.as_deref().or_else(|| {
+            ) {
+                stopped_after_best_within_limit = true;
+                break;
+            }
+
+            let sampled_legacy_frames = if resolved_timeline_frames.is_none() {
+                sampled_frame_indexes(
                     legacy_selected_frames
                         .as_ref()
-                        .and_then(|frames| frames.as_deref())
-                }),
-                None,
-            )
-        };
+                        .and_then(|frames| frames.as_deref()),
+                    request.base_frame_count,
+                    candidate.frame_sample_step,
+                )
+            } else {
+                None
+            };
 
-        match encode_result {
-            Ok(result) => {
-                let within_limit = result.size_bytes <= DISCORD_MAX_STICKER_BYTES;
-                let output_path = result.output_path.to_string_lossy().into_owned();
-                let attempt = SearchAttemptResult {
-                    candidate_id: candidate.id.clone(),
-                    canonical_candidate_id: candidate.id.clone(),
-                    equivalent_to_candidate_id: None,
-                    rank: candidate.rank,
-                    duration_seconds: candidate.duration_seconds,
-                    fps: candidate.fps,
-                    content_scale: candidate.content_scale,
-                    preset: candidate.preset.clone(),
-                    fit_mode: candidate.fit_mode.clone(),
-                    score: candidate.score,
-                    source_similarity_score: candidate.source_similarity_score,
-                    summary: candidate.summary.clone(),
-                    skipped: false,
-                    within_limit,
-                    output_path: Some(output_path.clone()),
-                    size_bytes: Some(result.size_bytes),
-                    elapsed_ms: Some(result.elapsed_ms),
-                    tool_source: Some(result.tool_source.clone()),
-                    tool_command: result.tool_command.clone(),
-                    tool_detail: result.tool_detail.clone(),
-                    warnings: Vec::new(),
-                    error_code: None,
-                    error_message: None,
-                };
-                attempts.push(attempt);
-                let contender = SelectedEncodeOutput {
-                    candidate_id: candidate.id.clone(),
-                    rank: candidate.rank,
-                    duration_seconds: candidate.duration_seconds,
-                    size_bytes: result.size_bytes,
-                    source_similarity_score: candidate.source_similarity_score,
-                    output_path: output_path.clone(),
-                };
+            let encode_result = if let Some(timeline_frames) = resolved_timeline_frames.as_deref() {
+                encode_candidate_internal(
+                    &request.input_path,
+                    request.output_directory.as_deref(),
+                    locale,
+                    request.crop_region.as_ref(),
+                    request.input_width,
+                    request.input_height,
+                    candidate,
+                    None,
+                    Some(timeline_frames),
+                    Some(&source_identity),
+                )
+            } else {
+                encode_candidate_internal(
+                    &request.input_path,
+                    request.output_directory.as_deref(),
+                    locale,
+                    request.crop_region.as_ref(),
+                    request.input_width,
+                    request.input_height,
+                    candidate,
+                    sampled_legacy_frames.as_deref().or_else(|| {
+                        legacy_selected_frames
+                            .as_ref()
+                            .and_then(|frames| frames.as_deref())
+                    }),
+                    None,
+                    Some(&source_identity),
+                )
+            };
 
-                if within_limit {
-                    let replace_current = best_within_limit_output
-                        .as_ref()
-                        .map(|current| is_better_within_limit_candidate(current, &contender))
-                        .unwrap_or(true);
+            match encode_result {
+                Ok(result) => {
+                    let within_limit = result.size_bytes <= DISCORD_MAX_STICKER_BYTES;
+                    let output_path = result.output_path.to_string_lossy().into_owned();
+                    let attempt = SearchAttemptResult {
+                        candidate_id: candidate.id.clone(),
+                        canonical_candidate_id: candidate.id.clone(),
+                        equivalent_to_candidate_id: None,
+                        rank: candidate.rank,
+                        duration_seconds: candidate.duration_seconds,
+                        fps: candidate.fps,
+                        content_scale: candidate.content_scale,
+                        preset: candidate.preset.clone(),
+                        fit_mode: candidate.fit_mode.clone(),
+                        score: candidate.score,
+                        source_similarity_score: candidate.source_similarity_score,
+                        summary: candidate.summary.clone(),
+                        skipped: false,
+                        within_limit,
+                        output_path: Some(output_path.clone()),
+                        size_bytes: Some(result.size_bytes),
+                        elapsed_ms: Some(result.elapsed_ms),
+                        tool_source: Some(result.tool_source.clone()),
+                        tool_command: result.tool_command.clone(),
+                        tool_detail: result.tool_detail.clone(),
+                        warnings: Vec::new(),
+                        reason_code: None,
+                        error_code: None,
+                        error_message: None,
+                    };
+                    attempts.push(attempt);
+                    let contender = SelectedEncodeOutput {
+                        candidate_id: candidate.id.clone(),
+                        rank: candidate.rank,
+                        duration_seconds: candidate.duration_seconds,
+                        size_bytes: result.size_bytes,
+                        source_similarity_score: candidate.source_similarity_score,
+                        output_path: output_path.clone(),
+                    };
 
-                    if replace_current {
-                        if let Some(previous) = best_within_limit_output.replace(contender) {
-                            let _ = fs::remove_file(&previous.output_path);
-                            clear_attempt_output_path(&mut attempts, &previous.candidate_id);
+                    if within_limit {
+                        let replace_current = best_within_limit_output
+                            .as_ref()
+                            .map(|current| is_better_within_limit_candidate(current, &contender))
+                            .unwrap_or(true);
+
+                        if replace_current {
+                            if let Some(previous) = best_within_limit_output.replace(contender) {
+                                let _ = fs::remove_file(&previous.output_path);
+                                clear_attempt_output_path(&mut attempts, &previous.candidate_id);
+                            }
+                        } else {
+                            let _ = fs::remove_file(&output_path);
+                            clear_attempt_output_path(&mut attempts, &candidate.id);
                         }
                     } else {
-                        let _ = fs::remove_file(&output_path);
-                        clear_attempt_output_path(&mut attempts, &candidate.id);
-                    }
-                } else {
-                    let replace_current = smallest_oversize_output
-                        .as_ref()
-                        .map(|current| is_better_oversize_candidate(current, &contender))
-                        .unwrap_or(true);
+                        let replace_current = smallest_oversize_output
+                            .as_ref()
+                            .map(|current| is_better_oversize_candidate(current, &contender))
+                            .unwrap_or(true);
 
-                    if replace_current {
-                        if let Some(previous) = smallest_oversize_output.replace(contender) {
-                            let _ = fs::remove_file(&previous.output_path);
-                            clear_attempt_output_path(&mut attempts, &previous.candidate_id);
+                        if replace_current {
+                            if let Some(previous) = smallest_oversize_output.replace(contender) {
+                                let _ = fs::remove_file(&previous.output_path);
+                                clear_attempt_output_path(&mut attempts, &previous.candidate_id);
+                            }
+                        } else {
+                            let _ = fs::remove_file(&output_path);
+                            clear_attempt_output_path(&mut attempts, &candidate.id);
                         }
-                    } else {
-                        let _ = fs::remove_file(&output_path);
-                        clear_attempt_output_path(&mut attempts, &candidate.id);
                     }
                 }
+                Err(error) => {
+                    return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+                }
             }
-            Err(error) => attempts.push(SearchAttemptResult {
-                candidate_id: candidate.id.clone(),
-                canonical_candidate_id: candidate.id.clone(),
-                equivalent_to_candidate_id: None,
-                rank: candidate.rank,
-                duration_seconds: candidate.duration_seconds,
-                fps: candidate.fps,
-                content_scale: candidate.content_scale,
-                preset: candidate.preset.clone(),
-                fit_mode: candidate.fit_mode.clone(),
-                score: candidate.score,
-                source_similarity_score: candidate.source_similarity_score,
-                summary: candidate.summary.clone(),
-                skipped: false,
-                within_limit: false,
-                output_path: None,
-                size_bytes: None,
-                elapsed_ms: None,
-                tool_source: None,
-                tool_command: None,
-                tool_detail: None,
-                warnings: Vec::new(),
-                error_code: Some("invoke-failed".into()),
-                error_message: Some(error),
-            }),
         }
-    }
 
-    if best_within_limit_output.is_some() {
-        if let Some(oversize_output) = smallest_oversize_output.take() {
-            let _ = fs::remove_file(&oversize_output.output_path);
-            clear_attempt_output_path(&mut attempts, &oversize_output.candidate_id);
+        if best_within_limit_output.is_some() {
+            if let Some(oversize_output) = smallest_oversize_output.take() {
+                let _ = fs::remove_file(&oversize_output.output_path);
+                clear_attempt_output_path(&mut attempts, &oversize_output.candidate_id);
+            }
         }
-    }
 
-    let stop_reason = if stopped_after_best_within_limit {
-        "found-best-ranked-within-limit"
-    } else if attempts.iter().any(|attempt| attempt.output_path.is_some()) {
-        "exhausted-ranked-candidates"
-    } else {
-        "no-successful-encodes"
-    };
-    let selection_reason = if best_within_limit_output.is_some() {
-        "best_within_limit"
-    } else if smallest_oversize_output.is_some() {
-        "smallest_oversize"
-    } else {
-        "no_fit_found"
-    };
-    let selected_output = best_within_limit_output
-        .as_ref()
-        .or(smallest_oversize_output.as_ref());
-    let winning_candidate_id = best_within_limit_output
-        .as_ref()
-        .map(|output| output.candidate_id.clone());
-    let closest_candidate_id = selected_output.map(|output| output.candidate_id.clone());
-    let best_output_path = selected_output.map(|output| output.output_path.clone());
-    let best_size_bytes = selected_output.map(|output| output.size_bytes);
-    let best_within_limit = best_within_limit_output.is_some();
-    let summary = locale::optimizer_search_summary(locale, selection_reason);
-    let final_duration_seconds = selected_output
-        .map(|output| output.duration_seconds)
-        .or(plan.selected_duration_seconds);
+        let stop_reason = if stopped_after_best_within_limit {
+            "found-best-ranked-within-limit"
+        } else if attempts.iter().any(|attempt| attempt.output_path.is_some()) {
+            "exhausted-ranked-candidates"
+        } else {
+            "no-successful-encodes"
+        };
+        let selection_reason = if best_within_limit_output.is_some() {
+            "best_within_limit"
+        } else if smallest_oversize_output.is_some() {
+            "smallest_oversize"
+        } else {
+            "no_fit_found"
+        };
+        let selected_output = best_within_limit_output
+            .as_ref()
+            .or(smallest_oversize_output.as_ref());
+        let winning_candidate_id = best_within_limit_output
+            .as_ref()
+            .map(|output| output.candidate_id.clone());
+        let closest_candidate_id = selected_output.map(|output| output.candidate_id.clone());
+        let best_output_path = selected_output.map(|output| output.output_path.clone());
+        let best_size_bytes = selected_output.map(|output| output.size_bytes);
+        let best_within_limit = best_within_limit_output.is_some();
+        let summary = locale::optimizer_search_summary(locale, selection_reason);
+        let final_duration_seconds = selected_output
+            .map(|output| output.duration_seconds)
+            .or(plan.selected_duration_seconds);
 
-    OptimizerSearchResponse {
-        ok: best_within_limit,
-        fit_mode: plan.fit_mode,
-        selected_duration_seconds: final_duration_seconds,
-        limit_bytes: DISCORD_MAX_STICKER_BYTES,
-        search_budget: plan.search_budget,
-        real_attempt_count: attempts.len(),
-        stop_reason: Some(stop_reason.into()),
-        selection_reason: selection_reason.into(),
-        summary,
-        warnings: plan.warnings,
-        attempts,
-        winning_candidate_id,
-        closest_candidate_id,
-        best_output_path,
-        best_size_bytes,
-        best_within_limit,
-        error_code: None,
-        error_message: None,
-    }
+        OptimizerSearchResponse {
+            ok: best_within_limit,
+            fit_mode: plan.fit_mode,
+            selected_duration_seconds: final_duration_seconds,
+            limit_bytes: DISCORD_MAX_STICKER_BYTES,
+            search_budget: plan.search_budget,
+            real_attempt_count: attempts.len(),
+            stop_reason: Some(stop_reason.into()),
+            selection_reason: selection_reason.into(),
+            summary,
+            warnings: plan.warnings,
+            attempts,
+            winning_candidate_id,
+            closest_candidate_id,
+            best_output_path,
+            best_size_bytes,
+            best_within_limit,
+            reason_code: None,
+            error_code: None,
+            error_message: None,
+        }
+    })();
+    finalize_optimizer_search_source(&source_identity, response, locale)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_error::PipelineError;
+    use crate::media_limits::MediaLimits;
+    use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct PanicOnFrame301;
+
+    impl<'de> Deserialize<'de> for PanicOnFrame301 {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let value = u32::deserialize(deserializer)?;
+            assert_ne!(
+                value, 301,
+                "the bounded visitor must not deserialize the 301st T"
+            );
+            Ok(Self)
+        }
+    }
+
+    struct UnknownLengthFrameSequence {
+        next: u32,
+        size_hint: Option<usize>,
+    }
+
+    impl<'de> SeqAccess<'de> for UnknownLengthFrameSequence {
+        type Error = serde::de::value::Error;
+
+        fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+        where
+            T: serde::de::DeserializeSeed<'de>,
+        {
+            if self.next > 301 {
+                return Ok(None);
+            }
+
+            let value = self.next;
+            self.next += 1;
+            seed.deserialize(serde::de::value::U32Deserializer::<Self::Error>::new(value))
+                .map(Some)
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            self.size_hint
+        }
+    }
 
     struct TestDir {
         path: PathBuf,
@@ -4282,6 +6100,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn revisioned_placeholder(prefix: &str) -> (TestDir, String, String) {
+        let test_dir = TestDir::new(prefix);
+        let input_path = test_dir.path.join("input.png");
+        fs::write(&input_path, b"placeholder").expect("revision placeholder must be written");
+        let identity = SourceIdentity::from_path(&input_path, MediaLimits::default())
+            .expect("revision placeholder identity must be created");
+        (
+            test_dir,
+            input_path.to_string_lossy().into_owned(),
+            identity.revision(),
+        )
     }
 
     fn build_test_candidate(id: &str, fps: u32) -> CandidatePreview {
@@ -4314,6 +6145,807 @@ mod tests {
             source_similarity_score,
             output_path: format!("C:/tmp/{candidate_id}.png"),
         }
+    }
+
+    #[test]
+    fn decoder_boundary_maps_panics_to_malformed_media() {
+        let error = run_decoder_boundary("png", || -> Result<(), PipelineError> {
+            panic!("decoder panic detail must not cross the wire")
+        })
+        .expect_err("decoder panics must be contained");
+
+        assert!(matches!(
+            error,
+            PipelineError::MalformedInput {
+                format: "png",
+                ref reason,
+            } if reason == "decoder panicked"
+        ));
+    }
+
+    #[test]
+    fn animation_decode_preflights_aggregate_bytes_before_advancing_iterator() {
+        let next_calls = Cell::new(0usize);
+        let frames = std::iter::from_fn(|| {
+            next_calls.set(next_calls.get() + 1);
+            Some(Ok(image::Frame::new(RgbaImage::new(1, 1))))
+        });
+        let limits = MediaLimits {
+            max_total_decoded_bytes: 3,
+            ..MediaLimits::default()
+        };
+
+        let error = collect_decoded_animation_frames("gif", frames, 4, 1, limits, || Ok(()))
+            .expect_err("aggregate budget must be checked before decoding a frame");
+
+        assert_eq!(next_calls.get(), 0, "iterator.next() must not be called");
+        assert!(matches!(
+            error,
+            PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: 3,
+                actual: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn animation_decode_accepts_exact_aggregate_budget_without_false_eof_failure() {
+        let frames = vec![Ok(image::Frame::new(RgbaImage::new(1, 1)))];
+        let limits = MediaLimits {
+            max_total_decoded_bytes: 4,
+            ..MediaLimits::default()
+        };
+
+        let decoded =
+            collect_decoded_animation_frames("gif", frames.into_iter(), 4, 1, limits, || Ok(()))
+                .expect("one 4-byte frame must fit an exact 4-byte aggregate budget");
+
+        assert_eq!(decoded.len(), 1);
+    }
+
+    #[test]
+    fn wire_diagnostics_expose_only_safe_stable_detail_tags() {
+        let parser_error = malformed_png("CRC mismatch for \u{1b}[31msecret chunk");
+        let panic_error = PipelineError::MalformedInput {
+            format: "png",
+            reason: "decoder panicked".into(),
+        };
+        let secret_path = r"C:\Users\private\source.mp4";
+        let process_error = PipelineError::ProcessFailed {
+            command: secret_path.into(),
+            exit_code: Some(1),
+            stderr: format!("failed while reading {secret_path}"),
+        };
+
+        let parser_diagnostic = pipeline_error_diagnostic(&parser_error, UiLocale::En);
+        let panic_diagnostic = pipeline_error_diagnostic(&panic_error, UiLocale::En);
+        let process_diagnostic = pipeline_error_diagnostic(&process_error, UiLocale::En);
+
+        assert!(parser_diagnostic.contains("[png-parser-crc]"));
+        assert!(panic_diagnostic.contains("[decoder-panic]"));
+        assert_ne!(parser_diagnostic, panic_diagnostic);
+        for diagnostic in [parser_diagnostic, panic_diagnostic, process_diagnostic] {
+            assert!(!diagnostic.contains(secret_path));
+            assert!(!diagnostic.contains('\u{1b}'));
+        }
+        assert_eq!(
+            ffmpeg_inspection_failure_diagnostic(UiLocale::En, false),
+            locale::media_pipeline_diagnostic(UiLocale::En, "malformed-media")
+        );
+    }
+
+    #[test]
+    fn failed_ffmpeg_inspection_cannot_become_success_from_stderr_metadata() {
+        let tool = ToolResolution {
+            source: "sidecar",
+            command: OsString::from("C:\\private\\ffmpeg.exe"),
+            command_display: "ffmpeg.exe".into(),
+            attempted_sidecar_paths: vec!["ffmpeg.exe".into()],
+            fallback_reason: None,
+        };
+        let stderr = b"Input #0, mov, from 'C:\\private\\source.mp4':\n\
+            Stream #0:0: Video: h264, yuv420p, 320x240, 30 fps";
+
+        let failure = ffmpeg_inspection_process_failure(
+            "C:\\private\\source.mp4",
+            &tool,
+            false,
+            stderr,
+            UiLocale::En,
+        )
+        .expect("non-zero FFmpeg status must fail before metadata parsing");
+
+        assert!(!failure.ok);
+        assert_eq!(failure.error_code.as_deref(), Some("malformed-media"));
+        assert_eq!(failure.reason_code.as_deref(), Some("decode-failed"));
+        assert!(!failure
+            .error_message
+            .unwrap_or_default()
+            .contains("C:\\private"));
+    }
+
+    #[test]
+    fn decode_still_rgba_image_applies_dimension_limits() {
+        let test_dir = TestDir::new("still-decode-limits");
+        let input_path = test_dir.path.join("input.png");
+        DynamicImage::ImageRgba8(RgbaImage::new(2, 1))
+            .save_with_format(&input_path, ImageFormat::Png)
+            .expect("still fixture must be encoded");
+        let limits = MediaLimits {
+            max_dimension: 1,
+            ..MediaLimits::default()
+        };
+
+        let error =
+            decode_still_rgba_image(input_path.to_string_lossy().as_ref(), limits, || Ok(()))
+                .expect_err("still decoder must reject oversized dimensions");
+
+        assert!(matches!(
+            error,
+            PipelineError::LimitExceeded {
+                resource: "image-dimensions",
+                limit: 1,
+                actual: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_still_rgba_image_rejects_pixel_budget_from_header_before_pixel_decode() {
+        let test_dir = TestDir::new("still-pixel-preflight");
+        let input_path = test_dir.path.join("input.png");
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(10_000, 4_001));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        fs::write(&input_path, bytes).expect("oversized PNG header fixture must be written");
+
+        let error = decode_still_rgba_image(
+            input_path.to_string_lossy().as_ref(),
+            MediaLimits::default(),
+            || Ok(()),
+        )
+        .expect_err("pixel budget must be rejected from dimensions alone");
+
+        assert!(matches!(
+            error,
+            PipelineError::LimitExceeded {
+                resource: "image-pixels",
+                limit: 40_000_000,
+                actual: 40_010_000,
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_gif_animation_frames_enforces_frame_limit() {
+        let test_dir = TestDir::new("gif-frame-limit");
+        let input_path = test_dir.path.join("input.gif");
+        let file = File::create(&input_path).expect("GIF fixture must be created");
+        image::codecs::gif::GifEncoder::new(file)
+            .encode_frames(
+                vec![
+                    image::Frame::new(RgbaImage::new(1, 1)),
+                    image::Frame::new(RgbaImage::new(1, 1)),
+                ]
+                .into_iter(),
+            )
+            .expect("GIF fixture must be encoded");
+        let limits = MediaLimits {
+            max_frame_count: 1,
+            ..MediaLimits::default()
+        };
+
+        let error =
+            decode_gif_animation_frames(input_path.to_string_lossy().as_ref(), limits, || Ok(()))
+                .expect_err("GIF decoder must enforce the frame limit");
+
+        assert!(matches!(
+            error,
+            PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: 1,
+                actual: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_apng_animation_frames_enforces_decoded_byte_budget() {
+        let test_dir = TestDir::new("apng-decoded-byte-limit");
+        let input_path = test_dir.path.join("input.png");
+        let frames = vec![
+            StickerFrame {
+                pixels: RgbaImage::new(1, 1),
+                duration_us: 100_000,
+            },
+            StickerFrame {
+                pixels: RgbaImage::new(1, 1),
+                duration_us: 100_000,
+            },
+        ];
+        write_native_apng(&input_path, &frames, "standard").expect("APNG fixture must be encoded");
+        let limits = MediaLimits {
+            max_total_decoded_bytes: 7,
+            ..MediaLimits::default()
+        };
+
+        let error =
+            decode_apng_animation_frames(input_path.to_string_lossy().as_ref(), limits, || Ok(()))
+                .expect_err("APNG decoder must enforce the aggregate decoded byte budget");
+
+        assert!(matches!(
+            error,
+            PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: 7,
+                actual: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn animation_decode_checkpoint_cancellation_is_preserved() {
+        let frames = vec![
+            Ok(image::Frame::new(RgbaImage::new(1, 1))),
+            Ok(image::Frame::new(RgbaImage::new(1, 1))),
+        ];
+        let mut checkpoints = 0;
+
+        let error = collect_decoded_animation_frames(
+            "gif",
+            frames.into_iter(),
+            4,
+            2,
+            MediaLimits::default(),
+            || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    Err(PipelineError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("checkpoint cancellation must stop frame collection");
+
+        assert_eq!(error, PipelineError::Cancelled);
+    }
+
+    #[test]
+    fn raw_rgba_output_limits_reject_frame_count_and_total_bytes() {
+        let frame_error = validate_raw_rgba_output(
+            1,
+            1,
+            8,
+            None,
+            MediaLimits {
+                max_frame_count: 1,
+                ..MediaLimits::default()
+            },
+        )
+        .expect_err("raw output must enforce frame count");
+        assert!(matches!(
+            frame_error,
+            PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: 1,
+                actual: 2,
+            }
+        ));
+
+        let byte_error = validate_raw_rgba_output(
+            1,
+            1,
+            8,
+            None,
+            MediaLimits {
+                max_total_decoded_bytes: 7,
+                ..MediaLimits::default()
+            },
+        )
+        .expect_err("raw output must enforce aggregate decoded bytes");
+        assert!(matches!(
+            byte_error,
+            PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: 7,
+                actual: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn native_animation_crop_uses_decoded_dimensions_not_request_dimensions() {
+        let test_dir = TestDir::new("native-decoded-crop-dimensions");
+        let input_path = test_dir.path.join("input.apng");
+        write_native_apng(
+            &input_path,
+            &[StickerFrame {
+                pixels: RgbaImage::new(4, 2),
+                duration_us: 100_000,
+            }],
+            "standard",
+        )
+        .expect("native crop fixture must be encoded");
+        let candidate = build_test_candidate("decoded-crop", 10);
+        let crop = CropRegion {
+            x: 0.5,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+
+        let result = encode_candidate_internal(
+            input_path.to_string_lossy().as_ref(),
+            Some(test_dir.path.to_string_lossy().as_ref()),
+            UiLocale::En,
+            Some(&crop),
+            Some(400),
+            Some(400),
+            &candidate,
+            None,
+            None,
+            None,
+        )
+        .expect("native crop encode must succeed");
+        let frames = decode_apng_animation_frames(
+            result.output_path.to_string_lossy().as_ref(),
+            MediaLimits::default(),
+            || Ok(()),
+        )
+        .expect("native crop output must decode");
+
+        assert_eq!(frames[0].pixels.dimensions(), (2, 2));
+    }
+
+    #[test]
+    fn validate_source_revision_rejects_missing_and_stale_revisions() {
+        let test_dir = TestDir::new("source-revision-validation");
+        let input_path = test_dir.path.join("input.png");
+        fs::write(&input_path, b"first").expect("source fixture must be written");
+
+        let missing = validate_source_revision(&input_path, None, MediaLimits::default())
+            .expect_err("missing source revision must be rejected");
+        assert_eq!(missing, PipelineError::InvalidRequestWithoutReason);
+        assert_eq!(missing.code(), "invalid-request");
+        assert_eq!(missing.reason_code(), None);
+
+        let assert_response_contract = |error: &PipelineError, expected_code: &str| {
+            let conversion = static_conversion_pipeline_error(error, UiLocale::En);
+            assert_eq!(conversion.error_code.as_deref(), Some(expected_code));
+            assert_eq!(conversion.reason_code, None);
+
+            let single = frame_preview_pipeline_error(error, UiLocale::En);
+            assert_eq!(single.error_code.as_deref(), Some(expected_code));
+            assert_eq!(single.reason_code, None);
+
+            let bulk = frame_previews_pipeline_error(error, UiLocale::En);
+            assert_eq!(bulk.error_code.as_deref(), Some(expected_code));
+            assert_eq!(bulk.reason_code, None);
+
+            let search = optimizer_search_pipeline_error(UiLocale::En, Vec::new(), error.clone());
+            assert_eq!(search.error_code.as_deref(), Some(expected_code));
+            assert_eq!(search.reason_code, None);
+        };
+        assert_response_contract(&missing, "invalid-request");
+        let missing_search: OptimizerSearchRequest = serde_json::from_value(serde_json::json!({
+            "inputPath": input_path.to_string_lossy()
+        }))
+        .expect("missing-revision search fixture must deserialize");
+        let missing_search_response = run_optimizer_search_internal(missing_search, UiLocale::En);
+        assert_eq!(
+            missing_search_response.error_code.as_deref(),
+            Some("invalid-request")
+        );
+        assert_eq!(missing_search_response.reason_code, None);
+
+        let identity =
+            crate::media_limits::SourceIdentity::from_path(&input_path, MediaLimits::default())
+                .expect("source identity must be created");
+        validate_source_revision(
+            &input_path,
+            Some(identity.revision().as_str()),
+            MediaLimits::default(),
+        )
+        .expect("matching source revision must be accepted");
+
+        fs::write(&input_path, b"changed-source").expect("source fixture must be changed");
+        let stale = validate_source_revision(
+            &input_path,
+            Some(identity.revision().as_str()),
+            MediaLimits::default(),
+        )
+        .expect_err("stale source revision must be rejected");
+        assert_eq!(stale, PipelineError::SourceChanged);
+        assert_eq!(stale.code(), "source-changed");
+        assert_eq!(stale.reason_code(), None);
+        assert_response_contract(&stale, "source-changed");
+        let stale_search: OptimizerSearchRequest = serde_json::from_value(serde_json::json!({
+            "inputPath": input_path.to_string_lossy(),
+            "sourceRevision": identity.revision()
+        }))
+        .expect("stale-revision search fixture must deserialize");
+        let stale_search_response = run_optimizer_search_internal(stale_search, UiLocale::En);
+        assert_eq!(
+            stale_search_response.error_code.as_deref(),
+            Some("source-changed")
+        );
+        assert_eq!(stale_search_response.reason_code, None);
+    }
+
+    #[test]
+    fn source_postcheck_treats_disappearance_as_changed_and_overrides_work_failure() {
+        let test_dir = TestDir::new("source-postcheck-precedence");
+        let input_path = test_dir.path.join("input.png");
+        fs::write(&input_path, b"source").expect("source fixture must be written");
+        let identity = SourceIdentity::from_path(&input_path, MediaLimits::default())
+            .expect("source identity must be created");
+        fs::remove_file(&input_path).expect("source fixture must be removed");
+
+        let direct_error = ensure_source_unchanged(&identity, MediaLimits::default())
+            .expect_err("a disappeared source must be reported as changed");
+        assert_eq!(direct_error, PipelineError::SourceChanged);
+
+        let result =
+            finalize_source_checked(&identity, "work-failed", MediaLimits::default(), |error| {
+                error.code()
+            });
+        assert_eq!(result, "source-changed");
+
+        let stale_revision = validate_source_revision(
+            &input_path,
+            Some(identity.revision().as_str()),
+            MediaLimits::default(),
+        )
+        .expect_err("a supplied revision whose source disappeared must be stale");
+        assert_eq!(stale_revision, PipelineError::SourceChanged);
+
+        let work_error = PipelineError::MalformedInput {
+            format: "test",
+            reason: "work failed".into(),
+        };
+        for work_reported_success in [false, true] {
+            let mut conversion = static_conversion_pipeline_error(&work_error, UiLocale::En);
+            conversion.ok = work_reported_success;
+            assert_eq!(
+                finalize_static_conversion_source(&identity, conversion, UiLocale::En)
+                    .error_code
+                    .as_deref(),
+                Some("source-changed")
+            );
+
+            let mut search =
+                optimizer_search_pipeline_error(UiLocale::En, Vec::new(), work_error.clone());
+            search.ok = work_reported_success;
+            assert_eq!(
+                finalize_optimizer_search_source(&identity, search, UiLocale::En)
+                    .error_code
+                    .as_deref(),
+                Some("source-changed")
+            );
+
+            let mut single = frame_preview_pipeline_error(&work_error, UiLocale::En);
+            single.ok = work_reported_success;
+            assert_eq!(
+                finalize_frame_preview_source(&identity, single, UiLocale::En)
+                    .error_code
+                    .as_deref(),
+                Some("source-changed")
+            );
+
+            let mut batch = frame_previews_pipeline_error(&work_error, UiLocale::En);
+            batch.ok = work_reported_success;
+            assert_eq!(
+                finalize_frame_previews_source(&identity, batch, UiLocale::En)
+                    .error_code
+                    .as_deref(),
+                Some("source-changed")
+            );
+        }
+    }
+
+    #[test]
+    fn request_frame_counts_are_capped_before_collection_or_range_allocation() {
+        let selected = vec![1u32; 301];
+        assert!(matches!(
+            resolve_frame_selection(Some(&selected), Some(300)),
+            Err("invalid-frame-selection")
+        ));
+        assert!(matches!(
+            resolve_frame_selection(None, Some(u32::MAX)),
+            Err("invalid-frame-selection")
+        ));
+
+        let timeline = (0..301)
+            .map(|_| EditedTimelineFrame {
+                source_frame_id: 1,
+                duration_us: 100_000,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            resolve_timeline_frames(Some(&timeline), Some(300)),
+            Err("invalid-frame-selection")
+        ));
+
+        let preview =
+            extract_frame_previews_internal("missing.gif", &vec![1u32; 301], UiLocale::En);
+        assert!(!preview.ok);
+        assert_eq!(preview.error_code.as_deref(), Some("media-frame-limit"));
+        assert_eq!(preview.reason_code, None);
+
+        let zero_id = extract_frame_previews_internal("missing.gif", &[0, 1], UiLocale::En);
+        assert!(!zero_id.ok);
+        assert_eq!(zero_id.error_code.as_deref(), Some("invalid-request"));
+        assert_eq!(
+            zero_id.reason_code.as_deref(),
+            Some("invalid-frame-selection")
+        );
+    }
+
+    fn video_inspection_fixture(estimated_frames: u64) -> MediaInspection {
+        MediaInspection {
+            ok: true,
+            input_path: "canonical-input.mp4".into(),
+            source_revision: None,
+            tool_source: Some("sidecar".into()),
+            tool_command: Some("ffmpeg".into()),
+            tool_detail: Some("fixture".into()),
+            format_name: Some("mp4".into()),
+            duration_seconds: Some(10.0),
+            size_bytes: Some(10),
+            width: Some(320),
+            height: Some(320),
+            codec_name: Some("h264".into()),
+            pixel_format: Some("yuv420p".into()),
+            avg_fps: Some(30.0),
+            frame_rate_label: Some("30.00".into()),
+            estimated_frames: Some(estimated_frames),
+            frame_durations_seconds: None,
+            warnings: Vec::new(),
+            is_static_image: false,
+            can_convert_to_png: false,
+            error_code: None,
+            reason_code: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn desktop_inspection_accepts_300_frames_and_rejects_301_before_revision_export() {
+        let test_dir = TestDir::new("desktop-inspection-frame-limit");
+        let input_path = test_dir.path.join("input.mp4");
+        fs::write(&input_path, b"fixture").expect("inspection identity fixture must be written");
+        let identity = SourceIdentity::from_path(&input_path, MediaLimits::default())
+            .expect("inspection identity must be created");
+        let display_path = input_path.to_string_lossy();
+        let expected_revision = identity.revision();
+
+        let accepted = enforce_desktop_inspection_frame_limit(
+            apply_inspection_source_revision(
+                &identity,
+                &display_path,
+                video_inspection_fixture(300),
+            ),
+            UiLocale::En,
+        );
+        assert!(accepted.ok);
+        assert_eq!(accepted.estimated_frames, Some(300));
+        assert_eq!(
+            accepted.source_revision.as_deref(),
+            Some(expected_revision.as_str())
+        );
+
+        let rejected = enforce_desktop_inspection_frame_limit(
+            apply_inspection_source_revision(
+                &identity,
+                &display_path,
+                video_inspection_fixture(301),
+            ),
+            UiLocale::En,
+        );
+        assert!(!rejected.ok);
+        assert_eq!(rejected.error_code.as_deref(), Some("media-frame-limit"));
+        assert_eq!(rejected.reason_code, None);
+        assert_eq!(rejected.source_revision, None);
+        assert!(rejected
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("limit:frame-count:301>300")));
+    }
+
+    #[test]
+    fn media_inspection_sets_revision_only_for_success() {
+        let test_dir = TestDir::new("inspection-source-revision");
+        let valid_path = test_dir.path.join("input.png");
+        DynamicImage::ImageRgba8(RgbaImage::new(2, 2))
+            .save_with_format(&valid_path, ImageFormat::Png)
+            .expect("inspection fixture must be encoded");
+
+        let success =
+            inspect_input_media_internal(valid_path.to_string_lossy().as_ref(), UiLocale::En);
+        assert!(success.ok);
+        assert!(success
+            .source_revision
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()));
+
+        let failed_path = test_dir.path.join("unsupported.bin");
+        fs::write(&failed_path, b"unsupported").expect("failed fixture must be written");
+        let failure =
+            inspect_input_media_internal(failed_path.to_string_lossy().as_ref(), UiLocale::En);
+        assert!(!failure.ok);
+        assert_eq!(failure.source_revision, None);
+    }
+
+    #[test]
+    fn path_backed_request_deserialization_keeps_missing_revision_for_validation() {
+        let conversion: StaticImageConversionRequest = serde_json::from_value(serde_json::json!({
+            "inputPath": "input.png"
+        }))
+        .expect("legacy request must reach command validation");
+        assert_eq!(conversion.source_revision, None);
+
+        let search: OptimizerSearchRequest = serde_json::from_value(serde_json::json!({
+            "inputPath": "input.png"
+        }))
+        .expect("legacy search request must reach command validation");
+        assert_eq!(search.source_revision, None);
+    }
+
+    #[test]
+    fn request_deserialization_stops_frame_sequences_at_the_hard_cap() {
+        let selected_frames = vec![1u32; 301];
+        let search = serde_json::json!({
+            "inputPath": "input.gif",
+            "selectedFrames": selected_frames,
+            "baseFrameCount": 300
+        });
+        assert!(
+            serde_json::from_value::<OptimizerSearchRequest>(search).is_err(),
+            "search selectedFrames must fail while deserializing the 301st item"
+        );
+
+        let timeline_frames = (0..301)
+            .map(|_| {
+                serde_json::json!({
+                    "sourceFrameId": 1,
+                    "durationUs": 100_000
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = serde_json::json!({
+            "timelineFrames": timeline_frames,
+            "baseFrameCount": 300
+        });
+        assert!(
+            serde_json::from_value::<OptimizerPlanRequest>(plan).is_err(),
+            "plan timelineFrames must fail while deserializing the 301st item"
+        );
+
+        assert!(
+            serde_json::from_value::<BoundedFrameIds>(serde_json::json!(vec![1u32; 301])).is_err()
+        );
+
+        let selected_at_limit = vec![1u32; 300];
+        assert!(
+            serde_json::from_value::<OptimizerSearchRequest>(serde_json::json!({
+                "inputPath": "input.gif",
+                "selectedFrames": selected_at_limit,
+                "baseFrameCount": 300
+            }))
+            .is_ok()
+        );
+        let timeline_at_limit = (0..300)
+            .map(|_| {
+                serde_json::json!({
+                    "sourceFrameId": 1,
+                    "durationUs": 100_000
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            serde_json::from_value::<OptimizerPlanRequest>(serde_json::json!({
+                "timelineFrames": timeline_at_limit,
+                "baseFrameCount": 300
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<BoundedFrameIds>(serde_json::json!(vec![1u32; 300])).is_ok()
+        );
+
+        for base_frame_count in [300u32] {
+            assert!(
+                serde_json::from_value::<OptimizerPlanRequest>(serde_json::json!({
+                    "baseFrameCount": base_frame_count
+                }))
+                .is_ok()
+            );
+            assert!(
+                serde_json::from_value::<OptimizerSearchRequest>(serde_json::json!({
+                    "inputPath": "input.gif",
+                    "baseFrameCount": base_frame_count
+                }))
+                .is_ok()
+            );
+        }
+        assert!(
+            serde_json::from_value::<OptimizerPlanRequest>(serde_json::json!({
+                "baseFrameCount": 301
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<OptimizerSearchRequest>(serde_json::json!({
+                "inputPath": "input.gif",
+                "baseFrameCount": 301
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_sequence_probes_the_301st_item_without_deserializing_t() {
+        for size_hint in [None, Some(0)] {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                BoundedVecVisitor::<PanicOnFrame301>(PhantomData)
+                    .visit_seq(UnknownLengthFrameSequence { next: 1, size_hint })
+            }));
+
+            let result = outcome.expect("the 301st item must not deserialize PanicOnFrame301");
+            assert!(
+                result.is_err(),
+                "an unknown or false size hint must still reject item 301"
+            );
+        }
+    }
+
+    #[test]
+    fn still_decoder_preflight_rejects_native_and_conversion_allocation_peaks() {
+        let limits = MediaLimits::default();
+        let native_high_depth = validate_still_decoder_allocation(
+            10_000,
+            4_000,
+            image::ColorType::Rgba16,
+            320_000_000,
+            limits,
+        )
+        .expect_err("40M-pixel RGBA16 must be rejected before native allocation");
+        assert!(matches!(
+            native_high_depth,
+            PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: 167_772_160,
+                actual: 320_000_000,
+            }
+        ));
+
+        let conversion_peak = validate_still_decoder_allocation(
+            10_000,
+            2_500,
+            image::ColorType::Rgb8,
+            75_000_000,
+            limits,
+        )
+        .expect_err("native RGB plus RGBA conversion must share the decoded-byte budget");
+        assert!(matches!(
+            conversion_peak,
+            PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: 167_772_160,
+                actual: 175_000_000,
+            }
+        ));
+
+        validate_still_decoder_allocation(
+            10_000,
+            4_000,
+            image::ColorType::Rgba8,
+            160_000_000,
+            limits,
+        )
+        .expect("an existing RGBA8 output must not be double-counted");
     }
 
     #[cfg(target_os = "windows")]
@@ -4557,9 +7189,12 @@ mod tests {
 
     #[test]
     fn legacy_fit_mode_search_error_stays_canonical_and_warns() {
+        let (_test_dir, input_path, source_revision) =
+            revisioned_placeholder("legacy-fit-search-error");
         let response = run_optimizer_search_internal(
             OptimizerSearchRequest {
-                input_path: "ignored.png".into(),
+                input_path,
+                source_revision: Some(source_revision),
                 output_directory: None,
                 locale: Some("en".into()),
                 source_duration_seconds: Some(1.0),
@@ -4659,13 +7294,795 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_health_wire_labels_do_not_expose_absolute_paths_or_raw_version_output() {
+        let label = safe_tool_path_label(
+            Path::new(r"C:\Users\private\ffmpeg-x86_64-pc-windows-msvc.exe"),
+            "ffmpeg",
+        );
+        assert_eq!(label, "ffmpeg-x86_64-pc-windows-msvc.exe");
+        assert!(!label.contains("C:\\Users"));
+
+        let version =
+            safe_tool_version_line("ffmpeg", br"ffmpeg version 7.1 C:\Users\private\build", &[])
+                .expect("safe version label must be available");
+        assert_eq!(version, "ffmpeg 7.1");
+        assert!(!version.contains("private"));
+    }
+
     fn png_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
         bytes.extend_from_slice(chunk_type);
         bytes.extend_from_slice(data);
-        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(chunk_type);
+        crc.update(data);
+        bytes.extend_from_slice(&crc.finalize().to_be_bytes());
         bytes
+    }
+
+    fn png_ihdr_with_format(width: u32, height: u32, bit_depth: u8, color_type: u8) -> Vec<u8> {
+        let mut data = [0u8; 13];
+        data[0..4].copy_from_slice(&width.to_be_bytes());
+        data[4..8].copy_from_slice(&height.to_be_bytes());
+        data[8] = bit_depth;
+        data[9] = color_type;
+        png_chunk(b"IHDR", &data)
+    }
+
+    fn png_ihdr(width: u32, height: u32) -> Vec<u8> {
+        png_ihdr_with_format(width, height, 8, 6)
+    }
+
+    fn png_suggested_palette(name: &str) -> Vec<u8> {
+        let mut data = name.as_bytes().to_vec();
+        data.push(0);
+        data.push(8);
+        data.extend_from_slice(&[0, 0, 0, 255, 0, 1]);
+        data
+    }
+
+    fn png_actl(frame_count: u32) -> Vec<u8> {
+        png_actl_with_plays(frame_count, 0)
+    }
+
+    fn png_actl_with_plays(frame_count: u32, play_count: u32) -> Vec<u8> {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&frame_count.to_be_bytes());
+        data[4..8].copy_from_slice(&play_count.to_be_bytes());
+        png_chunk(b"acTL", &data)
+    }
+
+    fn png_fctl(sequence: u32, width: u32, height: u32, x: u32, y: u32) -> Vec<u8> {
+        png_fctl_with_ops(sequence, width, height, x, y, 0, 0)
+    }
+
+    fn png_fctl_with_ops(
+        sequence: u32,
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        dispose: u8,
+        blend: u8,
+    ) -> Vec<u8> {
+        let mut data = [0u8; 26];
+        data[0..4].copy_from_slice(&sequence.to_be_bytes());
+        data[4..8].copy_from_slice(&width.to_be_bytes());
+        data[8..12].copy_from_slice(&height.to_be_bytes());
+        data[12..16].copy_from_slice(&x.to_be_bytes());
+        data[16..20].copy_from_slice(&y.to_be_bytes());
+        data[20..22].copy_from_slice(&1u16.to_be_bytes());
+        data[22..24].copy_from_slice(&10u16.to_be_bytes());
+        data[24] = dispose;
+        data[25] = blend;
+        png_chunk(b"fcTL", &data)
+    }
+
+    fn png_fdat(sequence: u32, frame_data: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(4 + frame_data.len());
+        data.extend_from_slice(&sequence.to_be_bytes());
+        data.extend_from_slice(frame_data);
+        png_chunk(b"fdAT", &data)
+    }
+
+    fn write_png_parser_fixture(name: &str, bytes: &[u8]) -> (TestDir, PathBuf) {
+        let test_dir = TestDir::new(name);
+        let path = test_dir.path.join("fixture.png");
+        fs::write(&path, bytes).expect("PNG parser fixture must be written");
+        (test_dir, path)
+    }
+
+    fn parse_png_error(name: &str, bytes: &[u8]) -> PipelineError {
+        let (_test_dir, path) = write_png_parser_fixture(name, bytes);
+        read_png_animation_metadata(&path, MediaLimits::default(), || Ok(()))
+            .expect_err("malformed PNG must be rejected")
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_non_first_ihdr() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_actl(1));
+        bytes.extend_from_slice(&png_ihdr(32, 32));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+
+        assert!(matches!(
+            parse_png_error("png-ihdr-order", &bytes),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "IHDR must be the first chunk"
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_allows_fctl_before_actl_when_both_precede_idat() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(8, 8));
+        bytes.extend_from_slice(&png_fctl(0, 8, 8, 0, 0));
+        bytes.extend_from_slice(&png_actl(1));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, path) = write_png_parser_fixture("png-fctl-before-actl", &bytes);
+
+        let metadata = read_png_animation_metadata(&path, MediaLimits::default(), || Ok(()))
+            .expect("fcTL may precede acTL before the first IDAT")
+            .expect("acTL must produce animation metadata");
+        assert_eq!(metadata.frame_count, Some(1));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_invalid_fixed_chunk_lengths() {
+        for (name, chunk_type, payload, expected_reason) in [
+            ("ihdr", b"IHDR", vec![0u8; 12], "IHDR length must be 13"),
+            ("actl", b"acTL", vec![0u8; 7], "acTL length must be 8"),
+            ("fctl", b"fcTL", vec![0u8; 25], "fcTL length must be 26"),
+        ] {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            if name != "ihdr" {
+                bytes.extend_from_slice(&png_ihdr(32, 32));
+            }
+            if name == "fctl" {
+                bytes.extend_from_slice(&png_actl(1));
+            }
+            bytes.extend_from_slice(&png_chunk(chunk_type, &payload));
+            bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+
+            assert!(matches!(
+                parse_png_error(&format!("png-{name}-length"), &bytes),
+                PipelineError::MalformedInput { format: "png", reason }
+                    if reason == expected_reason
+            ));
+        }
+    }
+
+    #[test]
+    fn read_png_metadata_rejects_invalid_ihdr_and_critical_chunk_contracts() {
+        let mut invalid_ihdr_data = [0u8; 13];
+        invalid_ihdr_data[0..4].copy_from_slice(&8u32.to_be_bytes());
+        invalid_ihdr_data[4..8].copy_from_slice(&8u32.to_be_bytes());
+        invalid_ihdr_data[8] = 8;
+        invalid_ihdr_data[9] = 6;
+        invalid_ihdr_data[10] = 1;
+        let mut invalid_ihdr = b"\x89PNG\r\n\x1a\n".to_vec();
+        invalid_ihdr.extend_from_slice(&png_chunk(b"IHDR", &invalid_ihdr_data));
+        match parse_png_error("png-invalid-ihdr-control", &invalid_ihdr) {
+            PipelineError::MalformedInput { reason, .. } => {
+                assert!(reason.contains("IHDR control fields"));
+            }
+            error => panic!("expected IHDR control error, got {error:?}"),
+        }
+
+        for (name, chunk_type, expected_reason) in [
+            ("reserved", *b"abcd", "chunk type is invalid"),
+            ("critical", *b"ABCD", "unknown critical"),
+        ] {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(&png_ihdr(8, 8));
+            bytes.extend_from_slice(&png_chunk(&chunk_type, &[]));
+            match parse_png_error(&format!("png-{name}-chunk"), &bytes) {
+                PipelineError::MalformedInput { reason, .. } => {
+                    assert!(reason.contains(expected_reason));
+                }
+                error => panic!("expected chunk type error, got {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_png_metadata_enforces_plte_presence_order_and_uniqueness() {
+        let mut indexed_ihdr = [0u8; 13];
+        indexed_ihdr[0..4].copy_from_slice(&8u32.to_be_bytes());
+        indexed_ihdr[4..8].copy_from_slice(&8u32.to_be_bytes());
+        indexed_ihdr[8] = 8;
+        indexed_ihdr[9] = 3;
+
+        let mut missing = b"\x89PNG\r\n\x1a\n".to_vec();
+        missing.extend_from_slice(&png_chunk(b"IHDR", &indexed_ihdr));
+        missing.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        assert!(matches!(
+            parse_png_error("png-indexed-missing-plte", &missing),
+            PipelineError::MalformedInput { reason, .. }
+                if reason.contains("requires PLTE")
+        ));
+
+        let mut duplicate = b"\x89PNG\r\n\x1a\n".to_vec();
+        duplicate.extend_from_slice(&png_chunk(b"IHDR", &indexed_ihdr));
+        duplicate.extend_from_slice(&png_chunk(b"PLTE", &[0, 0, 0]));
+        duplicate.extend_from_slice(&png_chunk(b"PLTE", &[1, 1, 1]));
+        assert!(matches!(
+            parse_png_error("png-duplicate-plte", &duplicate),
+            PipelineError::MalformedInput { reason, .. }
+                if reason.contains("duplicate PLTE")
+        ));
+
+        let mut one_bit_ihdr = indexed_ihdr;
+        one_bit_ihdr[8] = 1;
+        let mut exact_palette = b"\x89PNG\r\n\x1a\n".to_vec();
+        exact_palette.extend_from_slice(&png_chunk(b"IHDR", &one_bit_ihdr));
+        exact_palette.extend_from_slice(&png_chunk(b"PLTE", &[0, 0, 0, 255, 255, 255]));
+        exact_palette.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        exact_palette.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, exact_path) =
+            write_png_parser_fixture("png-one-bit-exact-palette", &exact_palette);
+        assert!(
+            read_png_metadata(&exact_path, MediaLimits::default(), || Ok(()))
+                .expect("two entries must fit one-bit indexed PNG")
+                .animation
+                .is_none()
+        );
+
+        let mut oversized_palette = b"\x89PNG\r\n\x1a\n".to_vec();
+        oversized_palette.extend_from_slice(&png_chunk(b"IHDR", &one_bit_ihdr));
+        oversized_palette.extend_from_slice(&png_chunk(b"PLTE", &[0; 9]));
+        assert!(matches!(
+            parse_png_error("png-one-bit-oversized-palette", &oversized_palette),
+            PipelineError::MalformedInput { reason, .. }
+                if reason.contains("indexed bit depth")
+        ));
+
+        let mut rgb_ihdr = indexed_ihdr;
+        rgb_ihdr[9] = 2;
+        let mut late_palette = b"\x89PNG\r\n\x1a\n".to_vec();
+        late_palette.extend_from_slice(&png_chunk(b"IHDR", &rgb_ihdr));
+        late_palette.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        late_palette.extend_from_slice(&png_chunk(b"PLTE", &[0, 0, 0]));
+        assert!(matches!(
+            parse_png_error("png-late-plte", &late_palette),
+            PipelineError::MalformedInput { reason, .. }
+                if reason.contains("PLTE must precede IDAT")
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_invalid_animation_frame_counts() {
+        let mut zero = b"\x89PNG\r\n\x1a\n".to_vec();
+        zero.extend_from_slice(&png_ihdr(32, 32));
+        zero.extend_from_slice(&png_actl(0));
+        zero.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-frame-count-0", &zero),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "acTL frame count must be non-zero"
+        ));
+
+        let mut excessive = b"\x89PNG\r\n\x1a\n".to_vec();
+        excessive.extend_from_slice(&png_ihdr(32, 32));
+        excessive.extend_from_slice(&png_actl(301));
+        excessive.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-frame-count-301", &excessive),
+            PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: 300,
+                actual: 301,
+            }
+        ));
+
+        let mut excessive_plays = b"\x89PNG\r\n\x1a\n".to_vec();
+        excessive_plays.extend_from_slice(&png_ihdr(8, 8));
+        excessive_plays.extend_from_slice(&png_actl_with_plays(1, 0x8000_0000));
+        assert!(matches!(
+            parse_png_error("png-play-count-high-bit", &excessive_plays),
+            PipelineError::MalformedInput { reason, .. }
+                if reason == "acTL play count exceeds PNG integer range"
+        ));
+
+        let mut max_plays = b"\x89PNG\r\n\x1a\n".to_vec();
+        max_plays.extend_from_slice(&png_ihdr(8, 8));
+        max_plays.extend_from_slice(&png_actl_with_plays(1, i32::MAX as u32));
+        max_plays.extend_from_slice(&png_fctl(0, 8, 8, 0, 0));
+        max_plays.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        max_plays.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, max_plays_path) =
+            write_png_parser_fixture("png-max-play-count", &max_plays);
+        assert!(
+            read_png_animation_metadata(&max_plays_path, MediaLimits::default(), || Ok(()),)
+                .expect("maximum PNG play count must parse")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_frame_rectangle_outside_canvas() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(10, 10));
+        bytes.extend_from_slice(&png_actl(1));
+        bytes.extend_from_slice(&png_fctl(0, 8, 8, 3, 3));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+
+        assert!(matches!(
+            parse_png_error("png-frame-rectangle", &bytes),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "fcTL frame rectangle is outside the canvas"
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_apng_sequence_and_fdat_length() {
+        let mut sequence_gap = b"\x89PNG\r\n\x1a\n".to_vec();
+        sequence_gap.extend_from_slice(&png_ihdr(8, 8));
+        sequence_gap.extend_from_slice(&png_actl(1));
+        sequence_gap.extend_from_slice(&png_fctl(1, 8, 8, 0, 0));
+        sequence_gap.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        sequence_gap.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-sequence-gap", &sequence_gap),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+
+        let mut short_fdat = b"\x89PNG\r\n\x1a\n".to_vec();
+        short_fdat.extend_from_slice(&png_ihdr(8, 8));
+        short_fdat.extend_from_slice(&png_actl(1));
+        short_fdat.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        short_fdat.extend_from_slice(&png_fctl(0, 8, 8, 0, 0));
+        short_fdat.extend_from_slice(&png_chunk(b"fdAT", &[0, 0, 0]));
+        short_fdat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-short-fdat", &short_fdat),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+
+        let mut sequence_only_fdat = b"\x89PNG\r\n\x1a\n".to_vec();
+        sequence_only_fdat.extend_from_slice(&png_ihdr(8, 8));
+        sequence_only_fdat.extend_from_slice(&png_actl(1));
+        sequence_only_fdat.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        sequence_only_fdat.extend_from_slice(&png_fctl(0, 8, 8, 0, 0));
+        sequence_only_fdat.extend_from_slice(&png_fdat(1, &[]));
+        sequence_only_fdat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-empty-fdat", &sequence_only_fdat),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_allows_empty_fdat_before_frame_payload() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(8, 8));
+        bytes.extend_from_slice(&png_actl(2));
+        bytes.extend_from_slice(&png_fctl(0, 8, 8, 0, 0));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        bytes.extend_from_slice(&png_fctl(1, 8, 8, 0, 0));
+        bytes.extend_from_slice(&png_fdat(2, &[]));
+        bytes.extend_from_slice(&png_fdat(3, &[0]));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, path) = write_png_parser_fixture("png-empty-fdat-prefix", &bytes);
+
+        let metadata = read_png_animation_metadata(&path, MediaLimits::default(), || Ok(()))
+            .expect("empty fdAT prefix followed by payload must parse")
+            .expect("fixture must contain animation metadata");
+        assert_eq!(metadata.frame_count, Some(2));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_invalid_dispose_and_blend_ops() {
+        for (name, dispose, blend) in [("dispose", 3, 0), ("blend", 0, 2)] {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(&png_ihdr(8, 8));
+            bytes.extend_from_slice(&png_actl(1));
+            bytes.extend_from_slice(&png_fctl_with_ops(0, 8, 8, 0, 0, dispose, blend));
+            bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+            bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+
+            assert!(matches!(
+                parse_png_error(&format!("png-invalid-{name}"), &bytes),
+                PipelineError::MalformedInput { format: "png", .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_missing_or_misordered_frame_data() {
+        let mut missing_idat = b"\x89PNG\r\n\x1a\n".to_vec();
+        missing_idat.extend_from_slice(&png_ihdr(8, 8));
+        missing_idat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-missing-idat", &missing_idat),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+
+        let mut empty_idat = b"\x89PNG\r\n\x1a\n".to_vec();
+        empty_idat.extend_from_slice(&png_ihdr(8, 8));
+        empty_idat.extend_from_slice(&png_chunk(b"IDAT", &[]));
+        empty_idat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-empty-idat-stream", &empty_idat),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+
+        let mut empty_then_data = b"\x89PNG\r\n\x1a\n".to_vec();
+        empty_then_data.extend_from_slice(&png_ihdr(8, 8));
+        empty_then_data.extend_from_slice(&png_chunk(b"IDAT", &[]));
+        empty_then_data.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        empty_then_data.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, path) = write_png_parser_fixture("png-empty-idat-prefix", &empty_then_data);
+        assert!(
+            read_png_animation_metadata(&path, MediaLimits::default(), || Ok(()))
+                .expect("empty IDAT prefix followed by data must parse")
+                .is_none()
+        );
+
+        let mut pending_frame = b"\x89PNG\r\n\x1a\n".to_vec();
+        pending_frame.extend_from_slice(&png_ihdr(8, 8));
+        pending_frame.extend_from_slice(&png_actl(1));
+        pending_frame.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        pending_frame.extend_from_slice(&png_fctl(0, 8, 8, 0, 0));
+        pending_frame.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-fctl-without-data", &pending_frame),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+
+        let mut noncontiguous_idat = b"\x89PNG\r\n\x1a\n".to_vec();
+        noncontiguous_idat.extend_from_slice(&png_ihdr(8, 8));
+        noncontiguous_idat.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        noncontiguous_idat.extend_from_slice(&png_chunk(b"tEXt", &[]));
+        noncontiguous_idat.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        noncontiguous_idat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-noncontiguous-idat", &noncontiguous_idat),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+
+        let mut fdat_without_frame = b"\x89PNG\r\n\x1a\n".to_vec();
+        fdat_without_frame.extend_from_slice(&png_ihdr(8, 8));
+        fdat_without_frame.extend_from_slice(&png_actl(1));
+        fdat_without_frame.extend_from_slice(&png_fctl(0, 8, 8, 0, 0));
+        fdat_without_frame.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        fdat_without_frame.extend_from_slice(&png_fdat(1, &[0]));
+        fdat_without_frame.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-fdat-without-frame", &fdat_without_frame),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_requires_full_canvas_for_first_animated_idat_frame() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(10, 10));
+        bytes.extend_from_slice(&png_actl(1));
+        bytes.extend_from_slice(&png_fctl(0, 8, 8, 1, 1));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+
+        assert!(matches!(
+            parse_png_error("png-first-frame-subrect", &bytes),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_caps_observed_frame_controls() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(1, 1));
+        bytes.extend_from_slice(&png_actl(1));
+        bytes.extend_from_slice(&png_fctl(0, 1, 1, 0, 0));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        for frame in 1..=300u32 {
+            let sequence = frame * 2 - 1;
+            bytes.extend_from_slice(&png_fctl(sequence, 1, 1, 0, 0));
+            bytes.extend_from_slice(&png_fdat(sequence + 1, &[0]));
+        }
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+
+        assert!(matches!(
+            parse_png_error("png-observed-frame-cap", &bytes),
+            PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: 300,
+                actual: 301,
+            }
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_crc_mismatch() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = png_ihdr(32, 32);
+        let last = ihdr.len() - 1;
+        ihdr[last] ^= 0xff;
+        bytes.extend_from_slice(&ihdr);
+
+        assert!(matches!(
+            parse_png_error("png-crc", &bytes),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "CRC mismatch for IHDR chunk"
+        ));
+    }
+
+    #[test]
+    fn inspect_input_media_internal_reports_malformed_png_crc_without_static_fallback() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = png_ihdr(32, 32);
+        let last_crc_byte = ihdr.last_mut().expect("IHDR fixture must include a CRC");
+        *last_crc_byte ^= 0xff;
+        bytes.extend_from_slice(&ihdr);
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, path) = write_png_parser_fixture("png-dispatch-crc", &bytes);
+
+        let inspection =
+            inspect_input_media_internal(path.to_string_lossy().as_ref(), UiLocale::En);
+
+        assert!(!inspection.ok);
+        assert_eq!(inspection.error_code.as_deref(), Some("malformed-media"));
+        assert!(!inspection.is_static_image);
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_oversized_chunk_before_allocation() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(32, 32));
+        bytes.extend_from_slice(&(MediaLimits::default().max_png_chunk_bytes + 1).to_be_bytes());
+        bytes.extend_from_slice(b"iTXt");
+
+        assert!(matches!(
+            parse_png_error("png-huge-chunk", &bytes),
+            PipelineError::LimitExceeded {
+                resource: "png-chunk-bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_chunk_lengths_above_the_png_integer_range() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(32, 32));
+        bytes.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+        bytes.extend_from_slice(b"IDAT");
+
+        assert!(matches!(
+            parse_png_error("png-31-bit-chunk-length", &bytes),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "PNG chunk length exceeds the 31-bit maximum"
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_duplicate_and_late_gama_with_exact_reasons() {
+        let gamma = 45_455u32.to_be_bytes();
+
+        let mut duplicate = b"\x89PNG\r\n\x1a\n".to_vec();
+        duplicate.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 2));
+        duplicate.extend_from_slice(&png_chunk(b"gAMA", &gamma));
+        duplicate.extend_from_slice(&png_chunk(b"gAMA", &gamma));
+        duplicate.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        duplicate.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-duplicate-gama", &duplicate),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "duplicate gAMA chunk"
+        ));
+
+        let mut after_idat = b"\x89PNG\r\n\x1a\n".to_vec();
+        after_idat.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 2));
+        after_idat.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        after_idat.extend_from_slice(&png_chunk(b"gAMA", &gamma));
+        after_idat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-gama-after-idat", &after_idat),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "gAMA must precede PLTE and IDAT"
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_enforces_plte_and_idat_ancillary_boundaries() {
+        let gamma = 45_455u32.to_be_bytes();
+
+        let mut gamma_after_plte = b"\x89PNG\r\n\x1a\n".to_vec();
+        gamma_after_plte.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 2));
+        gamma_after_plte.extend_from_slice(&png_chunk(b"PLTE", &[0, 0, 0]));
+        gamma_after_plte.extend_from_slice(&png_chunk(b"gAMA", &gamma));
+        gamma_after_plte.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        gamma_after_plte.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-gama-after-plte", &gamma_after_plte),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "gAMA must precede PLTE and IDAT"
+        ));
+
+        let mut background_before_plte = b"\x89PNG\r\n\x1a\n".to_vec();
+        background_before_plte.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 3));
+        background_before_plte.extend_from_slice(&png_chunk(b"bKGD", &[0]));
+        background_before_plte.extend_from_slice(&png_chunk(b"PLTE", &[0, 0, 0]));
+        background_before_plte.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        background_before_plte.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-bkgd-before-plte", &background_before_plte),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "PLTE must precede bKGD, hIST, and tRNS"
+        ));
+
+        let mut palette_after_idat = b"\x89PNG\r\n\x1a\n".to_vec();
+        palette_after_idat.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 2));
+        palette_after_idat.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        palette_after_idat.extend_from_slice(&png_chunk(b"sPLT", &png_suggested_palette("late")));
+        palette_after_idat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-splt-after-idat", &palette_after_idat),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "sPLT must precede IDAT"
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_requires_plte_for_hist_and_keeps_time_order_free_but_singleton()
+    {
+        let mut histogram_without_plte = b"\x89PNG\r\n\x1a\n".to_vec();
+        histogram_without_plte.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 2));
+        histogram_without_plte.extend_from_slice(&png_chunk(b"hIST", &[0, 1]));
+        histogram_without_plte.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        histogram_without_plte.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-hist-without-plte", &histogram_without_plte),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "hIST requires a preceding PLTE chunk"
+        ));
+
+        let timestamp = [0x07, 0xea, 7, 11, 0, 0, 0];
+        let mut duplicate_time_after_idat = b"\x89PNG\r\n\x1a\n".to_vec();
+        duplicate_time_after_idat.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 2));
+        duplicate_time_after_idat.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        duplicate_time_after_idat.extend_from_slice(&png_chunk(b"tIME", &timestamp));
+        duplicate_time_after_idat.extend_from_slice(&png_chunk(b"tIME", &timestamp));
+        duplicate_time_after_idat.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(matches!(
+            parse_png_error("png-duplicate-time-after-idat", &duplicate_time_after_idat),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "duplicate tIME chunk"
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_preserves_repeatable_text_and_splt_chunks() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr_with_format(32, 32, 8, 2));
+        bytes.extend_from_slice(&png_chunk(b"sPLT", &png_suggested_palette("first")));
+        bytes.extend_from_slice(&png_chunk(b"sPLT", &png_suggested_palette("second")));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        bytes.extend_from_slice(&png_chunk(b"tEXt", b"Comment\0one"));
+        bytes.extend_from_slice(&png_chunk(b"tEXt", b"Comment\0two"));
+        bytes.extend_from_slice(&png_chunk(b"iTXt", b"Title\0\0\0\0\0one"));
+        bytes.extend_from_slice(&png_chunk(b"iTXt", b"Title\0\0\0\0\0two"));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, path) = write_png_parser_fixture("png-repeatable-ancillary", &bytes);
+
+        read_png_animation_metadata(&path, MediaLimits::default(), || Ok(()))
+            .expect("repeatable text and sPLT chunks must remain legal");
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_truncated_payload_or_crc() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(32, 32));
+        bytes.extend_from_slice(&4u32.to_be_bytes());
+        bytes.extend_from_slice(b"tEXt");
+        bytes.extend_from_slice(&[1, 2]);
+
+        assert!(matches!(
+            parse_png_error("png-truncated", &bytes),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_requires_zero_length_iend() {
+        let mut missing = b"\x89PNG\r\n\x1a\n".to_vec();
+        missing.extend_from_slice(&png_ihdr(32, 32));
+        assert!(matches!(
+            parse_png_error("png-missing-iend", &missing),
+            PipelineError::MalformedInput { format: "png", .. }
+        ));
+
+        let mut nonzero = b"\x89PNG\r\n\x1a\n".to_vec();
+        nonzero.extend_from_slice(&png_ihdr(32, 32));
+        nonzero.extend_from_slice(&png_chunk(b"IEND", &[0]));
+        assert!(matches!(
+            parse_png_error("png-nonzero-iend", &nonzero),
+            PipelineError::MalformedInput { format: "png", reason }
+                if reason == "IEND length must be zero"
+        ));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_rejects_fctl_count_mismatch() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(32, 32));
+        bytes.extend_from_slice(&png_actl(2));
+        bytes.extend_from_slice(&png_fctl(0, 32, 32, 0, 0));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+
+        match parse_png_error("png-frame-count-mismatch", &bytes) {
+            PipelineError::MalformedInput {
+                format: "png",
+                reason,
+            } => assert!(reason.contains("fcTL count does not match")),
+            error => panic!("expected frame-count mismatch, got {error:?}"),
+        }
+    }
+
+    #[test]
+    fn read_png_animation_metadata_stops_on_stream_checkpoint_cancellation() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(32, 32));
+        bytes.extend_from_slice(&png_chunk(b"iTXt", &vec![0u8; 128 * 1024]));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let (_test_dir, path) = write_png_parser_fixture("png-checkpoint", &bytes);
+        let mut checkpoints = 0;
+
+        let error = read_png_animation_metadata(&path, MediaLimits::default(), || {
+            checkpoints += 1;
+            if checkpoints >= 4 {
+                Err(PipelineError::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("stream checkpoint cancellation must stop parsing");
+
+        assert_eq!(error, PipelineError::Cancelled);
+    }
+
+    #[test]
+    fn read_png_animation_metadata_warns_about_trailing_bytes() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&png_ihdr(32, 32));
+        bytes.extend_from_slice(&png_actl(1));
+        bytes.extend_from_slice(&png_fctl(0, 32, 32, 0, 0));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
+        bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+        bytes.extend_from_slice(b"trailing");
+        let (_test_dir, path) = write_png_parser_fixture("png-trailing", &bytes);
+
+        let metadata = read_png_animation_metadata(&path, MediaLimits::default(), || Ok(()))
+            .expect("valid APNG should parse")
+            .expect("acTL should produce animation metadata");
+        assert_eq!(metadata.warnings, vec!["png-trailing-bytes"]);
+    }
+
+    #[test]
+    fn static_png_inspection_preserves_trailing_bytes_warning() {
+        let test_dir = TestDir::new("static-png-trailing-warning");
+        let input_path = test_dir.path.join("static.png");
+        DynamicImage::ImageRgba8(RgbaImage::new(2, 2))
+            .save_with_format(&input_path, ImageFormat::Png)
+            .expect("static PNG fixture must be encoded");
+        let mut bytes = fs::read(&input_path).expect("static PNG fixture must be read");
+        bytes.extend_from_slice(b"trailing");
+        fs::write(&input_path, bytes).expect("static PNG trailing bytes must be written");
+
+        let metadata = read_png_metadata(&input_path, MediaLimits::default(), || Ok(()))
+            .expect("static PNG metadata must parse");
+        assert!(metadata.animation.is_none());
+        assert_eq!(metadata.warnings, vec!["png-trailing-bytes"]);
+
+        let inspection =
+            inspect_input_media_internal(input_path.to_string_lossy().as_ref(), UiLocale::En);
+        assert!(inspection.ok);
+        assert_eq!(inspection.warnings, vec!["png-trailing-bytes"]);
     }
 
     #[test]
@@ -4680,19 +8097,26 @@ mod tests {
         ));
         bytes.extend_from_slice(&png_chunk(b"acTL", &[0, 0, 0, 2, 0, 0, 0, 0]));
 
-        let mut first_frame = [0u8; 26];
-        first_frame[20..22].copy_from_slice(&12u16.to_be_bytes());
-        first_frame[22..24].copy_from_slice(&100u16.to_be_bytes());
-        bytes.extend_from_slice(&png_chunk(b"fcTL", &first_frame));
+        let mut first_frame = png_fctl(0, 48, 32, 0, 0);
+        let delay_start = 8 + 20;
+        first_frame[delay_start..delay_start + 2].copy_from_slice(&12u16.to_be_bytes());
+        first_frame[delay_start + 2..delay_start + 4].copy_from_slice(&100u16.to_be_bytes());
+        let first_payload = first_frame[8..34].to_vec();
+        bytes.extend_from_slice(&png_chunk(b"fcTL", &first_payload));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[0]));
 
-        let mut second_frame = [0u8; 26];
-        second_frame[20..22].copy_from_slice(&24u16.to_be_bytes());
-        second_frame[22..24].copy_from_slice(&100u16.to_be_bytes());
-        bytes.extend_from_slice(&png_chunk(b"fcTL", &second_frame));
+        let mut second_frame_data = [0u8; 26];
+        second_frame_data[0..4].copy_from_slice(&1u32.to_be_bytes());
+        second_frame_data[4..8].copy_from_slice(&48u32.to_be_bytes());
+        second_frame_data[8..12].copy_from_slice(&32u32.to_be_bytes());
+        second_frame_data[20..22].copy_from_slice(&24u16.to_be_bytes());
+        second_frame_data[22..24].copy_from_slice(&100u16.to_be_bytes());
+        bytes.extend_from_slice(&png_chunk(b"fcTL", &second_frame_data));
+        bytes.extend_from_slice(&png_fdat(2, &[0]));
         bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
         fs::write(&input_path, bytes).expect("metadata-only png should be written");
 
-        let metadata = read_png_animation_metadata(&input_path)
+        let metadata = read_png_animation_metadata(&input_path, MediaLimits::default(), || Ok(()))
             .expect("metadata parser should read valid chunks")
             .expect("acTL should mark this as APNG metadata");
 
@@ -4702,6 +8126,47 @@ mod tests {
         assert_eq!(metadata.frame_durations.len(), 2);
         assert!(approx_eq(metadata.frame_durations[0], 0.12));
         assert!(approx_eq(metadata.frame_durations[1], 0.24));
+    }
+
+    #[test]
+    fn read_png_animation_metadata_accepts_native_writer_output() {
+        let test_dir = TestDir::new("apng-native-parser-positive");
+        let input_path = test_dir.path.join("native.png");
+        let frames = vec![
+            StickerFrame {
+                pixels: RgbaImage::new(3, 2),
+                duration_us: 120_000,
+            },
+            StickerFrame {
+                pixels: RgbaImage::from_pixel(3, 2, Rgba([1, 2, 3, 255])),
+                duration_us: 240_000,
+            },
+        ];
+        write_native_apng(&input_path, &frames, "standard")
+            .expect("native APNG fixture must be written");
+
+        let metadata = read_png_animation_metadata(&input_path, MediaLimits::default(), || Ok(()))
+            .expect("native APNG metadata must parse")
+            .expect("native APNG must contain animation metadata");
+
+        assert_eq!(metadata.frame_count, Some(2));
+        assert_eq!(metadata.frame_durations.len(), 2);
+    }
+
+    #[test]
+    fn write_native_apng_maps_sub_tick_duration_to_typed_invalid_request() {
+        let test_dir = TestDir::new("apng-invalid-duration-error");
+        let output_path = test_dir.path.join("invalid.png");
+        let frames = vec![StickerFrame {
+            pixels: RgbaImage::new(1, 1),
+            duration_us: 99,
+        }];
+
+        let error = write_native_apng(&output_path, &frames, "standard")
+            .expect_err("sub-tick authored duration must be rejected");
+
+        assert_eq!(error.code(), "invalid-request");
+        assert_eq!(error.reason_code(), Some("invalid-frame-duration"));
     }
 
     #[cfg(target_os = "windows")]
@@ -4731,8 +8196,12 @@ mod tests {
         write_native_apng(&output_path, &expected_frames, "compact")
             .expect("sparse APNG should be written");
 
-        let decoded_frames = decode_apng_animation_frames(output_path.to_string_lossy().as_ref())
-            .expect("sparse APNG should decode");
+        let decoded_frames = decode_apng_animation_frames(
+            output_path.to_string_lossy().as_ref(),
+            MediaLimits::default(),
+            || Ok(()),
+        )
+        .expect("sparse APNG should decode");
 
         assert_eq!(decoded_frames.len(), expected_frames.len());
         for (decoded, expected) in decoded_frames.iter().zip(expected_frames.iter()) {
@@ -4780,6 +8249,7 @@ mod tests {
             Some(48),
             &candidate,
             Some(selected_frames.as_slice()),
+            None,
             None,
         )
         .expect("encoding should succeed");
@@ -5053,6 +8523,7 @@ mod tests {
             let response = run_optimizer_search_internal(
                 OptimizerSearchRequest {
                     input_path: input_path.clone(),
+                    source_revision: inspection.source_revision.clone(),
                     output_directory: Some(output_dir.to_string_lossy().into_owned()),
                     locale: Some("en".into()),
                     source_duration_seconds: inspection.duration_seconds,
@@ -5188,6 +8659,7 @@ mod tests {
             Some(test_dir.path.to_string_lossy().as_ref()),
             None,
             UiLocale::En,
+            None,
         );
 
         assert!(result.ok, "jpg conversion should succeed");
@@ -5224,6 +8696,7 @@ mod tests {
             Some(test_dir.path.to_string_lossy().as_ref()),
             Some(&crop_region),
             UiLocale::En,
+            None,
         );
 
         assert!(result.ok, "large static image conversion should succeed");
@@ -5251,6 +8724,7 @@ mod tests {
             Some(test_dir.path.to_string_lossy().as_ref()),
             None,
             UiLocale::En,
+            None,
         );
 
         assert!(result.ok, "png conversion should succeed");
@@ -5302,6 +8776,7 @@ mod tests {
             &candidate,
             None,
             Some(timeline_frames.as_slice()),
+            None,
         )
         .expect("timeline-based encoding should succeed");
         assert_eq!(result.tool_source, "native");
@@ -5329,10 +8804,15 @@ mod tests {
     fn run_optimizer_search_internal_accepts_timeline_frames() {
         let test_dir = TestDir::new("timeline-search");
         let input_path = create_three_frame_animation(&test_dir);
+        let source_revision =
+            SourceIdentity::from_path(Path::new(&input_path), MediaLimits::default())
+                .expect("timeline source identity must be created")
+                .revision();
 
         let response = run_optimizer_search_internal(
             OptimizerSearchRequest {
                 input_path,
+                source_revision: Some(source_revision),
                 output_directory: Some(test_dir.path.to_string_lossy().into_owned()),
                 locale: Some("en".into()),
                 source_duration_seconds: Some(0.72),
@@ -5380,9 +8860,12 @@ mod tests {
 
     #[test]
     fn run_optimizer_search_rejects_empty_frame_selection() {
+        let (_test_dir, input_path, source_revision) =
+            revisioned_placeholder("empty-frame-selection");
         let response = run_optimizer_search_internal(
             OptimizerSearchRequest {
-                input_path: "ignored.png".into(),
+                input_path,
+                source_revision: Some(source_revision),
                 output_directory: None,
                 locale: Some("en".into()),
                 source_duration_seconds: Some(1.0),
@@ -5403,7 +8886,8 @@ mod tests {
         );
 
         assert!(!response.ok);
-        assert_eq!(response.error_code.as_deref(), Some("no-frames-selected"));
+        assert_eq!(response.error_code.as_deref(), Some("invalid-request"));
+        assert_eq!(response.reason_code.as_deref(), Some("no-frames-selected"));
         assert_eq!(
             response.error_message.as_deref(),
             Some("Select at least one frame before exporting.")
@@ -5411,10 +8895,83 @@ mod tests {
     }
 
     #[test]
+    fn plan_and_search_preserve_invalid_frame_duration_for_99_microseconds() {
+        let timeline_frames = Some(vec![EditedTimelineFrame {
+            source_frame_id: 1,
+            duration_us: 99,
+        }]);
+        let plan = prepare_optimizer_plan(
+            &OptimizerPlanRequest {
+                locale: Some("en".into()),
+                source_duration_seconds: Some(0.000099),
+                input_width: Some(48),
+                input_height: Some(48),
+                avg_fps: Some(30.0),
+                fit_mode: Some("contain".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: Some(1),
+                timeline_frames: timeline_frames.clone(),
+            },
+            UiLocale::En,
+        );
+        assert!(!plan.ok);
+        assert_eq!(plan.error_code.as_deref(), Some("invalid-request"));
+        assert_eq!(plan.reason_code.as_deref(), Some("invalid-frame-duration"));
+        assert_eq!(
+            plan.error_message.as_deref(),
+            Some("One or more frame durations are invalid.")
+        );
+
+        let (_test_dir, input_path, source_revision) =
+            revisioned_placeholder("invalid-frame-duration-search");
+        let search = run_optimizer_search_internal(
+            OptimizerSearchRequest {
+                input_path,
+                source_revision: Some(source_revision),
+                output_directory: None,
+                locale: Some("en".into()),
+                source_duration_seconds: Some(0.000099),
+                input_width: Some(48),
+                input_height: Some(48),
+                avg_fps: Some(30.0),
+                fit_mode: Some("contain".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: Some(1),
+                timeline_frames,
+            },
+            UiLocale::En,
+        );
+        assert!(!search.ok);
+        assert!(search.attempts.is_empty());
+        assert_eq!(search.error_code.as_deref(), Some("invalid-request"));
+        assert_eq!(
+            search.reason_code.as_deref(),
+            Some("invalid-frame-duration")
+        );
+        assert_eq!(
+            search.error_message.as_deref(),
+            Some("One or more frame durations are invalid.")
+        );
+    }
+
+    #[test]
     fn run_optimizer_search_rejects_out_of_range_frame_selection() {
+        let (_test_dir, input_path, source_revision) =
+            revisioned_placeholder("out-of-range-frame-selection");
         let response = run_optimizer_search_internal(
             OptimizerSearchRequest {
-                input_path: "ignored.png".into(),
+                input_path,
+                source_revision: Some(source_revision),
                 output_directory: None,
                 locale: Some("en".into()),
                 source_duration_seconds: Some(1.0),
@@ -5435,13 +8992,54 @@ mod tests {
         );
 
         assert!(!response.ok);
+        assert_eq!(response.error_code.as_deref(), Some("invalid-request"));
         assert_eq!(
-            response.error_code.as_deref(),
+            response.reason_code.as_deref(),
             Some("invalid-frame-selection")
         );
         assert_eq!(
             response.error_message.as_deref(),
             Some("The selected frame list does not match the available frame markers.")
+        );
+    }
+
+    #[test]
+    fn run_optimizer_search_aborts_on_operation_wide_output_directory_error() {
+        let (test_dir, input_path, source_revision) =
+            revisioned_placeholder("search-output-directory-error");
+        let output_file = test_dir.path.join("not-a-directory");
+        fs::write(&output_file, b"file").expect("output conflict fixture must be written");
+
+        let response = run_optimizer_search_internal(
+            OptimizerSearchRequest {
+                input_path,
+                source_revision: Some(source_revision),
+                output_directory: Some(output_file.to_string_lossy().into_owned()),
+                locale: Some("en".into()),
+                source_duration_seconds: Some(0.1),
+                input_width: Some(1),
+                input_height: Some(1),
+                avg_fps: Some(10.0),
+                fit_mode: Some("contain".into()),
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: Some(1),
+                timeline_frames: None,
+            },
+            UiLocale::En,
+        );
+
+        assert!(!response.ok);
+        assert!(response.attempts.is_empty());
+        assert_eq!(response.real_attempt_count, 0);
+        assert_eq!(response.error_code.as_deref(), Some("invalid-request"));
+        assert_eq!(
+            response.reason_code.as_deref(),
+            Some("invalid-output-directory")
         );
     }
 
@@ -5561,7 +9159,8 @@ mod tests {
         );
 
         assert!(!response.ok);
-        assert_eq!(response.error_code.as_deref(), Some("duration-too-long"));
+        assert_eq!(response.error_code.as_deref(), Some("invalid-request"));
+        assert_eq!(response.reason_code.as_deref(), Some("duration-too-long"));
     }
 
     #[test]
@@ -5650,7 +9249,8 @@ mod tests {
 
         assert!(!response.ok);
         assert!(response.candidates.is_empty());
-        assert_eq!(response.error_code.as_deref(), Some("duration-too-long"));
+        assert_eq!(response.error_code.as_deref(), Some("invalid-request"));
+        assert_eq!(response.reason_code.as_deref(), Some("duration-too-long"));
     }
 
     #[test]
@@ -5807,7 +9407,7 @@ async fn run_optimizer_search(request: OptimizerSearchRequest) -> OptimizerSearc
 
     match run_blocking_task(move || run_optimizer_search_internal(request, locale)).await {
         Ok(result) => result,
-        Err(error) => OptimizerSearchResponse {
+        Err(_) => OptimizerSearchResponse {
             ok: false,
             fit_mode: CANONICAL_FIT_MODE.into(),
             selected_duration_seconds: None,
@@ -5824,11 +9424,9 @@ async fn run_optimizer_search(request: OptimizerSearchRequest) -> OptimizerSearc
             best_output_path: None,
             best_size_bytes: None,
             best_within_limit: false,
+            reason_code: None,
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(format!(
-                "{} ({error})",
-                locale::internal_task_error_message(locale)
-            )),
+            error_message: Some(locale::internal_task_error_message(locale)),
         },
     }
 }
@@ -5836,27 +9434,36 @@ async fn run_optimizer_search(request: OptimizerSearchRequest) -> OptimizerSearc
 #[tauri::command]
 async fn extract_frame_preview(
     input_path: String,
+    source_revision: Option<String>,
     source_frame_id: u32,
     locale: Option<String>,
 ) -> FramePreviewResponse {
     let locale = parse_ui_locale(locale.as_deref());
 
     match run_blocking_task(move || {
-        extract_frame_preview_internal(&input_path, source_frame_id, locale)
+        let identity = match validate_source_revision(
+            Path::new(&input_path),
+            source_revision.as_deref(),
+            MediaLimits::default(),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return frame_preview_pipeline_error(&error, locale),
+        };
+        let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
+        let response = extract_frame_preview_internal(&canonical_path, source_frame_id, locale);
+        finalize_frame_preview_source(&identity, response, locale)
     })
     .await
     {
         Ok(response) => response,
-        Err(error) => FramePreviewResponse {
+        Err(_) => FramePreviewResponse {
             ok: false,
             data_url: None,
             width: None,
             height: None,
+            reason_code: None,
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(format!(
-                "{} ({error})",
-                locale::internal_task_error_message(locale)
-            )),
+            error_message: Some(locale::internal_task_error_message(locale)),
         },
     }
 }
@@ -5864,25 +9471,35 @@ async fn extract_frame_preview(
 #[tauri::command]
 async fn extract_frame_previews(
     input_path: String,
-    source_frame_ids: Vec<u32>,
+    source_revision: Option<String>,
+    source_frame_ids: BoundedFrameIds,
     locale: Option<String>,
 ) -> FramePreviewsResponse {
     let locale = parse_ui_locale(locale.as_deref());
+    let source_frame_ids = source_frame_ids.0;
 
     match run_blocking_task(move || {
-        extract_frame_previews_internal(&input_path, &source_frame_ids, locale)
+        let identity = match validate_source_revision(
+            Path::new(&input_path),
+            source_revision.as_deref(),
+            MediaLimits::default(),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return frame_previews_pipeline_error(&error, locale),
+        };
+        let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
+        let response = extract_frame_previews_internal(&canonical_path, &source_frame_ids, locale);
+        finalize_frame_previews_source(&identity, response, locale)
     })
     .await
     {
         Ok(response) => response,
-        Err(error) => FramePreviewsResponse {
+        Err(_) => FramePreviewsResponse {
             ok: false,
             previews: Vec::new(),
+            reason_code: None,
             error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(format!(
-                "{} ({error})",
-                locale::internal_task_error_message(locale)
-            )),
+            error_message: Some(locale::internal_task_error_message(locale)),
         },
     }
 }

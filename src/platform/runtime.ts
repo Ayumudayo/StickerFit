@@ -42,7 +42,9 @@ function isMediaOperationErrorCode(
   value: unknown,
 ): value is MediaOperationErrorCode {
   return (
-    typeof value === "string" && MEDIA_OPERATION_ERROR_CODES.has(value)
+    typeof value === "string" &&
+    value.length <= 64 &&
+    MEDIA_OPERATION_ERROR_CODES.has(value)
   );
 }
 
@@ -50,8 +52,43 @@ function isMediaOperationReasonCode(
   value: unknown,
 ): value is MediaOperationReasonCode {
   return (
-    typeof value === "string" && MEDIA_OPERATION_REASON_CODES.has(value)
+    typeof value === "string" &&
+    value.length <= 64 &&
+    MEDIA_OPERATION_REASON_CODES.has(value)
   );
+}
+
+function containsPathSignal(value: string) {
+  return (
+    /[A-Za-z]:[\\/]/.test(value) ||
+    /\\\\/.test(value) ||
+    /(?:^|[^A-Za-z0-9])\/[^\s]/.test(value) ||
+    /(?:^|[^A-Za-z0-9])\\[^\s]/.test(value)
+  );
+}
+
+function boundedUnknownValue(value: unknown) {
+  const valueType = typeof value;
+  let serialized: string;
+
+  if (valueType === "string") {
+    const stringValue = value as string;
+    return stringValue.length > 256
+      ? `${stringValue.slice(0, 256)}…`
+      : stringValue;
+  } else if (value === null) {
+    serialized = "null";
+  } else if (
+    valueType === "number" ||
+    valueType === "boolean" ||
+    valueType === "undefined"
+  ) {
+    serialized = String(value);
+  } else {
+    serialized = `[${valueType}]`;
+  }
+
+  return serialized;
 }
 
 function diagnosticMessage(value: unknown) {
@@ -59,17 +96,49 @@ function diagnosticMessage(value: unknown) {
     return null;
   }
 
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
+  const sample = value.length > 513 ? value.slice(0, 513) : value;
+  const trimmed = sample.trim();
+  if (containsPathSignal(trimmed)) {
+    return "[path redacted]";
+  }
+  const escapedControls = Array.from(trimmed, (character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f)
+      ? `\\u{${codePoint.toString(16).padStart(4, "0")}}`
+      : character;
+  }).join("");
+  if (!escapedControls) {
+    return null;
+  }
+  return escapedControls.length > 512 || sample.length < value.length
+    ? `${escapedControls.slice(0, 512)}…`
+    : escapedControls;
+}
+
+function safeLegacyValue(value: string) {
+  const sample = value.length > 129 ? value.slice(0, 129) : value;
+  if (containsPathSignal(sample)) {
+    return "[path-redacted]";
+  }
+  const escaped = Array.from(sample, (character) =>
+    /^[A-Za-z0-9._\[\]-]$/.test(character)
+      ? character
+      : `\\u{${(character.codePointAt(0) ?? 0)
+          .toString(16)
+          .padStart(4, "0")}}`,
+  ).join("");
+  return escaped.length > 128 || sample.length < value.length
+    ? `${escaped.slice(0, 128)}…`
+    : escaped;
 }
 
 function withLegacyCodeDiagnostic(message: string | null, code: string) {
-  const suffix = `(legacy code: ${code})`;
+  const suffix = `(legacy code: ${safeLegacyValue(code)})`;
   return message ? `${message} ${suffix}` : suffix;
 }
 
 function withLegacyReasonDiagnostic(message: string | null, reason: string) {
-  const suffix = `(legacy reason code: ${reason})`;
+  const suffix = `(legacy reason code: ${safeLegacyValue(reason)})`;
   return message ? `${message} ${suffix}` : suffix;
 }
 
@@ -78,16 +147,31 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
     return { errorCode: null, reasonCode: null, diagnostics: null };
   }
 
-  const fields: RawMediaErrorFields =
-    typeof raw === "object" && raw !== null
-      ? (raw as RawMediaErrorFields)
-      : { errorCode: raw };
-  const rawCode = fields.errorCode;
-  const rawReasonCode = fields.reasonCode;
-  const diagnostics =
-    raw instanceof Error
-      ? diagnosticMessage(raw.message)
-      : diagnosticMessage(fields.errorMessage);
+  let rawCode: unknown;
+  let rawReasonCode: unknown;
+  let rawErrorMessage: unknown;
+  try {
+    if (typeof raw === "object" && raw !== null) {
+      const fields = raw as RawMediaErrorFields;
+      const isError = raw instanceof Error;
+      rawCode = fields.errorCode;
+      rawReasonCode = fields.reasonCode;
+      rawErrorMessage = isError
+        ? (raw as Error).message
+        : fields.errorMessage;
+    } else {
+      rawCode = raw;
+      rawReasonCode = undefined;
+      rawErrorMessage = undefined;
+    }
+  } catch {
+    return {
+      errorCode: "internal-task-failed",
+      reasonCode: null,
+      diagnostics: null,
+    };
+  }
+  const diagnostics = diagnosticMessage(rawErrorMessage);
   const rawCodeIsKnown =
     isMediaOperationErrorCode(rawCode) ||
     isMediaOperationReasonCode(rawCode) ||
@@ -98,7 +182,7 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
   if (rawCode !== null && rawCode !== undefined && !rawCodeIsKnown) {
     let unknownDiagnostics = withLegacyCodeDiagnostic(
       diagnostics,
-      String(rawCode),
+      boundedUnknownValue(rawCode),
     );
     if (
       rawReasonCode !== null &&
@@ -107,7 +191,7 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
     ) {
       unknownDiagnostics = withLegacyReasonDiagnostic(
         unknownDiagnostics,
-        String(rawReasonCode),
+        boundedUnknownValue(rawReasonCode),
       );
     }
 
@@ -128,12 +212,26 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
       reasonCode: null,
       diagnostics: withLegacyReasonDiagnostic(
         diagnostics,
-        String(rawReasonCode),
+        boundedUnknownValue(rawReasonCode),
       ),
     };
   }
 
   if (isMediaOperationErrorCode(rawCode)) {
+    if (
+      isMediaOperationReasonCode(rawReasonCode) &&
+      rawCode !== "invalid-request" &&
+      !(rawCode === "malformed-media" && rawReasonCode === "decode-failed")
+    ) {
+      return {
+        errorCode: "internal-task-failed",
+        reasonCode: null,
+        diagnostics: withLegacyReasonDiagnostic(
+          withLegacyCodeDiagnostic(diagnostics, rawCode),
+          rawReasonCode,
+        ),
+      };
+    }
     return {
       errorCode: rawCode,
       reasonCode: isMediaOperationReasonCode(rawReasonCode)
@@ -190,7 +288,7 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
     };
   }
 
-  const legacyCode = String(rawCode);
+  const legacyCode = boundedUnknownValue(rawCode);
   return {
     errorCode: "internal-task-failed",
     reasonCode: null,
@@ -226,12 +324,39 @@ export function normalizeLegacyOptimizerSearchResponse<
 export function buildWebFileSourceRevision(
   file: Pick<File, "name" | "size" | "lastModified" | "type">,
 ) {
-  return JSON.stringify([
+  const identity = JSON.stringify([
     file.name,
     file.size,
     file.lastModified,
     file.type,
   ]);
+  let hash = 0xcbf29ce484222325n;
+  for (let index = 0; index < identity.length; index += 1) {
+    hash ^= BigInt(identity.charCodeAt(index));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+
+  return `web-${hash.toString(16).padStart(16, "0")}`;
+}
+
+export function normalizeInspectionSourceRevision(input: {
+  ok: boolean;
+  sourceRevision?: unknown;
+}): string | null {
+  if (!input.ok) {
+    return null;
+  }
+
+  if (
+    typeof input.sourceRevision !== "string" ||
+    !input.sourceRevision.trim()
+  ) {
+    throw new Error(
+      "Successful media inspection did not include a source revision.",
+    );
+  }
+
+  return input.sourceRevision;
 }
 
 type LegacyMediaResponse<T> = Omit<T, keyof MediaOperationErrorFields> &
@@ -240,7 +365,7 @@ type LegacyMediaResponse<T> = Omit<T, keyof MediaOperationErrorFields> &
 type RuntimeInspectionPayload = Omit<
   LegacyMediaResponse<MediaInspection>,
   "backendInputPath" | "previewSrc" | "inputSourceKind" | "sourceRevision"
-> & { sourceRevision?: string | null };
+> & { sourceRevision: string | null };
 
 type LegacyOptimizerSearchResponse = LegacyMediaResponse<
   Omit<OptimizerSearchResponse, "attempts">
@@ -371,11 +496,16 @@ function createMediaErrorInspection(
     frameRateLabel: null,
     estimatedFrames: null,
     frameDurationsSeconds: null,
+    warnings: [],
     isStaticImage: true,
     canConvertToPng: false,
     errorCode: "malformed-media",
     reasonCode: "decode-failed",
-    errorMessage: error instanceof Error ? error.message : String(error),
+    errorMessage:
+      diagnosticMessage(
+        error instanceof Error ? error.message : boundedUnknownValue(error),
+      ) ??
+      "Browser media inspection failed.",
   };
 }
 
@@ -445,6 +575,7 @@ function createBrowserVideoInspection(file: File, previewSrc: string, metadata: 
     frameRateLabel: `${DEFAULT_BROWSER_VIDEO_FPS}`,
     estimatedFrames,
     frameDurationsSeconds: null,
+    warnings: [],
     isStaticImage: false,
     canConvertToPng: false,
     errorCode: null,
@@ -478,6 +609,7 @@ function createBrowserImageInspection(file: File, previewSrc: string, metadata: 
     frameRateLabel: null,
     estimatedFrames: null,
     frameDurationsSeconds: null,
+    warnings: [],
     isStaticImage: true,
     canConvertToPng: false,
     errorCode: null,
@@ -630,7 +762,7 @@ const tauriRuntime: AppRuntime = {
     return {
       ...normalized,
       inputPath: source.path,
-      sourceRevision: result.sourceRevision ?? null,
+      sourceRevision: normalizeInspectionSourceRevision(result),
       backendInputPath: source.path,
       previewSrc: convertFileSrc(source.path),
       inputSourceKind: "path",
@@ -674,6 +806,7 @@ const tauriRuntime: AppRuntime = {
       "extract_frame_preview",
       {
         inputPath: request.inputPath,
+        sourceRevision: request.sourceRevision,
         sourceFrameId: request.sourceFrameId,
         locale: request.locale,
       },
@@ -686,6 +819,7 @@ const tauriRuntime: AppRuntime = {
       "extract_frame_previews",
       {
         inputPath: request.inputPath,
+        sourceRevision: request.sourceRevision,
         sourceFrameIds: request.sourceFrameIds,
         locale: request.locale,
       },

@@ -36,6 +36,7 @@ import {
   latestActiveWorkflowState,
   type WorkflowFingerprints,
 } from "./hooks/mediaWorkflow/workflowFingerprint";
+import { buildFramePreviewsRequest } from "./hooks/mediaWorkflow/mediaRequestBuilders";
 import { usePlaybackTimelineController } from "./hooks/usePlaybackTimelineController";
 import { editorText } from "./locales/editorText";
 import {
@@ -370,10 +371,14 @@ export default function App() {
     !inspection.isStaticImage &&
     previewKind === "image" &&
     Boolean(inspection.backendInputPath) &&
+    Boolean(inspection.sourceRevision) &&
     /\.(gif|apng|png)$/i.test(inspection.backendInputPath ?? "");
 
   useEffect(() => {
-    const backendInputPath = inspection?.backendInputPath;
+    const request = buildFramePreviewsRequest(inspection, {
+      sourceFrameIds: framePreviewSourceFrameIds,
+      locale,
+    });
     const requestId = framePreviewRequestIdRef.current + 1;
     framePreviewRequestIdRef.current = requestId;
 
@@ -383,7 +388,7 @@ export default function App() {
 
     if (
       !requiresBackendFramePreview ||
-      !backendInputPath ||
+      !request ||
       framePreviewSourceFrameIds.length === 0
     ) {
       return;
@@ -391,11 +396,7 @@ export default function App() {
 
     const timeoutId = window.setTimeout(() => {
       void runtime
-        .extractFramePreviews({
-          inputPath: backendInputPath,
-          sourceFrameIds: framePreviewSourceFrameIds,
-          locale,
-        })
+        .extractFramePreviews(request)
         .then((result) => {
           if (framePreviewRequestIdRef.current !== requestId) {
             return;
@@ -404,7 +405,11 @@ export default function App() {
           if (result?.ok) {
             for (const preview of result.previews) {
               framePreviewCacheRef.current.set(
-                `${backendInputPath}:${preview.sourceFrameId}`,
+                [
+                  request.inputPath,
+                  request.sourceRevision,
+                  preview.sourceFrameId,
+                ].join(":"),
                 preview.dataUrl,
               );
             }
@@ -425,6 +430,7 @@ export default function App() {
   }, [
     framePreviewSourceFrameIds,
     inspection?.backendInputPath,
+    inspection?.sourceRevision,
     locale,
     requiresBackendFramePreview,
     runtime,
@@ -432,12 +438,22 @@ export default function App() {
 
   useEffect(() => {
     const backendInputPath = inspection?.backendInputPath;
-    if (!requiresBackendFramePreview || !backendInputPath || !currentPreviewFrame) {
+    const sourceRevision = inspection?.sourceRevision;
+    if (
+      !requiresBackendFramePreview ||
+      !backendInputPath ||
+      !sourceRevision ||
+      !currentPreviewFrame
+    ) {
       setFramePreviewSrc(null);
       return;
     }
 
-    const cacheKey = `${backendInputPath}:${currentPreviewFrame.sourceFrameId}`;
+    const cacheKey = [
+      backendInputPath,
+      sourceRevision,
+      currentPreviewFrame.sourceFrameId,
+    ].join(":");
     const cachedPreview = framePreviewCacheRef.current.get(cacheKey);
     if (cachedPreview) {
       setFramePreviewSrc(cachedPreview);
@@ -446,6 +462,7 @@ export default function App() {
     currentPreviewFrame,
     framePreviewCacheVersion,
     inspection?.backendInputPath,
+    inspection?.sourceRevision,
     requiresBackendFramePreview,
   ]);
 

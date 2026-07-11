@@ -1,8 +1,21 @@
 import { useEffect, useState } from "react";
 
-import type { Locale } from "../../locales/messages";
+import {
+  MEDIA_OPERATION_MESSAGES,
+  type Locale,
+} from "../../locales/messages";
 import type { AppRuntime } from "../../platform/runtime";
 import type { ToolHealthReport } from "../../types/workflow";
+
+export function canonicalToolHealthFailureMessage(
+  initialLocale: Locale,
+  rejection: unknown,
+) {
+  void rejection;
+  return MEDIA_OPERATION_MESSAGES[initialLocale].errorCodes[
+    "internal-task-failed"
+  ];
+}
 
 export function useToolHealthReport(runtime: AppRuntime, initialLocale: Locale) {
   const [toolReport, setToolReport] = useState<ToolHealthReport | null>(null);
@@ -20,7 +33,7 @@ export function useToolHealthReport(runtime: AppRuntime, initialLocale: Locale) 
         }
       } catch (error) {
         if (!cancelled) {
-          setToolError(error instanceof Error ? error.message : String(error));
+          setToolError(canonicalToolHealthFailureMessage(initialLocale, error));
         }
       }
     }

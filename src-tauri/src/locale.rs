@@ -74,6 +74,66 @@ pub(crate) fn legacy_fit_mode_fallback_warning(locale: UiLocale) -> String {
     )
 }
 
+pub(crate) fn media_pipeline_diagnostic(locale: UiLocale, error_code: &str) -> String {
+    match error_code {
+        "cancelled" => tr(
+            locale,
+            "The media operation was cancelled.",
+            "미디어 작업이 취소되었습니다.",
+        ),
+        "timed-out" => tr(
+            locale,
+            "The media operation timed out.",
+            "미디어 작업 시간이 초과되었습니다.",
+        ),
+        "operation-conflict" => tr(
+            locale,
+            "Another media operation is already using this resource.",
+            "다른 미디어 작업이 이 자원을 사용 중입니다.",
+        ),
+        "invalid-request" => tr(
+            locale,
+            "The media request is no longer valid.",
+            "미디어 요청이 더 이상 유효하지 않습니다.",
+        ),
+        "source-changed" => tr(
+            locale,
+            "The source file changed. Inspect it again before continuing.",
+            "원본 파일이 변경되었습니다. 계속하기 전에 다시 검사하세요.",
+        ),
+        "media-input-too-large"
+        | "media-dimensions-too-large"
+        | "media-frame-limit"
+        | "decoded-byte-limit"
+        | "png-chunk-limit" => tr(
+            locale,
+            "The media exceeds StickerFit's safe processing limits.",
+            "미디어가 StickerFit의 안전한 처리 한도를 초과했습니다.",
+        ),
+        "malformed-media" | "malformed-process-output" => tr(
+            locale,
+            "The media data is malformed or incomplete.",
+            "미디어 데이터가 손상되었거나 불완전합니다.",
+        ),
+        "tool-missing" => tr(
+            locale,
+            "A required media tool is unavailable.",
+            "필요한 미디어 도구를 사용할 수 없습니다.",
+        ),
+        "process-failed" => tr(
+            locale,
+            "A media tool could not complete the operation.",
+            "미디어 도구가 작업을 완료하지 못했습니다.",
+        ),
+        "output-conflict" => tr(
+            locale,
+            "The selected output already exists.",
+            "선택한 출력이 이미 존재합니다.",
+        ),
+        _ => internal_task_error_message(locale),
+    }
+}
+
 pub(crate) fn selected_duration_limit_error(locale: UiLocale) -> String {
     tr(
         locale,
@@ -95,6 +155,14 @@ pub(crate) fn invalid_frame_selection_error(locale: UiLocale) -> String {
         locale,
         "The selected frame list does not match the available frame markers.",
         "선택한 프레임 목록이 현재 프레임 표식 범위와 맞지 않습니다.",
+    )
+}
+
+pub(crate) fn invalid_frame_duration_error(locale: UiLocale) -> String {
+    tr(
+        locale,
+        "One or more frame durations are invalid.",
+        "하나 이상의 프레임 길이가 올바르지 않습니다.",
     )
 }
 

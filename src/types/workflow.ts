@@ -73,11 +73,13 @@ export type OptimizerPlanRequest = {
 
 export type OptimizerSearchRequest = OptimizerPlanRequest & {
   inputPath: string;
+  sourceRevision: string;
   outputDirectory: string | null;
 };
 
 export type StaticImageConversionRequest = {
   inputPath: string;
+  sourceRevision: string;
   outputDirectory: string | null;
   locale: Locale;
   cropRegion: CropRegion;
@@ -85,6 +87,7 @@ export type StaticImageConversionRequest = {
 
 export type FramePreviewRequest = {
   inputPath: string;
+  sourceRevision: string;
   sourceFrameId: number;
   locale: Locale;
 };
@@ -98,6 +101,7 @@ export type FramePreviewResult = {
 
 export type FramePreviewsRequest = {
   inputPath: string;
+  sourceRevision: string;
   sourceFrameIds: number[];
   locale: Locale;
 };
@@ -135,7 +139,7 @@ export type ToolHealthReport = {
 export type MediaInspection = {
   ok: boolean;
   inputPath: string;
-  sourceRevision?: string | null;
+  sourceRevision: string | null;
   backendInputPath: string | null;
   previewSrc: string;
   inputSourceKind: InputSourceKind;
@@ -153,6 +157,7 @@ export type MediaInspection = {
   frameRateLabel: string | null;
   estimatedFrames: number | null;
   frameDurationsSeconds: number[] | null;
+  warnings: string[];
   isStaticImage: boolean;
   canConvertToPng: boolean;
 } & MediaOperationErrorFields;

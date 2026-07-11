@@ -17,12 +17,14 @@ import type {
   OptimizerPlanResponse,
   OptimizerPresetStrategy,
   OptimizerSearchDepth,
-  OptimizerSearchRequest,
   OptimizerSearchResponse,
-  StaticImageConversionRequest,
   StaticImageConversionResult,
   TimelineFrameRequest,
 } from "../types/workflow";
+import {
+  buildOptimizerSearchRequest,
+  buildStaticImageConversionRequest,
+} from "./mediaWorkflow/mediaRequestBuilders";
 import {
   isCurrentWorkflowRequest,
   workflowStateFromResult,
@@ -375,6 +377,24 @@ export function useMediaWorkflowController({
         return null;
       }
 
+      const request = buildOptimizerSearchRequest(inspection, {
+        ...buildOptimizerBaseRequest({
+          inspection,
+          locale,
+          presetStrategy: optimizerPresetStrategy,
+          optimizerGoal,
+          qualityFrameDropInterval,
+          searchDepth: optimizerSearchDepth,
+          cropRegion,
+          baseFrameCount,
+          editedTimelineFramesForRequest,
+        }),
+        outputDirectory,
+      });
+      if (!request) {
+        return null;
+      }
+
       const ticket: WorkflowRequestTicket = {
         revision: searchTicketRef.current + 1,
         fingerprint,
@@ -389,30 +409,12 @@ export function useMediaWorkflowController({
       });
 
       try {
-        if (
-          !runtime.capabilities.backendProcessing ||
-          !inspection.backendInputPath
-        ) {
+        if (!runtime.capabilities.backendProcessing) {
           throw new Error(
             "Desktop optimization is unavailable in browser preview mode.",
           );
         }
 
-        const request = {
-          ...buildOptimizerBaseRequest({
-            inspection,
-            locale,
-            presetStrategy: optimizerPresetStrategy,
-            optimizerGoal,
-            qualityFrameDropInterval,
-            searchDepth: optimizerSearchDepth,
-            cropRegion,
-            baseFrameCount,
-            editedTimelineFramesForRequest,
-          }),
-          inputPath: inspection.backendInputPath,
-          outputDirectory,
-        } satisfies OptimizerSearchRequest;
         const result = await runtime.runOptimizerSearch(request);
 
         if (
@@ -506,6 +508,15 @@ export function useMediaWorkflowController({
         return null;
       }
 
+      const request = buildStaticImageConversionRequest(inspection, {
+        outputDirectory,
+        locale,
+        cropRegion,
+      });
+      if (!request) {
+        return null;
+      }
+
       const ticket: WorkflowRequestTicket = {
         revision: conversionTicketRef.current + 1,
         fingerprint,
@@ -520,21 +531,13 @@ export function useMediaWorkflowController({
       });
 
       try {
-        if (
-          !runtime.capabilities.backendProcessing ||
-          !inspection.backendInputPath
-        ) {
+        if (!runtime.capabilities.backendProcessing) {
           throw new Error(
             "Desktop export is unavailable in browser preview mode.",
           );
         }
 
-        const result = await runtime.convertStaticImageToPng({
-          inputPath: inspection.backendInputPath,
-          outputDirectory,
-          locale,
-          cropRegion,
-        } satisfies StaticImageConversionRequest);
+        const result = await runtime.convertStaticImageToPng(request);
 
         if (
           !isCurrentOperation(
