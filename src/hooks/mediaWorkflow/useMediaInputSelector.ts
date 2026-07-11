@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Locale } from "../../locales/messages";
 import type { AppRuntime } from "../../platform/runtime";
 import { releaseInspectionPreview, type RuntimeInputSource } from "../../platform/runtime";
+import { createMediaOperationId } from "../../platform/mediaOperationId";
 import type { MediaInspection } from "../../types/workflow";
 import {
   createRequestLifecycleCoordinator,
@@ -40,6 +41,7 @@ export function useMediaInputSelector({
   const [inspectionLoading, setInspectionLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [outputDirectory, setOutputDirectory] = useState<string | null>(null);
+  const inspectionAbortControllerRef = useRef<AbortController | null>(null);
 
   const requestLifecycleRef = useRef<RequestLifecycleCoordinator<MediaInspection> | null>(
     null,
@@ -54,13 +56,27 @@ export function useMediaInputSelector({
 
   const inspectSource = useCallback(
     async (source: RuntimeInputSource) => {
-      await requestLifecycle.run({
-        fingerprint: inputSourceFingerprint(source),
-        request: () => runtime.inspectInput(source, locale),
-        onBegin: onResetForNewInspection,
-        onCommit: onCommitEditorSession,
-        onLoadingChange: setInspectionLoading,
-      });
+      inspectionAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      inspectionAbortControllerRef.current = controller;
+      const operationId = createMediaOperationId();
+      try {
+        await requestLifecycle.run({
+          fingerprint: inputSourceFingerprint(source),
+          request: () =>
+            runtime.inspectInput(source, locale, {
+              operationId,
+              signal: controller.signal,
+            }),
+          onBegin: onResetForNewInspection,
+          onCommit: onCommitEditorSession,
+          onLoadingChange: setInspectionLoading,
+        });
+      } finally {
+        if (inspectionAbortControllerRef.current === controller) {
+          inspectionAbortControllerRef.current = null;
+        }
+      }
     },
     [
       locale,
@@ -102,6 +118,7 @@ export function useMediaInputSelector({
 
   useEffect(() => {
     return () => {
+      inspectionAbortControllerRef.current?.abort();
       requestLifecycle.invalidate();
     };
   }, [requestLifecycle]);

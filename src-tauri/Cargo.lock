@@ -528,6 +528,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
+ "tokio",
+ "tokio-util",
  "unicode-normalization",
  "windows",
 ]
@@ -3611,6 +3613,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

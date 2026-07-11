@@ -20,6 +20,7 @@ type PreviewUtilityActionsProps = {
   onToggleAdvancedSettings: () => void;
   onToggleResults: () => void;
   onRunOptimizer: () => void;
+  onCancelOptimizer: () => void;
   onConvertToPng: () => void;
 };
 
@@ -41,6 +42,7 @@ export function PreviewUtilityActions({
   onToggleAdvancedSettings,
   onToggleResults,
   onRunOptimizer,
+  onCancelOptimizer,
   onConvertToPng,
 }: PreviewUtilityActionsProps) {
   const previewCandidatesDisabledReason = !supportsDesktopProcessing
@@ -125,16 +127,21 @@ export function PreviewUtilityActions({
       <button
         className="primaryAction previewUtilityPrimaryAction"
         type="button"
-        disabled={!supportsDesktopProcessing || searchLoading || timelineFrameCount === 0}
-        title={optimizerDisabledReason}
+        disabled={
+          !searchLoading &&
+          (!supportsDesktopProcessing || timelineFrameCount === 0)
+        }
+        title={searchLoading ? undefined : optimizerDisabledReason}
         aria-label={
-          optimizerDisabledReason
+          searchLoading
+            ? copy.cancelOptimizer
+            : optimizerDisabledReason
             ? `${copy.runOptimizer}. ${optimizerDisabledReason}`
             : copy.runOptimizer
         }
-        onClick={onRunOptimizer}
+        onClick={searchLoading ? onCancelOptimizer : onRunOptimizer}
       >
-        <span>{searchLoading ? copy.runningOptimizer : copy.runOptimizer}</span>
+        <span>{searchLoading ? copy.cancelOptimizer : copy.runOptimizer}</span>
         <ExpandIcon size={18} className="ctaIcon gapIcon" />
       </button>
     </div>

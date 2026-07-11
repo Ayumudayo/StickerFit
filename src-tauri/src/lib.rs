@@ -1,6 +1,7 @@
 mod locale;
 mod media_error;
 mod media_limits;
+mod operation;
 mod output_file;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -35,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Instant;
+use tauri::{ipc::Channel, State};
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
@@ -52,6 +54,10 @@ use crate::locale::{parse_ui_locale, UiLocale};
 use crate::media_error::PipelineError;
 use crate::media_limits::{
     checked_rgba_bytes, image_decode_limits, validate_file_metadata, MediaLimits, SourceIdentity,
+};
+use crate::operation::{
+    publish_progress, run_managed_blocking, ChannelProgressSink, MediaOperationKind,
+    OperationContext, OperationProgress, PipelineState, ProgressSink, ProgressStage,
 };
 use crate::output_file::PendingOutput;
 
@@ -2466,6 +2472,40 @@ fn extract_frame_preview_internal(
     source_frame_id: u32,
     locale: UiLocale,
 ) -> FramePreviewResponse {
+    extract_frame_preview_with_callbacks(
+        input_path,
+        source_frame_id,
+        locale,
+        || Ok(()),
+        |_, _, _| {},
+    )
+}
+
+fn extract_frame_preview_with_operation(
+    input_path: &str,
+    source_frame_id: u32,
+    locale: UiLocale,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> FramePreviewResponse {
+    extract_frame_preview_with_callbacks(
+        input_path,
+        source_frame_id,
+        locale,
+        || context.checkpoint(),
+        |stage, completed, total| {
+            publish_progress(progress, context, stage, completed, total);
+        },
+    )
+}
+
+fn extract_frame_preview_with_callbacks(
+    input_path: &str,
+    source_frame_id: u32,
+    locale: UiLocale,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
+) -> FramePreviewResponse {
     let Some(extension) = lowercase_source_extension(input_path) else {
         return frame_preview_pipeline_error(
             &PipelineError::InvalidRequest {
@@ -2493,27 +2533,42 @@ fn extract_frame_preview_internal(
         );
     }
 
+    progress(ProgressStage::Decoding, 0, Some(1));
     let frame = match decode_native_animation_frame(
         input_path,
         source_frame_id,
         MediaLimits::default(),
-        || Ok(()),
+        || checkpoint(),
     ) {
         Ok(frame) => frame,
         Err(error) => return frame_preview_pipeline_error(&error, locale),
     };
 
-    match encode_native_png_data_url(&frame.pixels) {
-        Ok(data_url) => FramePreviewResponse {
-            ok: true,
-            data_url: Some(data_url),
-            width: Some(frame.pixels.width()),
-            height: Some(frame.pixels.height()),
-            reason_code: None,
-            error_code: None,
-            error_message: None,
-        },
-        Err(error) => frame_preview_pipeline_error(&error, locale),
+    progress(ProgressStage::Encoding, 0, Some(1));
+    if let Err(error) = checkpoint() {
+        return frame_preview_pipeline_error(&error, locale);
+    }
+    let data_url = match encode_native_png_data_url(&frame.pixels) {
+        Ok(data_url) => data_url,
+        Err(error) => return frame_preview_pipeline_error(&error, locale),
+    };
+    if let Err(error) = checkpoint() {
+        return frame_preview_pipeline_error(&error, locale);
+    }
+    progress(ProgressStage::Encoding, 1, Some(1));
+    progress(ProgressStage::Finalizing, 1, Some(1));
+    if let Err(error) = checkpoint() {
+        return frame_preview_pipeline_error(&error, locale);
+    }
+
+    FramePreviewResponse {
+        ok: true,
+        data_url: Some(data_url),
+        width: Some(frame.pixels.width()),
+        height: Some(frame.pixels.height()),
+        reason_code: None,
+        error_code: None,
+        error_message: None,
     }
 }
 
@@ -2543,6 +2598,40 @@ fn extract_frame_previews_internal(
     input_path: &str,
     source_frame_ids: &[u32],
     locale: UiLocale,
+) -> FramePreviewsResponse {
+    extract_frame_previews_with_callbacks(
+        input_path,
+        source_frame_ids,
+        locale,
+        || Ok(()),
+        |_, _, _| {},
+    )
+}
+
+fn extract_frame_previews_with_operation(
+    input_path: &str,
+    source_frame_ids: &[u32],
+    locale: UiLocale,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> FramePreviewsResponse {
+    extract_frame_previews_with_callbacks(
+        input_path,
+        source_frame_ids,
+        locale,
+        || context.checkpoint(),
+        |stage, completed, total| {
+            publish_progress(progress, context, stage, completed, total);
+        },
+    )
+}
+
+fn extract_frame_previews_with_callbacks(
+    input_path: &str,
+    source_frame_ids: &[u32],
+    locale: UiLocale,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> FramePreviewsResponse {
     if source_frame_ids.len() > MAX_MEDIA_FRAME_COUNT {
         return frame_previews_pipeline_error(
@@ -2594,14 +2683,20 @@ fn extract_frame_previews_internal(
         );
     }
 
-    let frames = match decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))
-    {
-        Ok(frames) => frames,
-        Err(error) => return frame_previews_pipeline_error(&error, locale),
-    };
+    let total = u32::try_from(requested_frame_ids.len()).unwrap_or(u32::MAX);
+    progress(ProgressStage::Decoding, 0, Some(total));
+    let frames =
+        match decode_native_animation_frames(input_path, MediaLimits::default(), || checkpoint()) {
+            Ok(frames) => frames,
+            Err(error) => return frame_previews_pipeline_error(&error, locale),
+        };
 
+    progress(ProgressStage::Encoding, 0, Some(total));
     let mut previews = Vec::with_capacity(requested_frame_ids.len());
     for source_frame_id in requested_frame_ids {
+        if let Err(error) = checkpoint() {
+            return frame_previews_pipeline_error(&error, locale);
+        }
         let Some(frame) = frames.get((source_frame_id - 1) as usize) else {
             return frame_previews_pipeline_error(
                 &PipelineError::InvalidRequest {
@@ -2622,6 +2717,16 @@ fn extract_frame_previews_internal(
             width: frame.pixels.width(),
             height: frame.pixels.height(),
         });
+        progress(
+            ProgressStage::Encoding,
+            u32::try_from(previews.len()).unwrap_or(u32::MAX),
+            Some(total),
+        );
+    }
+
+    progress(ProgressStage::Finalizing, total, Some(total));
+    if let Err(error) = checkpoint() {
+        return frame_previews_pipeline_error(&error, locale);
     }
 
     FramePreviewsResponse {
@@ -2763,6 +2868,16 @@ fn write_native_apng<W: Write>(
     frames: &[StickerFrame],
     preset: &str,
 ) -> Result<(), PipelineError> {
+    write_native_apng_with_checkpoint(writer, frames, preset, || Ok(()))
+}
+
+fn write_native_apng_with_checkpoint<W: Write>(
+    writer: W,
+    frames: &[StickerFrame],
+    preset: &str,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+) -> Result<(), PipelineError> {
+    checkpoint()?;
     if frames.is_empty() {
         return Err(PipelineError::InvalidRequest {
             reason: "no-frames-selected",
@@ -2813,12 +2928,15 @@ fn write_native_apng<W: Write>(
     let mut png_writer = encoder
         .write_header()
         .map_err(|error| pipeline_io_error("write APNG header", error))?;
+    checkpoint()?;
     png_writer
         .write_image_data(frames[0].pixels.as_raw())
         .map_err(|error| pipeline_io_error("write APNG frame", error))?;
+    checkpoint()?;
 
     let mut previous_frame = frames[0].pixels.clone();
     for (frame, &(delay_num, delay_den)) in frames[1..].iter().zip(&frame_delays[1..]) {
+        checkpoint()?;
         let region = changed_frame_region(&previous_frame, &frame.pixels);
         png_writer
             .reset_frame_position()
@@ -2842,9 +2960,11 @@ fn write_native_apng<W: Write>(
         png_writer
             .write_image_data(&region_pixels)
             .map_err(|error| pipeline_io_error("write APNG frame", error))?;
+        checkpoint()?;
         previous_frame = frame.pixels.clone();
     }
 
+    checkpoint()?;
     png_writer
         .finish()
         .map_err(|error| pipeline_io_error("finish APNG output", error))
@@ -3078,6 +3198,32 @@ fn build_candidate_ladder(
     search_budget: usize,
     locale: UiLocale,
 ) -> Vec<CandidatePreview> {
+    build_candidate_ladder_with_checkpoint(
+        selected_frame_count,
+        source_fps,
+        input_width,
+        input_height,
+        preset_strategy,
+        optimizer_goal,
+        search_budget,
+        locale,
+        &mut || Ok(()),
+    )
+    .unwrap_or_default()
+}
+
+fn build_candidate_ladder_with_checkpoint(
+    selected_frame_count: usize,
+    source_fps: f64,
+    input_width: Option<u32>,
+    input_height: Option<u32>,
+    preset_strategy: &str,
+    optimizer_goal: &str,
+    search_budget: usize,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> Result<Vec<CandidatePreview>, PipelineError> {
+    checkpoint()?;
     let largest_input = input_width.unwrap_or(320).max(input_height.unwrap_or(320));
     let scale_ladder: Vec<f64> = match optimizer_goal {
         "motion" => vec![1.0, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44, 0.36],
@@ -3092,6 +3238,7 @@ fn build_candidate_ladder(
     let frame_sample_steps = frame_sample_steps_for_goal(selected_frame_count, optimizer_goal);
 
     for frame_sample_step in frame_sample_steps {
+        checkpoint()?;
         let encoded_frame_count = sampled_frame_count(selected_frame_count, frame_sample_step);
         let fps_ladder: Vec<u32> = [30, 27, 24, 21, 18, 15, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
             .into_iter()
@@ -3102,11 +3249,13 @@ fn build_candidate_ladder(
             .collect();
 
         for fps in fps_ladder {
+            checkpoint()?;
             let duration_seconds = candidate_duration_seconds(encoded_frame_count, fps);
             let preset_ladder = preset_ladder_for_strategy(duration_seconds, preset_strategy);
 
             for scale in &scale_ladder {
                 for preset in &preset_ladder {
+                    checkpoint()?;
                     let summary =
                         locale::candidate_summary(locale, fps, *scale, preset, duration_seconds);
                     let frame_retention_score =
@@ -3153,12 +3302,21 @@ fn build_candidate_ladder(
         }
     }
 
-    select_ranked_candidate_subset(candidates, search_budget)
+    checkpoint()?;
+    Ok(select_ranked_candidate_subset(candidates, search_budget))
 }
 
 fn prepare_optimizer_plan(
     request: &OptimizerPlanRequest,
     locale: UiLocale,
+) -> OptimizerPlanResponse {
+    prepare_optimizer_plan_with_checkpoint(request, locale, &mut || Ok(()))
+}
+
+fn prepare_optimizer_plan_with_checkpoint(
+    request: &OptimizerPlanRequest,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> OptimizerPlanResponse {
     let (fit_mode, fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
     let optimizer_goal = normalized_optimizer_goal(
@@ -3174,6 +3332,9 @@ fn prepare_optimizer_plan(
 
     if let Some(warning) = fit_warning {
         warnings.push(warning);
+    }
+    if let Err(error) = checkpoint() {
+        return optimizer_plan_pipeline_error(locale, warnings, &error);
     }
 
     let resolved_crop_region = match resolve_crop_region(
@@ -3439,6 +3600,21 @@ fn prepare_optimizer_plan(
         warnings.push(locale::recommended_duration_warning(locale));
     }
 
+    let candidates = match build_candidate_ladder_with_checkpoint(
+        frame_selection.selected_frame_count,
+        source_fps,
+        effective_input_width,
+        effective_input_height,
+        preset_strategy,
+        optimizer_goal,
+        search_budget,
+        locale,
+        checkpoint,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => return optimizer_plan_pipeline_error(locale, warnings, &error),
+    };
+
     OptimizerPlanResponse {
         ok: true,
         fit_mode: fit_mode.into(),
@@ -3446,19 +3622,29 @@ fn prepare_optimizer_plan(
         recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
         search_budget,
         warnings,
-        candidates: build_candidate_ladder(
-            frame_selection.selected_frame_count,
-            source_fps,
-            effective_input_width,
-            effective_input_height,
-            preset_strategy,
-            optimizer_goal,
-            search_budget,
-            locale,
-        ),
+        candidates,
         reason_code: None,
         error_code: None,
         error_message: None,
+    }
+}
+
+fn prepare_optimizer_plan_with_operation(
+    request: &OptimizerPlanRequest,
+    locale: UiLocale,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> OptimizerPlanResponse {
+    publish_progress(progress, context, ProgressStage::Estimating, 0, None);
+    let response =
+        prepare_optimizer_plan_with_checkpoint(request, locale, &mut || context.checkpoint());
+    if response.error_code.is_some() {
+        return response;
+    }
+    publish_progress(progress, context, ProgressStage::Finalizing, 1, Some(1));
+    match context.checkpoint() {
+        Ok(()) => response,
+        Err(error) => optimizer_plan_pipeline_error(locale, response.warnings, &error),
     }
 }
 
@@ -3472,6 +3658,7 @@ fn encode_candidate_from_native_animation_internal(
     candidate: &CandidatePreview,
     timeline_frames: &[ResolvedTimelineFrame],
     expected_source: Option<&SourceIdentity>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<EncodeResult, PipelineError> {
     let output_directory =
         resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
@@ -3480,7 +3667,7 @@ fn encode_candidate_from_native_animation_internal(
             }
         })?;
     let source_frames =
-        decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))?;
+        decode_native_animation_frames(input_path, MediaLimits::default(), || checkpoint())?;
     let first_frame = source_frames
         .first()
         .ok_or_else(|| PipelineError::MalformedInput {
@@ -3501,15 +3688,20 @@ fn encode_candidate_from_native_animation_internal(
             reason: "invalid-frame-selection",
         })?
         .into_iter()
-        .map(|frame| StickerFrame {
-            pixels: transform_frame_for_candidate(
-                &frame.pixels,
-                candidate.content_scale,
-                resolved_crop_region,
-            ),
-            duration_us: frame.duration_us,
+        .map(|frame| {
+            checkpoint()?;
+            let transformed = StickerFrame {
+                pixels: transform_frame_for_candidate(
+                    &frame.pixels,
+                    candidate.content_scale,
+                    resolved_crop_region,
+                ),
+                duration_us: frame.duration_us,
+            };
+            checkpoint()?;
+            Ok(transformed)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, PipelineError>>()?;
     if let Some(expected_source) = expected_source {
         ensure_source_unchanged(expected_source, MediaLimits::default())?;
     }
@@ -3520,7 +3712,9 @@ fn encode_candidate_from_native_animation_internal(
         &candidate.id,
         "png",
     )?;
-    write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+    write_native_apng_with_checkpoint(pending_output.writer(), &frames, &candidate.preset, || {
+        checkpoint()
+    })?;
     let size_bytes = pending_output_size(&mut pending_output)?;
 
     Ok(EncodeResult {
@@ -3543,6 +3737,7 @@ fn encode_candidate_from_video_timeline_internal(
     candidate: &CandidatePreview,
     timeline_frames: &[ResolvedTimelineFrame],
     expected_source: Option<&SourceIdentity>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<EncodeResult, PipelineError> {
     let output_directory =
         resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
@@ -3570,17 +3765,21 @@ fn encode_candidate_from_video_timeline_internal(
         .iter()
         .map(|frame| frame.source_frame_index)
         .collect::<BTreeSet<_>>();
-    let (source_frames, resolution) = extract_video_source_frames_rgba(
+    checkpoint()?;
+    let decoded = extract_video_source_frames_rgba(
         input_path,
         &unique_frame_indexes,
         source_width,
         source_height,
         locale,
-    )?;
+    );
+    checkpoint()?;
+    let (source_frames, resolution) = decoded?;
 
     let frames = timeline_frames
         .iter()
         .map(|frame| {
+            checkpoint()?;
             source_frames
                 .get(&frame.source_frame_index)
                 .map(|pixels| StickerFrame {
@@ -3606,7 +3805,9 @@ fn encode_candidate_from_video_timeline_internal(
         &candidate.id,
         "png",
     )?;
-    write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+    write_native_apng_with_checkpoint(pending_output.writer(), &frames, &candidate.preset, || {
+        checkpoint()
+    })?;
     let size_bytes = pending_output_size(&mut pending_output)?;
 
     Ok(EncodeResult {
@@ -3629,6 +3830,7 @@ fn encode_candidate_with_ffmpeg_frames_internal(
     candidate: &CandidatePreview,
     selected_frames: Option<&[u32]>,
     expected_source: Option<&SourceIdentity>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<EncodeResult, PipelineError> {
     let output_directory =
         resolve_output_directory(output_directory, input_path, locale).map_err(|_| {
@@ -3654,20 +3856,26 @@ fn encode_candidate_with_ffmpeg_frames_internal(
         .or(input_height);
     let (frame_width, frame_height) =
         scaled_output_dimensions(effective_width, effective_height, candidate.content_scale);
-    let (pixels, resolution) = decode_video_frames_with_ffmpeg(
+    checkpoint()?;
+    let decoded = decode_video_frames_with_ffmpeg(
         input_path,
         &filter_graph,
         frame_width,
         frame_height,
         locale,
-    )?;
+    );
+    checkpoint()?;
+    let (pixels, resolution) = decoded?;
     let frames = pixels
         .into_iter()
-        .map(|pixels| StickerFrame {
-            pixels,
-            duration_us: frame_duration_us_for_fps(candidate.fps),
+        .map(|pixels| {
+            checkpoint()?;
+            Ok(StickerFrame {
+                pixels,
+                duration_us: frame_duration_us_for_fps(candidate.fps),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, PipelineError>>()?;
     if let Some(expected_source) = expected_source {
         ensure_source_unchanged(expected_source, MediaLimits::default())?;
     }
@@ -3678,7 +3886,9 @@ fn encode_candidate_with_ffmpeg_frames_internal(
         &candidate.id,
         "png",
     )?;
-    write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+    write_native_apng_with_checkpoint(pending_output.writer(), &frames, &candidate.preset, || {
+        checkpoint()
+    })?;
     let size_bytes = pending_output_size(&mut pending_output)?;
 
     Ok(EncodeResult {
@@ -3703,6 +3913,34 @@ fn encode_candidate_internal(
     timeline_frames: Option<&[ResolvedTimelineFrame]>,
     expected_source: Option<&SourceIdentity>,
 ) -> Result<EncodeResult, PipelineError> {
+    encode_candidate_with_checkpoint(
+        input_path,
+        output_directory,
+        locale,
+        crop_region,
+        input_width,
+        input_height,
+        candidate,
+        selected_frames,
+        timeline_frames,
+        expected_source,
+        &mut || Ok(()),
+    )
+}
+
+fn encode_candidate_with_checkpoint(
+    input_path: &str,
+    output_directory: Option<&str>,
+    locale: UiLocale,
+    crop_region: Option<&CropRegion>,
+    input_width: Option<u32>,
+    input_height: Option<u32>,
+    candidate: &CandidatePreview,
+    selected_frames: Option<&[u32]>,
+    timeline_frames: Option<&[ResolvedTimelineFrame]>,
+    expected_source: Option<&SourceIdentity>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> Result<EncodeResult, PipelineError> {
     let extension = lowercase_source_extension(input_path).unwrap_or_default();
 
     if let Some(timeline_frames) = timeline_frames {
@@ -3717,6 +3955,7 @@ fn encode_candidate_internal(
                 candidate,
                 timeline_frames,
                 expected_source,
+                checkpoint,
             ),
             _ => encode_candidate_from_video_timeline_internal(
                 input_path,
@@ -3728,6 +3967,7 @@ fn encode_candidate_internal(
                 candidate,
                 timeline_frames,
                 expected_source,
+                checkpoint,
             ),
         };
     }
@@ -3738,7 +3978,7 @@ fn encode_candidate_internal(
                 reason: "invalid-output-directory",
             })?;
         let source_frames =
-            decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))?;
+            decode_native_animation_frames(input_path, MediaLimits::default(), || checkpoint())?;
         let first_frame = source_frames
             .first()
             .ok_or_else(|| PipelineError::MalformedInput {
@@ -3760,15 +4000,20 @@ fn encode_candidate_internal(
                     reason: "invalid-frame-selection",
                 })?
                 .into_iter()
-                .map(|frame| StickerFrame {
-                    pixels: transform_frame_for_candidate(
-                        &frame.pixels,
-                        candidate.content_scale,
-                        resolved_crop_region,
-                    ),
-                    duration_us: frame.duration_us,
+                .map(|frame| {
+                    checkpoint()?;
+                    let transformed = StickerFrame {
+                        pixels: transform_frame_for_candidate(
+                            &frame.pixels,
+                            candidate.content_scale,
+                            resolved_crop_region,
+                        ),
+                        duration_us: frame.duration_us,
+                    };
+                    checkpoint()?;
+                    Ok(transformed)
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, PipelineError>>()?;
         if let Some(expected_source) = expected_source {
             ensure_source_unchanged(expected_source, MediaLimits::default())?;
         }
@@ -3779,7 +4024,12 @@ fn encode_candidate_internal(
             &candidate.id,
             "png",
         )?;
-        write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+        write_native_apng_with_checkpoint(
+            pending_output.writer(),
+            &frames,
+            &candidate.preset,
+            || checkpoint(),
+        )?;
         let size_bytes = pending_output_size(&mut pending_output)?;
 
         return Ok(EncodeResult {
@@ -3802,6 +4052,7 @@ fn encode_candidate_internal(
         candidate,
         selected_frames,
         expected_source,
+        checkpoint,
     )
 }
 
@@ -3812,7 +4063,51 @@ fn convert_static_image_to_png_internal(
     locale: UiLocale,
     expected_source: Option<&SourceIdentity>,
 ) -> StaticImageConversionResult {
-    let inspection = inspect_input_media_internal(input_path, locale);
+    convert_static_image_to_png_with_callbacks(
+        input_path,
+        output_directory,
+        crop_region,
+        locale,
+        expected_source,
+        || Ok(()),
+        |_, _, _| {},
+    )
+}
+
+fn convert_static_image_to_png_with_operation(
+    input_path: &str,
+    output_directory: Option<&str>,
+    crop_region: Option<&CropRegion>,
+    locale: UiLocale,
+    expected_source: Option<&SourceIdentity>,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> StaticImageConversionResult {
+    convert_static_image_to_png_with_callbacks(
+        input_path,
+        output_directory,
+        crop_region,
+        locale,
+        expected_source,
+        || context.checkpoint(),
+        |stage, completed, total| {
+            publish_progress(progress, context, stage, completed, total);
+        },
+    )
+}
+
+fn convert_static_image_to_png_with_callbacks(
+    input_path: &str,
+    output_directory: Option<&str>,
+    crop_region: Option<&CropRegion>,
+    locale: UiLocale,
+    expected_source: Option<&SourceIdentity>,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
+) -> StaticImageConversionResult {
+    progress(ProgressStage::Inspecting, 0, Some(1));
+    let inspection =
+        inspect_input_media_with_callbacks(input_path, locale, || checkpoint(), |_, _, _| {});
 
     if !inspection.ok {
         return StaticImageConversionResult {
@@ -3879,26 +4174,30 @@ fn convert_static_image_to_png_internal(
         };
 
     let started = Instant::now();
-    let source_pixels = match decode_still_rgba_image(input_path, MediaLimits::default(), || Ok(()))
-    {
-        Ok(pixels) => pixels,
-        Err(error) => {
-            return StaticImageConversionResult {
-                ok: false,
-                output_path: None,
-                size_bytes: None,
-                elapsed_ms: None,
-                tool_source: Some("native".into()),
-                tool_command: None,
-                tool_detail: Some(locale::native_image_detail(locale)),
-                warnings: Vec::new(),
-                reason_code: error.reason_code().map(str::to_string),
-                error_code: Some(error.code().into()),
-                error_message: Some(pipeline_error_diagnostic(&error, locale)),
+    progress(ProgressStage::Decoding, 0, Some(1));
+    let source_pixels =
+        match decode_still_rgba_image(input_path, MediaLimits::default(), || checkpoint()) {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                return StaticImageConversionResult {
+                    ok: false,
+                    output_path: None,
+                    size_bytes: None,
+                    elapsed_ms: None,
+                    tool_source: Some("native".into()),
+                    tool_command: None,
+                    tool_detail: Some(locale::native_image_detail(locale)),
+                    warnings: Vec::new(),
+                    reason_code: error.reason_code().map(str::to_string),
+                    error_code: Some(error.code().into()),
+                    error_message: Some(pipeline_error_diagnostic(&error, locale)),
+                }
             }
-        }
-    };
+        };
     if let Some(expected_source) = expected_source {
+        if let Err(error) = checkpoint() {
+            return static_conversion_pipeline_error(&error, locale);
+        }
         if let Err(error) = ensure_source_unchanged(expected_source, MediaLimits::default()) {
             return StaticImageConversionResult {
                 ok: false,
@@ -3915,12 +4214,24 @@ fn convert_static_image_to_png_internal(
             };
         }
     }
+    if let Err(error) = checkpoint() {
+        return static_conversion_pipeline_error(&error, locale);
+    }
     let output_pixels = transform_frame_for_static_png(&source_pixels, resolved_crop_region);
+    if let Err(error) = checkpoint() {
+        return static_conversion_pipeline_error(&error, locale);
+    }
+    progress(ProgressStage::Encoding, 0, Some(1));
     let publication = (|| -> Result<(PathBuf, u64), PipelineError> {
         let mut pending_output =
             PendingOutput::new(&output_directory, Path::new(input_path), "png", "png")?;
+        checkpoint()?;
         write_native_png(pending_output.writer(), &output_pixels)?;
+        checkpoint()?;
         let size_bytes = pending_output_size(&mut pending_output)?;
+        progress(ProgressStage::Encoding, 1, Some(1));
+        progress(ProgressStage::Finalizing, 1, Some(1));
+        checkpoint()?;
         let output_path = commit_output_after_source_validation(pending_output, expected_source)?;
         Ok((output_path, size_bytes))
     })();
@@ -3960,6 +4271,40 @@ fn static_conversion_pipeline_error(
         error_code: Some(error.code().into()),
         error_message: Some(pipeline_error_diagnostic(error, locale)),
     }
+}
+
+fn optimizer_plan_pipeline_error(
+    locale: UiLocale,
+    warnings: Vec<String>,
+    error: &PipelineError,
+) -> OptimizerPlanResponse {
+    OptimizerPlanResponse {
+        ok: false,
+        fit_mode: CANONICAL_FIT_MODE.into(),
+        selected_duration_seconds: None,
+        recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
+        search_budget: MAX_SEARCH_BUDGET,
+        warnings,
+        candidates: Vec::new(),
+        reason_code: error.reason_code().map(str::to_string),
+        error_code: Some(error.code().into()),
+        error_message: Some(pipeline_error_diagnostic(error, locale)),
+    }
+}
+
+fn inspection_pipeline_error(
+    input_path: &str,
+    error: &PipelineError,
+    locale: UiLocale,
+) -> MediaInspection {
+    inspection_error(
+        input_path,
+        Some("native".into()),
+        None,
+        None,
+        error.code(),
+        pipeline_error_diagnostic(error, locale),
+    )
 }
 
 fn inspection_error(
@@ -4789,6 +5134,17 @@ fn read_png_animation_metadata(
 }
 
 fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
+    inspect_still_image_metadata_with_checkpoint(input_path, locale, &mut || Ok(()))
+}
+
+fn inspect_still_image_metadata_with_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     let limits = MediaLimits::default();
     let (reader, metadata) = match open_limited_image_reader(input_path, limits) {
         Ok(result) => result,
@@ -4805,11 +5161,13 @@ fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> 
     };
 
     let dimensions = run_decoder_boundary("image", || {
+        checkpoint()?;
         let decoder = reader
             .into_decoder()
             .map_err(|error| image_decoder_error("image", error, limits))?;
         let dimensions = decoder.dimensions();
         checked_rgba_bytes(dimensions.0, dimensions.1, limits)?;
+        checkpoint()?;
         Ok(dimensions)
     });
     let (width, height) = match dimensions {
@@ -4856,6 +5214,17 @@ fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> 
 }
 
 fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
+    inspect_gif_metadata_with_checkpoint(input_path, locale, &mut || Ok(()))
+}
+
+fn inspect_gif_metadata_with_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     let metadata = match fs::metadata(input_path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -4871,19 +5240,20 @@ fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaIns
         }
     };
 
-    let frames = match decode_gif_animation_frames(input_path, MediaLimits::default(), || Ok(())) {
-        Ok(frames) => frames,
-        Err(error) => {
-            return inspection_error(
-                input_path,
-                Some("native".into()),
-                None,
-                Some(locale::native_animation_detail(locale, "gif")),
-                error.code(),
-                pipeline_error_diagnostic(&error, locale),
-            );
-        }
-    };
+    let frames =
+        match decode_gif_animation_frames(input_path, MediaLimits::default(), || checkpoint()) {
+            Ok(frames) => frames,
+            Err(error) => {
+                return inspection_error(
+                    input_path,
+                    Some("native".into()),
+                    None,
+                    Some(locale::native_animation_detail(locale, "gif")),
+                    error.code(),
+                    pipeline_error_diagnostic(&error, locale),
+                );
+            }
+        };
 
     let width = frames
         .first()
@@ -4950,6 +5320,18 @@ fn inspect_apng_metadata_internal(
     locale: UiLocale,
     preparsed_metadata: Option<PngAnimationMetadata>,
 ) -> MediaInspection {
+    inspect_apng_metadata_with_checkpoint(input_path, locale, preparsed_metadata, &mut || Ok(()))
+}
+
+fn inspect_apng_metadata_with_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    preparsed_metadata: Option<PngAnimationMetadata>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     let metadata = match fs::metadata(input_path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -4969,7 +5351,7 @@ fn inspect_apng_metadata_internal(
         Some(metadata) => metadata,
         None => {
             match read_png_animation_metadata(Path::new(input_path), MediaLimits::default(), || {
-                Ok(())
+                checkpoint()
             }) {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => {
@@ -5087,6 +5469,18 @@ fn parse_duration_hms_to_seconds(value: &str) -> Option<f64> {
 
 #[cfg(target_os = "windows")]
 fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) -> MediaInspection {
+    inspect_mp4_family_with_media_foundation_and_checkpoint(input_path, locale, &mut || Ok(()))
+}
+
+#[cfg(target_os = "windows")]
+fn inspect_mp4_family_with_media_foundation_and_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     let format_name = lowercase_source_extension(input_path).unwrap_or_else(|| "video".into());
     let detail = locale::native_video_detail(locale, &format_name);
     let result = unsafe {
@@ -5187,6 +5581,10 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
         inspection
     };
 
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
+
     match result {
         Ok(inspection) => inspection,
         Err(_) => inspection_error(
@@ -5202,10 +5600,30 @@ fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) 
 
 #[cfg(not(target_os = "windows"))]
 fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_video_with_ffmpeg(input_path, locale)
+    inspect_mp4_family_with_media_foundation_and_checkpoint(input_path, locale, &mut || Ok(()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn inspect_mp4_family_with_media_foundation_and_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, checkpoint)
 }
 
 fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspection {
+    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, &mut || Ok(()))
+}
+
+fn inspect_video_with_ffmpeg_and_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     let tool = match resolve_tool("ffmpeg", locale) {
         Ok(tool) => tool,
         Err(_) => {
@@ -5237,7 +5655,14 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
     configure_child_process(&mut command);
     // Task 9 replaces this direct child buffering with the shared bounded
     // stdout/stderr streaming and kill/reap process runner.
-    let output = match command.args(args).output() {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
+    let output_result = command.args(args).output();
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
+    let output = match output_result {
         Ok(output) => output,
         Err(_) => {
             return inspection_error(
@@ -5347,6 +5772,17 @@ fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspect
 }
 
 fn inspect_input_media_canonical_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
+    inspect_input_media_canonical_with_checkpoint(input_path, locale, &mut || Ok(()))
+}
+
+fn inspect_input_media_canonical_with_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     let Some(extension) = lowercase_source_extension(input_path) else {
         return inspection_error(
             input_path,
@@ -5359,12 +5795,20 @@ fn inspect_input_media_canonical_internal(input_path: &str, locale: UiLocale) ->
     };
 
     if extension == "png" {
-        match read_png_metadata(Path::new(input_path), MediaLimits::default(), || Ok(())) {
+        match read_png_metadata(Path::new(input_path), MediaLimits::default(), || {
+            checkpoint()
+        }) {
             Ok(metadata) => {
                 if let Some(animation) = metadata.animation {
-                    return inspect_apng_metadata_internal(input_path, locale, Some(animation));
+                    return inspect_apng_metadata_with_checkpoint(
+                        input_path,
+                        locale,
+                        Some(animation),
+                        checkpoint,
+                    );
                 }
-                let mut inspection = inspect_still_image_metadata_internal(input_path, locale);
+                let mut inspection =
+                    inspect_still_image_metadata_with_checkpoint(input_path, locale, checkpoint);
                 inspection.warnings = metadata.warnings;
                 return inspection;
             }
@@ -5382,23 +5826,25 @@ fn inspect_input_media_canonical_internal(input_path: &str, locale: UiLocale) ->
     }
 
     if is_supported_static_image_extension(&extension) {
-        return inspect_still_image_metadata_internal(input_path, locale);
+        return inspect_still_image_metadata_with_checkpoint(input_path, locale, checkpoint);
     }
 
     if extension == "gif" {
-        return inspect_gif_metadata_internal(input_path, locale);
+        return inspect_gif_metadata_with_checkpoint(input_path, locale, checkpoint);
     }
 
     if extension == "apng" {
-        return inspect_apng_metadata_internal(input_path, locale, None);
+        return inspect_apng_metadata_with_checkpoint(input_path, locale, None, checkpoint);
     }
 
     if matches!(extension.as_str(), "mp4" | "m4v" | "mov") {
-        return inspect_mp4_family_with_media_foundation(input_path, locale);
+        return inspect_mp4_family_with_media_foundation_and_checkpoint(
+            input_path, locale, checkpoint,
+        );
     }
 
     if is_supported_video_extension(&extension) {
-        return inspect_video_with_ffmpeg(input_path, locale);
+        return inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, checkpoint);
     }
 
     inspection_error(
@@ -5412,6 +5858,34 @@ fn inspect_input_media_canonical_internal(input_path: &str, locale: UiLocale) ->
 }
 
 fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
+    inspect_input_media_with_callbacks(input_path, locale, || Ok(()), |_, _, _| {})
+}
+
+fn inspect_input_media_with_operation(
+    input_path: &str,
+    locale: UiLocale,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> MediaInspection {
+    inspect_input_media_with_callbacks(
+        input_path,
+        locale,
+        || context.checkpoint(),
+        |stage, completed, total| {
+            publish_progress(progress, context, stage, completed, total);
+        },
+    )
+}
+
+fn inspect_input_media_with_callbacks(
+    input_path: &str,
+    locale: UiLocale,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
+) -> MediaInspection {
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     let limits = MediaLimits::default();
     let identity = match SourceIdentity::from_path(Path::new(input_path), limits) {
         Ok(identity) => identity,
@@ -5427,10 +5901,15 @@ fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInsp
         }
     };
     let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
-    let inspection = inspect_input_media_canonical_internal(&canonical_path, locale);
+    let inspection =
+        inspect_input_media_canonical_with_checkpoint(&canonical_path, locale, &mut checkpoint);
     let inspection = apply_inspection_source_revision(&identity, input_path, inspection);
     let inspection = enforce_desktop_inspection_frame_limit(inspection, locale);
     let tool_detail = inspection.tool_detail.clone();
+    progress(ProgressStage::Finalizing, 1, Some(1));
+    if let Err(error) = checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
     finalize_source_checked(&identity, inspection, limits, |error| {
         inspection_error(
             input_path,
@@ -5473,69 +5952,112 @@ async fn check_media_tools(locale: Option<String>) -> ToolHealthReport {
 }
 
 #[tauri::command]
-async fn inspect_input_media(input_path: String, locale: Option<String>) -> MediaInspection {
+async fn inspect_input_media(
+    input_path: String,
+    locale: Option<String>,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
+) -> MediaInspection {
     let locale = parse_ui_locale(locale.as_deref());
     let input_path_for_error = input_path.clone();
+    let state = pipeline_state.inner().clone();
+    let progress = ChannelProgressSink::new(on_progress);
+    let registered = match state.register(&operation_id, MediaOperationKind::Inspect.timeout()) {
+        Ok(registered) => registered,
+        Err(error) => return inspection_pipeline_error(&input_path, &error, locale),
+    };
+    let context = registered.context().clone();
+    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
+    let permit = match state.acquire_decode(&context).await {
+        Ok(permit) => permit,
+        Err(error) => return inspection_pipeline_error(&input_path, &error, locale),
+    };
+    publish_progress(&progress, &context, ProgressStage::Inspecting, 0, Some(1));
 
-    match run_blocking_task(move || inspect_input_media_internal(&input_path, locale)).await {
+    match run_managed_blocking(registered, permit, move || {
+        inspect_input_media_with_operation(&input_path, locale, &context, &progress)
+    })
+    .await
+    {
         Ok(result) => result,
-        Err(_) => MediaInspection {
-            ok: false,
-            input_path: input_path_for_error,
-            source_revision: None,
-            tool_source: None,
-            tool_command: None,
-            tool_detail: None,
-            format_name: None,
-            duration_seconds: None,
-            size_bytes: None,
-            width: None,
-            height: None,
-            codec_name: None,
-            pixel_format: None,
-            avg_fps: None,
-            frame_rate_label: None,
-            estimated_frames: None,
-            frame_durations_seconds: None,
-            warnings: Vec::new(),
-            is_static_image: false,
-            can_convert_to_png: false,
-            reason_code: None,
-            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(locale::internal_task_error_message(locale)),
-        },
+        Err(message) => inspection_pipeline_error(
+            &input_path_for_error,
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+            locale,
+        ),
     }
 }
 
 #[tauri::command]
-async fn build_optimizer_plan(request: OptimizerPlanRequest) -> OptimizerPlanResponse {
+async fn build_optimizer_plan(
+    request: OptimizerPlanRequest,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
+) -> OptimizerPlanResponse {
     let locale = parse_ui_locale(request.locale.as_deref());
     let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
+    let state = pipeline_state.inner().clone();
+    let progress = ChannelProgressSink::new(on_progress);
+    let registered = match state.register(&operation_id, MediaOperationKind::BuildPlan.timeout()) {
+        Ok(registered) => registered,
+        Err(error) => {
+            return optimizer_plan_pipeline_error(
+                locale,
+                fallback_fit_warning.into_iter().collect(),
+                &error,
+            )
+        }
+    };
+    let context = registered.context().clone();
+    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
 
-    match run_blocking_task(move || prepare_optimizer_plan(&request, locale)).await {
+    match run_managed_blocking(registered, (), move || {
+        prepare_optimizer_plan_with_operation(&request, locale, &context, &progress)
+    })
+    .await
+    {
         Ok(result) => result,
-        Err(_) => OptimizerPlanResponse {
-            ok: false,
-            fit_mode: CANONICAL_FIT_MODE.into(),
-            selected_duration_seconds: None,
-            recommended_max_duration_seconds: duration_us_to_seconds(RECOMMENDED_MAX_DURATION_US),
-            search_budget: MAX_SEARCH_BUDGET,
-            warnings: fallback_fit_warning.into_iter().collect(),
-            candidates: Vec::new(),
-            reason_code: None,
-            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(locale::internal_task_error_message(locale)),
-        },
+        Err(message) => optimizer_plan_pipeline_error(
+            locale,
+            fallback_fit_warning.into_iter().collect(),
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+        ),
     }
 }
 
 #[tauri::command]
 async fn convert_static_image_to_png(
     request: StaticImageConversionRequest,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
 ) -> StaticImageConversionResult {
     let locale = parse_ui_locale(request.locale.as_deref());
+    let state = pipeline_state.inner().clone();
+    let progress = ChannelProgressSink::new(on_progress);
+    let registered = match state.register(
+        &operation_id,
+        MediaOperationKind::StaticConversion.timeout(),
+    ) {
+        Ok(registered) => registered,
+        Err(error) => return static_conversion_pipeline_error(&error, locale),
+    };
+    let context = registered.context().clone();
+    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
+    let permits = match state.acquire_output_then_decode(&context).await {
+        Ok(permits) => permits,
+        Err(error) => return static_conversion_pipeline_error(&error, locale),
+    };
 
-    match run_blocking_task(move || {
+    match run_managed_blocking(registered, permits, move || {
         let identity = match validate_source_revision(
             Path::new(&request.input_path),
             request.source_revision.as_deref(),
@@ -5545,31 +6067,27 @@ async fn convert_static_image_to_png(
             Err(error) => return static_conversion_pipeline_error(&error, locale),
         };
         let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
-        let response = convert_static_image_to_png_internal(
+        let response = convert_static_image_to_png_with_operation(
             &canonical_path,
             request.output_directory.as_deref(),
             request.crop_region.as_ref(),
             locale,
             Some(&identity),
+            &context,
+            &progress,
         );
         finalize_static_conversion_source_unless_published(&identity, response, locale)
     })
     .await
     {
         Ok(result) => result,
-        Err(_) => StaticImageConversionResult {
-            ok: false,
-            output_path: None,
-            size_bytes: None,
-            elapsed_ms: None,
-            tool_source: None,
-            tool_command: None,
-            tool_detail: None,
-            warnings: Vec::new(),
-            reason_code: None,
-            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(locale::internal_task_error_message(locale)),
-        },
+        Err(message) => static_conversion_pipeline_error(
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+            locale,
+        ),
     }
 }
 
@@ -5605,8 +6123,36 @@ fn run_optimizer_search_internal(
     mut request: OptimizerSearchRequest,
     locale: UiLocale,
 ) -> OptimizerSearchResponse {
+    run_optimizer_search_with_callbacks(request, locale, || Ok(()), |_, _, _| {})
+}
+
+fn run_optimizer_search_with_operation(
+    request: OptimizerSearchRequest,
+    locale: UiLocale,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> OptimizerSearchResponse {
+    run_optimizer_search_with_callbacks(
+        request,
+        locale,
+        || context.checkpoint(),
+        |stage, completed, total| {
+            publish_progress(progress, context, stage, completed, total);
+        },
+    )
+}
+
+fn run_optimizer_search_with_callbacks(
+    mut request: OptimizerSearchRequest,
+    locale: UiLocale,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
+) -> OptimizerSearchResponse {
     let (_, legacy_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
     let legacy_fit_warnings = legacy_fit_warning.into_iter().collect::<Vec<_>>();
+    if let Err(error) = checkpoint() {
+        return optimizer_search_pipeline_error(locale, legacy_fit_warnings, error);
+    }
     let source_identity = match validate_source_revision(
         Path::new(&request.input_path),
         request.source_revision.as_deref(),
@@ -5816,7 +6362,8 @@ fn run_optimizer_search_internal(
             None
         };
 
-        let plan = prepare_optimizer_plan(
+        progress(ProgressStage::Estimating, 0, None);
+        let plan = prepare_optimizer_plan_with_checkpoint(
             &OptimizerPlanRequest {
                 locale: request.locale.clone(),
                 source_duration_seconds: request.source_duration_seconds,
@@ -5834,6 +6381,7 @@ fn run_optimizer_search_internal(
                 timeline_frames: request.timeline_frames.clone(),
             },
             locale,
+            &mut checkpoint,
         );
 
         if !plan.ok {
@@ -5867,7 +6415,13 @@ fn run_optimizer_search_internal(
         let mut best_within_limit_output: Option<PendingSelectedEncodeOutput> = None;
         let mut smallest_oversize_output: Option<PendingSelectedEncodeOutput> = None;
         let mut stopped_after_best_within_limit = false;
+        let total_candidates = u32::try_from(plan.candidates.len()).unwrap_or(u32::MAX);
+        let mut completed_candidates = 0_u32;
+        progress(ProgressStage::Encoding, 0, Some(total_candidates));
         for candidate in &plan.candidates {
+            if let Err(error) = checkpoint() {
+                return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+            }
             if let Err(error) = ensure_source_unchanged(&source_identity, MediaLimits::default()) {
                 return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
             }
@@ -5894,7 +6448,7 @@ fn run_optimizer_search_internal(
             };
 
             let encode_result = if let Some(timeline_frames) = resolved_timeline_frames.as_deref() {
-                encode_candidate_internal(
+                encode_candidate_with_checkpoint(
                     &request.input_path,
                     request.output_directory.as_deref(),
                     locale,
@@ -5905,9 +6459,10 @@ fn run_optimizer_search_internal(
                     None,
                     Some(timeline_frames),
                     Some(&source_identity),
+                    &mut checkpoint,
                 )
             } else {
-                encode_candidate_internal(
+                encode_candidate_with_checkpoint(
                     &request.input_path,
                     request.output_directory.as_deref(),
                     locale,
@@ -5922,6 +6477,7 @@ fn run_optimizer_search_internal(
                     }),
                     None,
                     Some(&source_identity),
+                    &mut checkpoint,
                 )
             };
 
@@ -6004,6 +6560,12 @@ fn run_optimizer_search_internal(
                             drop(contender);
                         }
                     }
+                    completed_candidates = completed_candidates.saturating_add(1);
+                    progress(
+                        ProgressStage::Encoding,
+                        completed_candidates,
+                        Some(total_candidates),
+                    );
                 }
                 Err(error) => {
                     return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
@@ -6029,6 +6591,14 @@ fn run_optimizer_search_internal(
             "no_fit_found"
         };
         let best_within_limit = best_within_limit_output.is_some();
+        progress(
+            ProgressStage::Finalizing,
+            completed_candidates,
+            Some(total_candidates),
+        );
+        if let Err(error) = checkpoint() {
+            return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
+        }
         let published_output = match publish_optimizer_selection(
             &source_identity,
             best_within_limit_output,
@@ -9808,33 +10378,54 @@ mod tests {
 }
 
 #[tauri::command]
-async fn run_optimizer_search(request: OptimizerSearchRequest) -> OptimizerSearchResponse {
+async fn run_optimizer_search(
+    request: OptimizerSearchRequest,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
+) -> OptimizerSearchResponse {
     let locale = parse_ui_locale(request.locale.as_deref());
     let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
+    let state = pipeline_state.inner().clone();
+    let progress = ChannelProgressSink::new(on_progress);
+    let registered =
+        match state.register(&operation_id, MediaOperationKind::OptimizerSearch.timeout()) {
+            Ok(registered) => registered,
+            Err(error) => {
+                return optimizer_search_pipeline_error(
+                    locale,
+                    fallback_fit_warning.into_iter().collect(),
+                    error,
+                )
+            }
+        };
+    let context = registered.context().clone();
+    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
+    let permits = match state.acquire_output_then_decode(&context).await {
+        Ok(permits) => permits,
+        Err(error) => {
+            return optimizer_search_pipeline_error(
+                locale,
+                fallback_fit_warning.into_iter().collect(),
+                error,
+            )
+        }
+    };
 
-    match run_blocking_task(move || run_optimizer_search_internal(request, locale)).await {
+    match run_managed_blocking(registered, permits, move || {
+        run_optimizer_search_with_operation(request, locale, &context, &progress)
+    })
+    .await
+    {
         Ok(result) => result,
-        Err(_) => OptimizerSearchResponse {
-            ok: false,
-            fit_mode: CANONICAL_FIT_MODE.into(),
-            selected_duration_seconds: None,
-            limit_bytes: DISCORD_MAX_STICKER_BYTES,
-            search_budget: MAX_SEARCH_BUDGET,
-            real_attempt_count: 0,
-            stop_reason: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            selection_reason: "no_fit_found".into(),
-            summary: locale::internal_task_error_message(locale),
-            warnings: fallback_fit_warning.into_iter().collect(),
-            attempts: Vec::new(),
-            winning_candidate_id: None,
-            closest_candidate_id: None,
-            best_output_path: None,
-            best_size_bytes: None,
-            best_within_limit: false,
-            reason_code: None,
-            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(locale::internal_task_error_message(locale)),
-        },
+        Err(message) => optimizer_search_pipeline_error(
+            locale,
+            fallback_fit_warning.into_iter().collect(),
+            PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+        ),
     }
 }
 
@@ -9844,10 +10435,25 @@ async fn extract_frame_preview(
     source_revision: Option<String>,
     source_frame_id: u32,
     locale: Option<String>,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
 ) -> FramePreviewResponse {
     let locale = parse_ui_locale(locale.as_deref());
+    let state = pipeline_state.inner().clone();
+    let progress = ChannelProgressSink::new(on_progress);
+    let registered = match state.register(&operation_id, MediaOperationKind::Preview.timeout()) {
+        Ok(registered) => registered,
+        Err(error) => return frame_preview_pipeline_error(&error, locale),
+    };
+    let context = registered.context().clone();
+    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
+    let permit = match state.acquire_decode(&context).await {
+        Ok(permit) => permit,
+        Err(error) => return frame_preview_pipeline_error(&error, locale),
+    };
 
-    match run_blocking_task(move || {
+    match run_managed_blocking(registered, permit, move || {
         let identity = match validate_source_revision(
             Path::new(&input_path),
             source_revision.as_deref(),
@@ -9857,21 +10463,25 @@ async fn extract_frame_preview(
             Err(error) => return frame_preview_pipeline_error(&error, locale),
         };
         let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
-        let response = extract_frame_preview_internal(&canonical_path, source_frame_id, locale);
+        let response = extract_frame_preview_with_operation(
+            &canonical_path,
+            source_frame_id,
+            locale,
+            &context,
+            &progress,
+        );
         finalize_frame_preview_source(&identity, response, locale)
     })
     .await
     {
         Ok(response) => response,
-        Err(_) => FramePreviewResponse {
-            ok: false,
-            data_url: None,
-            width: None,
-            height: None,
-            reason_code: None,
-            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(locale::internal_task_error_message(locale)),
-        },
+        Err(message) => frame_preview_pipeline_error(
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+            locale,
+        ),
     }
 }
 
@@ -9881,11 +10491,26 @@ async fn extract_frame_previews(
     source_revision: Option<String>,
     source_frame_ids: BoundedFrameIds,
     locale: Option<String>,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
 ) -> FramePreviewsResponse {
     let locale = parse_ui_locale(locale.as_deref());
     let source_frame_ids = source_frame_ids.0;
+    let state = pipeline_state.inner().clone();
+    let progress = ChannelProgressSink::new(on_progress);
+    let registered = match state.register(&operation_id, MediaOperationKind::Preview.timeout()) {
+        Ok(registered) => registered,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
+    };
+    let context = registered.context().clone();
+    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
+    let permit = match state.acquire_decode(&context).await {
+        Ok(permit) => permit,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
+    };
 
-    match run_blocking_task(move || {
+    match run_managed_blocking(registered, permit, move || {
         let identity = match validate_source_revision(
             Path::new(&input_path),
             source_revision.as_deref(),
@@ -9895,20 +10520,31 @@ async fn extract_frame_previews(
             Err(error) => return frame_previews_pipeline_error(&error, locale),
         };
         let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
-        let response = extract_frame_previews_internal(&canonical_path, &source_frame_ids, locale);
+        let response = extract_frame_previews_with_operation(
+            &canonical_path,
+            &source_frame_ids,
+            locale,
+            &context,
+            &progress,
+        );
         finalize_frame_previews_source(&identity, response, locale)
     })
     .await
     {
         Ok(response) => response,
-        Err(_) => FramePreviewsResponse {
-            ok: false,
-            previews: Vec::new(),
-            reason_code: None,
-            error_code: Some(INTERNAL_TASK_ERROR_CODE.into()),
-            error_message: Some(locale::internal_task_error_message(locale)),
-        },
+        Err(message) => frame_previews_pipeline_error(
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+            locale,
+        ),
     }
+}
+
+#[tauri::command]
+fn cancel_media_operation(operation_id: String, pipeline_state: State<'_, PipelineState>) -> bool {
+    pipeline_state.cancel(&operation_id)
 }
 
 #[tauri::command]
@@ -9963,6 +10599,7 @@ fn open_folder_path(path: Option<String>, locale: Option<String>) -> Result<(), 
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(PipelineState::new())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             check_media_tools,
@@ -9972,6 +10609,7 @@ pub fn run() {
             convert_static_image_to_png,
             extract_frame_preview,
             extract_frame_previews,
+            cancel_media_operation,
             open_folder_path,
         ])
         .run(tauri::generate_context!())

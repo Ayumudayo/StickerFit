@@ -5,6 +5,7 @@ import type {
   MediaOperationErrorCode,
   MediaOperationErrorFields,
   MediaOperationReasonCode,
+  OperationProgress,
   FramePreviewRequest,
   FramePreviewResult,
   FramePreviewsRequest,
@@ -396,6 +397,12 @@ export type RuntimeCapabilities = {
   openOutputFolder: boolean;
 };
 
+export type MediaOperationOptions = {
+  operationId: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: OperationProgress) => void;
+};
+
 export type AppRuntime = {
   kind: RuntimeKind;
   capabilities: RuntimeCapabilities;
@@ -406,15 +413,32 @@ export type AppRuntime = {
     fallbackPath: string | null | undefined,
     locale: Locale,
   ) => Promise<void>;
-  inspectInput: (source: RuntimeInputSource, locale: Locale) => Promise<MediaInspection>;
+  inspectInput: (
+    source: RuntimeInputSource,
+    locale: Locale,
+    options: MediaOperationOptions,
+  ) => Promise<MediaInspection>;
   checkToolHealth: (locale: Locale) => Promise<ToolHealthReport | null>;
-  buildOptimizerPlan: (request: OptimizerPlanRequest) => Promise<OptimizerPlanResponse>;
-  runOptimizerSearch: (request: OptimizerSearchRequest) => Promise<OptimizerSearchResponse>;
+  buildOptimizerPlan: (
+    request: OptimizerPlanRequest,
+    options: MediaOperationOptions,
+  ) => Promise<OptimizerPlanResponse>;
+  runOptimizerSearch: (
+    request: OptimizerSearchRequest,
+    options: MediaOperationOptions,
+  ) => Promise<OptimizerSearchResponse>;
   convertStaticImageToPng: (
     request: StaticImageConversionRequest,
+    options: MediaOperationOptions,
   ) => Promise<StaticImageConversionResult>;
-  extractFramePreview: (request: FramePreviewRequest) => Promise<FramePreviewResult | null>;
-  extractFramePreviews: (request: FramePreviewsRequest) => Promise<FramePreviewsResult | null>;
+  extractFramePreview: (
+    request: FramePreviewRequest,
+    options: MediaOperationOptions,
+  ) => Promise<FramePreviewResult | null>;
+  extractFramePreviews: (
+    request: FramePreviewsRequest,
+    options: MediaOperationOptions,
+  ) => Promise<FramePreviewsResult | null>;
   subscribeInputDrops: (handlers: RuntimeDropHandlers) => Promise<() => void>;
 };
 
@@ -683,6 +707,77 @@ async function loadTauriCore() {
   return import("@tauri-apps/api/core");
 }
 
+type DesktopMediaOperationBridge = {
+  invoke: <T>(
+    command: string,
+    args?: Record<string, unknown>,
+  ) => Promise<T>;
+  createChannel: (
+    onMessage: (progress: OperationProgress) => void,
+  ) => unknown;
+};
+
+export async function invokeDesktopMediaOperation<T>(
+  command: string,
+  args: Record<string, unknown>,
+  options: MediaOperationOptions,
+  bridge?: DesktopMediaOperationBridge,
+) {
+  const resolvedBridge =
+    bridge ??
+    (await (async (): Promise<DesktopMediaOperationBridge> => {
+      const { Channel, invoke } = await loadTauriCore();
+      return {
+        invoke: <TResult>(
+          nextCommand: string,
+          nextArgs?: Record<string, unknown>,
+        ) => invoke<TResult>(nextCommand, nextArgs),
+        createChannel: (onMessage) =>
+          new Channel<OperationProgress>(onMessage),
+      };
+    })());
+  const channel = resolvedBridge.createChannel((progress) => {
+    if (
+      options.signal?.aborted ||
+      progress.operationId !== options.operationId
+    ) {
+      return;
+    }
+    options.onProgress?.(progress);
+  });
+  let cancellation: Promise<void> | null = null;
+  const requestCancellation = () => {
+    if (cancellation === null) {
+      cancellation = resolvedBridge
+        .invoke<unknown>("cancel_media_operation", {
+          operationId: options.operationId,
+        })
+        .then(
+          () => undefined,
+          () => undefined,
+        );
+    }
+    return cancellation;
+  };
+  const handleAbort = () => {
+    void requestCancellation();
+  };
+
+  options.signal?.addEventListener("abort", handleAbort, { once: true });
+  try {
+    if (options.signal?.aborted) {
+      await requestCancellation();
+    }
+    return await resolvedBridge.invoke<T>(command, {
+      ...args,
+      operationId: options.operationId,
+      onProgress: channel,
+    });
+  } finally {
+    options.signal?.removeEventListener("abort", handleAbort);
+  }
+}
+
 async function loadTauriDialog() {
   return import("@tauri-apps/plugin-dialog");
 }
@@ -747,16 +842,20 @@ const tauriRuntime: AppRuntime = {
       locale,
     });
   },
-  async inspectInput(source, locale) {
+  async inspectInput(source, locale, options) {
     if (source.kind !== "tauri-path") {
       throw new Error("Expected a desktop file path.");
     }
 
-    const [{ invoke, convertFileSrc }] = await Promise.all([loadTauriCore()]);
-    const result = await invoke<RuntimeInspectionPayload>("inspect_input_media", {
-      inputPath: source.path,
-      locale,
-    });
+    const { convertFileSrc } = await loadTauriCore();
+    const result = await invokeDesktopMediaOperation<RuntimeInspectionPayload>(
+      "inspect_input_media",
+      {
+        inputPath: source.path,
+        locale,
+      },
+      options,
+    );
     const normalized = normalizeLegacyMediaResponse(result);
 
     return {
@@ -774,35 +873,40 @@ const tauriRuntime: AppRuntime = {
       locale,
     });
   },
-  async buildOptimizerPlan(request) {
-    const { invoke } = await loadTauriCore();
-    const result = await invoke<LegacyMediaResponse<OptimizerPlanResponse>>(
+  async buildOptimizerPlan(request, options) {
+    const result = await invokeDesktopMediaOperation<
+      LegacyMediaResponse<OptimizerPlanResponse>
+    >(
       "build_optimizer_plan",
       { request },
+      options,
     );
     return normalizeLegacyMediaResponse(result);
   },
-  async runOptimizerSearch(request) {
-    const { invoke } = await loadTauriCore();
-    const result = await invoke<LegacyOptimizerSearchResponse>(
+  async runOptimizerSearch(request, options) {
+    const result = await invokeDesktopMediaOperation<LegacyOptimizerSearchResponse>(
       "run_optimizer_search",
       { request },
+      options,
     );
     return normalizeLegacyOptimizerSearchResponse(
       result,
     ) as OptimizerSearchResponse;
   },
-  async convertStaticImageToPng(request) {
-    const { invoke } = await loadTauriCore();
-    const result = await invoke<LegacyMediaResponse<StaticImageConversionResult>>(
+  async convertStaticImageToPng(request, options) {
+    const result = await invokeDesktopMediaOperation<
+      LegacyMediaResponse<StaticImageConversionResult>
+    >(
       "convert_static_image_to_png",
       { request },
+      options,
     );
     return normalizeLegacyMediaResponse(result);
   },
-  async extractFramePreview(request) {
-    const { invoke } = await loadTauriCore();
-    const result = await invoke<LegacyMediaResponse<FramePreviewResult>>(
+  async extractFramePreview(request, options) {
+    const result = await invokeDesktopMediaOperation<
+      LegacyMediaResponse<FramePreviewResult>
+    >(
       "extract_frame_preview",
       {
         inputPath: request.inputPath,
@@ -810,12 +914,14 @@ const tauriRuntime: AppRuntime = {
         sourceFrameId: request.sourceFrameId,
         locale: request.locale,
       },
+      options,
     );
     return normalizeLegacyMediaResponse(result);
   },
-  async extractFramePreviews(request) {
-    const { invoke } = await loadTauriCore();
-    const result = await invoke<LegacyMediaResponse<FramePreviewsResult>>(
+  async extractFramePreviews(request, options) {
+    const result = await invokeDesktopMediaOperation<
+      LegacyMediaResponse<FramePreviewsResult>
+    >(
       "extract_frame_previews",
       {
         inputPath: request.inputPath,
@@ -823,6 +929,7 @@ const tauriRuntime: AppRuntime = {
         sourceFrameIds: request.sourceFrameIds,
         locale: request.locale,
       },
+      options,
     );
     return normalizeLegacyMediaResponse(result);
   },
@@ -896,7 +1003,7 @@ const webRuntime: AppRuntime = {
   async openOutputFolder(_path, _fallbackPath, _locale) {
     return;
   },
-  async inspectInput(source, _locale) {
+  async inspectInput(source, _locale, _options) {
     if (source.kind !== "web-file") {
       throw new Error("Expected a browser File object.");
     }
@@ -906,19 +1013,19 @@ const webRuntime: AppRuntime = {
   async checkToolHealth(_locale) {
     return null;
   },
-  async buildOptimizerPlan(_request) {
+  async buildOptimizerPlan(_request, _options) {
     throw new Error(DESKTOP_ONLY_ERROR);
   },
-  async runOptimizerSearch(_request) {
+  async runOptimizerSearch(_request, _options) {
     throw new Error(DESKTOP_ONLY_ERROR);
   },
-  async convertStaticImageToPng(_request) {
+  async convertStaticImageToPng(_request, _options) {
     throw new Error(DESKTOP_ONLY_ERROR);
   },
-  async extractFramePreview(_request) {
+  async extractFramePreview(_request, _options) {
     return null;
   },
-  async extractFramePreviews(_request) {
+  async extractFramePreviews(_request, _options) {
     return null;
   },
   async subscribeInputDrops(handlers) {

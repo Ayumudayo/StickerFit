@@ -36,6 +36,30 @@ export type MediaOperationReasonCode =
   | "plan-invalid"
   | "invoke-failed";
 
+export type MediaOperationProgressStage =
+  | "queued"
+  | "inspecting"
+  | "decoding"
+  | "estimating"
+  | "encoding"
+  | "finalizing";
+
+export type MediaOperationProgressMessageCode =
+  | "media-operation-queued"
+  | "media-operation-inspecting"
+  | "media-operation-decoding"
+  | "media-operation-estimating"
+  | "media-operation-encoding"
+  | "media-operation-finalizing";
+
+export type OperationProgress = Readonly<{
+  operationId: string;
+  stage: MediaOperationProgressStage;
+  completed: number;
+  total: number | null;
+  messageCode: MediaOperationProgressMessageCode;
+}>;
+
 export type MediaOperationErrorFields = {
   errorCode: MediaOperationErrorCode | null;
   reasonCode: MediaOperationReasonCode | null;

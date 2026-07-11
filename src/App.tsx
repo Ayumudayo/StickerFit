@@ -38,6 +38,7 @@ import {
 } from "./hooks/mediaWorkflow/workflowFingerprint";
 import { buildFramePreviewsRequest } from "./hooks/mediaWorkflow/mediaRequestBuilders";
 import { usePlaybackTimelineController } from "./hooks/usePlaybackTimelineController";
+import { createMediaOperationId } from "./platform/mediaOperationId";
 import { editorText } from "./locales/editorText";
 import {
   detectLocale,
@@ -136,6 +137,7 @@ export default function App() {
     openOutputFolder,
     buildPlan,
     runBoundedSearch,
+    cancelOptimizerSearch,
     convertStaticImageToPng,
     invalidateWorkflowResults,
   } = mediaWorkflow;
@@ -291,9 +293,7 @@ export default function App() {
         latestWorkflowState.code,
         latestWorkflowState.reasonCode,
       )
-    : latestWorkflowState?.status === "cancelled"
-      ? mediaOperationMessage(locale, "cancelled", null)
-      : null;
+    : null;
 
   useEffect(() => {
     const previous = invalidatedWorkflowFingerprintRef.current;
@@ -394,9 +394,14 @@ export default function App() {
       return;
     }
 
+    const controller = new AbortController();
+    const operationId = createMediaOperationId();
     const timeoutId = window.setTimeout(() => {
       void runtime
-        .extractFramePreviews(request)
+        .extractFramePreviews(request, {
+          operationId,
+          signal: controller.signal,
+        })
         .then((result) => {
           if (framePreviewRequestIdRef.current !== requestId) {
             return;
@@ -426,7 +431,10 @@ export default function App() {
         });
     }, 50);
 
-    return () => window.clearTimeout(timeoutId);
+    return () => {
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
   }, [
     framePreviewSourceFrameIds,
     inspection?.backendInputPath,
@@ -858,6 +866,7 @@ export default function App() {
                 onToggleAdvancedSettings: handleAdvancedSettingsToggle,
                 onToggleResults: handleResultsPanelToggle,
                 onRunOptimizer: () => void handleOptimizerRun(),
+                onCancelOptimizer: cancelOptimizerSearch,
                 onConvertToPng: () =>
                   void convertStaticImageToPng(workflowFingerprints.export),
               }}

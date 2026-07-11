@@ -1,5 +1,6 @@
 import type {
   MediaOperationErrorCode,
+  MediaOperationProgressMessageCode,
   MediaOperationReasonCode,
 } from "../types/workflow";
 
@@ -66,6 +67,13 @@ export type MessagesForLocale = {
   buildingPreview: string;
   runOptimizer: string;
   runningOptimizer: string;
+  cancelOptimizer: string;
+  mediaOperationQueued: string;
+  mediaOperationInspecting: string;
+  mediaOperationDecoding: string;
+  mediaOperationEstimating: string;
+  mediaOperationEncoding: string;
+  mediaOperationFinalizing: string;
   nextStep: string;
   nextStepBody: string;
   guidance: string;
@@ -194,6 +202,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     buildingPreview: "Preparing preview...",
     runOptimizer: "Run optimizer",
     runningOptimizer: "Optimizing...",
+    cancelOptimizer: "Cancel optimization",
+    mediaOperationQueued: "Waiting to start...",
+    mediaOperationInspecting: "Inspecting media...",
+    mediaOperationDecoding: "Decoding media...",
+    mediaOperationEstimating: "Estimating candidates...",
+    mediaOperationEncoding: "Encoding output...",
+    mediaOperationFinalizing: "Finalizing output...",
     nextStep: "Next step",
     nextStepBody: "Preview the candidate ladder first, then run the optimizer once the crop and frame selection look right.",
     guidance: "Guidance",
@@ -324,6 +339,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     buildingPreview: "후보를 준비하는 중...",
     runOptimizer: "최적화 실행",
     runningOptimizer: "최적화 중...",
+    cancelOptimizer: "최적화 취소",
+    mediaOperationQueued: "작업 시작을 기다리는 중...",
+    mediaOperationInspecting: "미디어를 분석하는 중...",
+    mediaOperationDecoding: "미디어를 디코딩하는 중...",
+    mediaOperationEstimating: "후보를 계산하는 중...",
+    mediaOperationEncoding: "출력을 인코딩하는 중...",
+    mediaOperationFinalizing: "출력을 마무리하는 중...",
     nextStep: "다음 단계",
     nextStepBody: "먼저 후보 미리보기를 실행해 정렬된 래더를 확인한 다음, 크롭과 프레임 선택이 괜찮으면 최적화를 실행하세요.",
     guidance: "안내",
@@ -397,6 +419,28 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     selectSourceFirst: "먼저 소스 파일을 선택하세요.",
     webPreviewNotice:
       "웹 모드에서는 파일 검사, 크롭, 확대, 타임라인 확인까지만 지원합니다. 최적화, 내보내기, 출력 폴더 기능은 데스크톱 앱 전용입니다.",
+  },
+};
+
+export const MEDIA_OPERATION_PROGRESS_MESSAGES: Record<
+  Locale,
+  Record<MediaOperationProgressMessageCode, string>
+> = {
+  en: {
+    "media-operation-queued": MESSAGES.en.mediaOperationQueued,
+    "media-operation-inspecting": MESSAGES.en.mediaOperationInspecting,
+    "media-operation-decoding": MESSAGES.en.mediaOperationDecoding,
+    "media-operation-estimating": MESSAGES.en.mediaOperationEstimating,
+    "media-operation-encoding": MESSAGES.en.mediaOperationEncoding,
+    "media-operation-finalizing": MESSAGES.en.mediaOperationFinalizing,
+  },
+  ko: {
+    "media-operation-queued": MESSAGES.ko.mediaOperationQueued,
+    "media-operation-inspecting": MESSAGES.ko.mediaOperationInspecting,
+    "media-operation-decoding": MESSAGES.ko.mediaOperationDecoding,
+    "media-operation-estimating": MESSAGES.ko.mediaOperationEstimating,
+    "media-operation-encoding": MESSAGES.ko.mediaOperationEncoding,
+    "media-operation-finalizing": MESSAGES.ko.mediaOperationFinalizing,
   },
 };
 

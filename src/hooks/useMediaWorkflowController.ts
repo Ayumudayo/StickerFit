@@ -10,6 +10,7 @@ import {
   getAppRuntime,
   normalizeLegacyMediaError,
 } from "../platform/runtime";
+import { createMediaOperationId } from "../platform/mediaOperationId";
 import type {
   MediaInspection,
   OptimizerGoal,
@@ -18,6 +19,7 @@ import type {
   OptimizerPresetStrategy,
   OptimizerSearchDepth,
   OptimizerSearchResponse,
+  OperationProgress,
   StaticImageConversionResult,
   TimelineFrameRequest,
 } from "../types/workflow";
@@ -99,21 +101,21 @@ export function useMediaWorkflowController({
 }: UseMediaWorkflowControllerParams) {
   const runtime = getAppRuntime();
   const [planState, setPlanState] = useState<
-    VersionedWorkflowState<OptimizerPlanResponse>
+    VersionedWorkflowState<OptimizerPlanResponse, OperationProgress>
   >({
     status: "idle",
     revision: 0,
     fingerprint: "",
   });
   const [searchState, setSearchState] = useState<
-    VersionedWorkflowState<OptimizerSearchResponse>
+    VersionedWorkflowState<OptimizerSearchResponse, OperationProgress>
   >({
     status: "idle",
     revision: 0,
     fingerprint: "",
   });
   const [conversionState, setConversionState] = useState<
-    VersionedWorkflowState<StaticImageConversionResult>
+    VersionedWorkflowState<StaticImageConversionResult, OperationProgress>
   >({
     status: "idle",
     revision: 0,
@@ -134,6 +136,9 @@ export function useMediaWorkflowController({
   const planTicketRef = useRef(0);
   const searchTicketRef = useRef(0);
   const conversionTicketRef = useRef(0);
+  const planAbortControllerRef = useRef<AbortController | null>(null);
+  const searchAbortControllerRef = useRef<AbortController | null>(null);
+  const conversionAbortControllerRef = useRef<AbortController | null>(null);
   const workflowRevisionRef = useRef(0);
   const invalidatedFingerprintsRef = useRef<WorkflowFingerprints | null>(null);
   const mountedRef = useRef(true);
@@ -148,6 +153,7 @@ export function useMediaWorkflowController({
       const previous = invalidatedFingerprintsRef.current;
 
       if (force || previous?.planner !== fingerprints.planner) {
+        planAbortControllerRef.current?.abort();
         planTicketRef.current += 1;
         setPlanState({
           status: "idle",
@@ -157,6 +163,8 @@ export function useMediaWorkflowController({
       }
 
       if (force || previous?.export !== fingerprints.export) {
+        searchAbortControllerRef.current?.abort();
+        conversionAbortControllerRef.current?.abort();
         searchTicketRef.current += 1;
         conversionTicketRef.current += 1;
         setSearchState({
@@ -183,6 +191,24 @@ export function useMediaWorkflowController({
       currentTicket: number,
     ) =>
       mountedRef.current &&
+      isCurrentWorkflowRequest(
+        ticket,
+        currentTicket,
+        getCurrentWorkflowFingerprints()[kind],
+      ),
+    [getCurrentWorkflowFingerprints],
+  );
+
+  const isCurrentProgressUpdate = useCallback(
+    (
+      kind: WorkflowFingerprintKind,
+      ticket: WorkflowRequestTicket,
+      currentTicket: number,
+      controllerRef: { current: AbortController | null },
+      controller: AbortController,
+    ) =>
+      mountedRef.current &&
+      controllerRef.current === controller &&
       isCurrentWorkflowRequest(
         ticket,
         currentTicket,
@@ -221,6 +247,9 @@ export function useMediaWorkflowController({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      planAbortControllerRef.current?.abort();
+      searchAbortControllerRef.current?.abort();
+      conversionAbortControllerRef.current?.abort();
       planTicketRef.current += 1;
       searchTicketRef.current += 1;
       conversionTicketRef.current += 1;
@@ -238,6 +267,12 @@ export function useMediaWorkflowController({
       if (!inspection?.ok || inspection.isStaticImage) {
         return null;
       }
+
+      planAbortControllerRef.current?.abort();
+      searchAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      planAbortControllerRef.current = controller;
+      const operationId = createMediaOperationId();
 
       searchTicketRef.current += 1;
       setSearchState({
@@ -277,7 +312,30 @@ export function useMediaWorkflowController({
           baseFrameCount,
           editedTimelineFramesForRequest,
         });
-        const result = await runtime.buildOptimizerPlan(request);
+        const result = await runtime.buildOptimizerPlan(request, {
+          operationId,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (
+              !isCurrentProgressUpdate(
+                "planner",
+                ticket,
+                planTicketRef.current,
+                planAbortControllerRef,
+                controller,
+              )
+            ) {
+              return;
+            }
+            setPlanState((current) =>
+              current.status === "loading" &&
+              current.revision === stateRevision &&
+              current.fingerprint === fingerprint
+                ? { ...current, progress }
+                : current,
+            );
+          },
+        });
         const trimmedResult = {
           ...result,
           candidates: result.candidates.slice(0, advancedPreviewCount),
@@ -347,6 +405,9 @@ export function useMediaWorkflowController({
               : current,
           );
         }
+        if (planAbortControllerRef.current === controller) {
+          planAbortControllerRef.current = null;
+        }
       }
     },
     [
@@ -355,6 +416,7 @@ export function useMediaWorkflowController({
       getCurrentWorkflowFingerprints,
       inspection,
       isCurrentOperation,
+      isCurrentProgressUpdate,
       locale,
       nextWorkflowRevision,
       optimizerGoal,
@@ -395,6 +457,11 @@ export function useMediaWorkflowController({
         return null;
       }
 
+      searchAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      searchAbortControllerRef.current = controller;
+      const operationId = createMediaOperationId();
+
       const ticket: WorkflowRequestTicket = {
         revision: searchTicketRef.current + 1,
         fingerprint,
@@ -415,7 +482,30 @@ export function useMediaWorkflowController({
           );
         }
 
-        const result = await runtime.runOptimizerSearch(request);
+        const result = await runtime.runOptimizerSearch(request, {
+          operationId,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (
+              !isCurrentProgressUpdate(
+                "export",
+                ticket,
+                searchTicketRef.current,
+                searchAbortControllerRef,
+                controller,
+              )
+            ) {
+              return;
+            }
+            setSearchState((current) =>
+              current.status === "loading" &&
+              current.revision === stateRevision &&
+              current.fingerprint === fingerprint
+                ? { ...current, progress }
+                : current,
+            );
+          },
+        });
 
         if (
           !isCurrentOperation(
@@ -481,12 +571,16 @@ export function useMediaWorkflowController({
               : current,
           );
         }
+        if (searchAbortControllerRef.current === controller) {
+          searchAbortControllerRef.current = null;
+        }
       }
     },
     [
       cropRegion,
       inspection,
       isCurrentOperation,
+      isCurrentProgressUpdate,
       locale,
       nextWorkflowRevision,
       optimizerGoal,
@@ -497,6 +591,10 @@ export function useMediaWorkflowController({
       runtime,
     ],
   );
+
+  const cancelOptimizerSearch = useCallback(() => {
+    searchAbortControllerRef.current?.abort();
+  }, []);
 
   const convertStaticImageToPng = useCallback(
     async (
@@ -516,6 +614,11 @@ export function useMediaWorkflowController({
       if (!request) {
         return null;
       }
+
+      conversionAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      conversionAbortControllerRef.current = controller;
+      const operationId = createMediaOperationId();
 
       const ticket: WorkflowRequestTicket = {
         revision: conversionTicketRef.current + 1,
@@ -537,7 +640,30 @@ export function useMediaWorkflowController({
           );
         }
 
-        const result = await runtime.convertStaticImageToPng(request);
+        const result = await runtime.convertStaticImageToPng(request, {
+          operationId,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (
+              !isCurrentProgressUpdate(
+                "export",
+                ticket,
+                conversionTicketRef.current,
+                conversionAbortControllerRef,
+                controller,
+              )
+            ) {
+              return;
+            }
+            setConversionState((current) =>
+              current.status === "loading" &&
+              current.revision === stateRevision &&
+              current.fingerprint === fingerprint
+                ? { ...current, progress }
+                : current,
+            );
+          },
+        });
 
         if (
           !isCurrentOperation(
@@ -603,12 +729,16 @@ export function useMediaWorkflowController({
               : current,
           );
         }
+        if (conversionAbortControllerRef.current === controller) {
+          conversionAbortControllerRef.current = null;
+        }
       }
     },
     [
       cropRegion,
       inspection,
       isCurrentOperation,
+      isCurrentProgressUpdate,
       locale,
       nextWorkflowRevision,
       outputDirectory,
@@ -645,6 +775,7 @@ export function useMediaWorkflowController({
     openOutputFolder,
     buildPlan,
     runBoundedSearch,
+    cancelOptimizerSearch,
     convertStaticImageToPng,
     invalidateWorkflowResults,
   };

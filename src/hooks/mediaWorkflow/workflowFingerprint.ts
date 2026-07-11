@@ -112,9 +112,9 @@ export function currentWorkflowState<T, TProgress = never>(
 }
 
 export function latestActiveWorkflowState(
-  states: readonly (VersionedWorkflowState<unknown> | null)[],
+  states: readonly (VersionedWorkflowState<unknown, unknown> | null)[],
 ) {
-  let latest: VersionedWorkflowState<unknown> | null = null;
+  let latest: VersionedWorkflowState<unknown, unknown> | null = null;
 
   for (const state of states) {
     if (state === null || state.status === "idle") {

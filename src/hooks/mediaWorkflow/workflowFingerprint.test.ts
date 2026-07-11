@@ -290,7 +290,18 @@ describe("latestActiveWorkflowState", () => {
     expect(latestActiveWorkflowState([error, idle])).toBe(error);
   });
 
-  it("selects a current cancellation for localized feedback", () => {
+  it("accepts loading states with typed operation progress", () => {
+    const loading: VersionedWorkflowState<unknown, { stage: "encoding" }> = {
+      status: "loading",
+      revision: 6,
+      fingerprint: "export",
+      progress: { stage: "encoding" },
+    };
+
+    expect(latestActiveWorkflowState([loading])).toBe(loading);
+  });
+
+  it("selects a current cancellation as a neutral workflow state", () => {
     const ready: VersionedWorkflowState<{ id: string }> = {
       status: "ready",
       revision: 4,
