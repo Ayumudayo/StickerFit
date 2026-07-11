@@ -3,6 +3,7 @@ mod media_error;
 mod media_limits;
 mod operation;
 mod output_file;
+mod process_runner;
 
 use base64::{engine::general_purpose, Engine as _};
 use image::codecs::gif::GifDecoder as ImageGifDecoder;
@@ -29,13 +30,11 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, State};
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
@@ -60,6 +59,9 @@ use crate::operation::{
     OperationContext, OperationProgress, PipelineState, ProgressSink, ProgressStage,
 };
 use crate::output_file::PendingOutput;
+use crate::process_runner::{
+    run_captured, stream_fixed_rgba_frames, CapturedProcess, ProcessLimits,
+};
 
 const CANONICAL_FIT_MODE: &str = "contain";
 const MAX_MEDIA_FRAME_COUNT: usize = 300;
@@ -477,7 +479,7 @@ struct CommandOutput {
 
 struct ToolRunError {
     resolution: ToolResolution,
-    system_error: String,
+    error: PipelineError,
 }
 
 struct EncodeResult {
@@ -543,8 +545,9 @@ const DISCORD_MAX_DURATION_US: u64 = 5_000_000;
 const DISCORD_MAX_STICKER_BYTES: u64 = 512 * 1024;
 const MAX_SEARCH_BUDGET: usize = 20;
 const INTERNAL_TASK_ERROR_CODE: &str = "internal-task-failed";
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const PROCESS_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
+const TOOL_PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
+const RAW_DECODE_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn duration_us_to_seconds(duration_us: u64) -> f64 {
     duration_us as f64 / 1_000_000.0
@@ -563,13 +566,6 @@ where
     tauri::async_runtime::spawn_blocking(job)
         .await
         .map_err(|error| error.to_string())
-}
-
-fn configure_child_process(command: &mut Command) {
-    #[cfg(target_os = "windows")]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
 }
 
 fn current_target_triple() -> &'static str {
@@ -1063,43 +1059,29 @@ fn resolve_tool(tool: &str, locale: UiLocale) -> Result<ToolResolution, String> 
 
 fn run_resolved_command(
     resolution: &ToolResolution,
-    args: &[&str],
-    locale: UiLocale,
-) -> Result<CommandOutput, String> {
-    let mut command = Command::new(&resolution.command);
-    configure_child_process(&mut command);
-
-    // Task 9 owns streaming/capping child stdout and stderr before allocation.
-    // Task 6 keeps the existing Command::output boundary; only raw-frame callers
-    // post-validate returned frame/count/total buffers.
-    let output = command
-        .args(args)
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if output.status.success() {
-        Ok(CommandOutput {
-            resolution: resolution.clone(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
-    } else {
-        Err(
-            first_output_line(&output.stdout, &output.stderr).unwrap_or_else(|| {
-                locale::command_non_zero_exit_message(&resolution.command_display, locale)
-            }),
-        )
-    }
+    args: &[OsString],
+    limits: ProcessLimits,
+    context: &OperationContext,
+) -> Result<CommandOutput, PipelineError> {
+    let CapturedProcess { stdout, stderr } =
+        run_captured(&resolution.command, args, limits, context)?;
+    Ok(CommandOutput {
+        resolution: resolution.clone(),
+        stdout,
+        stderr,
+    })
 }
 
 fn run_sidecar_tool(
-    tool: &str,
-    args: &[&str],
+    tool: &'static str,
+    args: &[OsString],
     locale: UiLocale,
+    limits: ProcessLimits,
+    context: &OperationContext,
 ) -> Result<CommandOutput, ToolRunError> {
     let resolved = match resolve_tool(tool, locale) {
         Ok(resolved) => resolved,
-        Err(message) => {
+        Err(_) => {
             return Err(ToolRunError {
                 resolution: ToolResolution {
                     source: "missing",
@@ -1111,32 +1093,36 @@ fn run_sidecar_tool(
                         .collect(),
                     fallback_reason: None,
                 },
-                system_error: message,
+                error: PipelineError::ToolMissing { tool },
             })
         }
     };
 
-    match run_resolved_command(&resolved, args, locale) {
+    match run_resolved_command(&resolved, args, limits, context) {
         Ok(output) => Ok(output),
-        Err(message) => Err(ToolRunError {
+        Err(error) => Err(ToolRunError {
             resolution: resolved,
-            system_error: message,
+            error,
         }),
     }
 }
 
-fn run_with_fallback(
-    tool: &str,
-    args: &[&str],
-    locale: UiLocale,
-) -> Result<CommandOutput, ToolRunError> {
-    run_sidecar_tool(tool, args, locale)
-}
-
-fn check_tool(tool: &str, locale: UiLocale) -> ToolCheck {
+fn check_tool(tool: &'static str, locale: UiLocale) -> ToolCheck {
     let expected = expected_sidecar_name(tool);
+    let context = OperationContext::detached(TOOL_PROCESS_TIMEOUT);
+    let args = [OsString::from("-version")];
 
-    match run_sidecar_tool(tool, &["-version"], locale) {
+    match run_sidecar_tool(
+        tool,
+        &args,
+        locale,
+        ProcessLimits {
+            timeout: TOOL_PROCESS_TIMEOUT,
+            max_stdout_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+        },
+        &context,
+    ) {
         Ok(output) => ToolCheck {
             tool: tool.to_string(),
             available: true,
@@ -1152,17 +1138,22 @@ fn check_tool(tool: &str, locale: UiLocale) -> ToolCheck {
             expected_sidecar_name: expected,
             attempted_sidecar_paths: output.resolution.attempted_sidecar_paths.clone(),
         },
-        Err(error) => ToolCheck {
-            tool: tool.to_string(),
-            available: false,
-            source: "missing".into(),
-            resolved_command: None,
-            fallback_reason: error.resolution.fallback_reason.clone(),
-            version_line: None,
-            detail: locale::media_pipeline_diagnostic(locale, "tool-missing"),
-            expected_sidecar_name: expected,
-            attempted_sidecar_paths: error.resolution.attempted_sidecar_paths,
-        },
+        Err(error) => {
+            let source = error.resolution.source.to_string();
+            let resolved_command = (error.resolution.source != "missing")
+                .then(|| error.resolution.command_display.clone());
+            ToolCheck {
+                tool: tool.to_string(),
+                available: false,
+                source,
+                resolved_command,
+                fallback_reason: error.resolution.fallback_reason.clone(),
+                version_line: None,
+                detail: pipeline_error_diagnostic(&error.error, locale),
+                expected_sidecar_name: expected,
+                attempted_sidecar_paths: error.resolution.attempted_sidecar_paths,
+            }
+        }
     }
 }
 
@@ -3055,18 +3046,6 @@ fn validate_raw_rgba_output(
     Ok((frame_size, frame_count))
 }
 
-fn tool_run_pipeline_error(tool: &'static str, error: ToolRunError) -> PipelineError {
-    if error.resolution.source == "missing" {
-        PipelineError::ToolMissing { tool }
-    } else {
-        PipelineError::ProcessFailed {
-            command: tool.into(),
-            exit_code: None,
-            stderr: error.system_error,
-        }
-    }
-}
-
 fn rgba_frame_from_bytes(
     width: u32,
     height: u32,
@@ -3083,41 +3062,55 @@ fn decode_video_frames_with_ffmpeg(
     frame_width: u32,
     frame_height: u32,
     locale: UiLocale,
+    context: Option<&OperationContext>,
 ) -> Result<(Vec<RgbaImage>, ToolResolution), PipelineError> {
-    let frame_bytes = checked_rgba_bytes(frame_width, frame_height, MediaLimits::default())?;
-    preflight_animation_decoded_bytes(frame_bytes, 1, MediaLimits::default())?;
+    let limits = MediaLimits::default();
+    let frame_size = checked_rgba_bytes(frame_width, frame_height, limits)?;
+    preflight_animation_decoded_bytes(frame_size, 1, limits)?;
+    let resolution = resolve_tool("ffmpeg", locale)
+        .map_err(|_| PipelineError::ToolMissing { tool: "ffmpeg" })?;
     let args = [
-        "-v",
-        "error",
-        "-i",
-        input_path,
-        "-vf",
-        filter_graph,
-        "-pix_fmt",
-        "rgba",
-        "-f",
-        "rawvideo",
-        "-an",
-        "-",
+        OsString::from("-v"),
+        OsString::from("error"),
+        OsString::from("-i"),
+        OsString::from(input_path),
+        OsString::from("-vf"),
+        OsString::from(filter_graph),
+        OsString::from("-pix_fmt"),
+        OsString::from("rgba"),
+        OsString::from("-f"),
+        OsString::from("rawvideo"),
+        OsString::from("-an"),
+        OsString::from("-"),
     ];
-
-    let output = run_with_fallback("ffmpeg", &args, locale)
-        .map_err(|error| tool_run_pipeline_error("ffmpeg", error))?;
-    let (frame_size, _) = validate_raw_rgba_output(
-        frame_width,
-        frame_height,
-        output.stdout.len(),
-        None,
-        MediaLimits::default(),
+    let detached = context
+        .is_none()
+        .then(|| OperationContext::detached(RAW_DECODE_PROCESS_TIMEOUT));
+    let context = context.unwrap_or_else(|| detached.as_ref().expect("detached decode context"));
+    let mut frames = Vec::new();
+    let summary = stream_fixed_rgba_frames(
+        &resolution.command,
+        &args,
+        frame_size,
+        limits.max_frame_count as usize,
+        ProcessLimits {
+            timeout: RAW_DECODE_PROCESS_TIMEOUT,
+            max_stdout_bytes: usize::try_from(limits.max_total_decoded_bytes).unwrap_or(usize::MAX),
+            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+        },
+        context,
+        |frame| {
+            frames.push(rgba_frame_from_bytes(
+                frame_width,
+                frame_height,
+                frame.to_vec(),
+            )?);
+            Ok(())
+        },
     )?;
+    validate_resampled_frame_stream(summary.frame_count)?;
 
-    let frames = output
-        .stdout
-        .chunks(frame_size)
-        .map(|chunk| rgba_frame_from_bytes(frame_width, frame_height, chunk.to_vec()))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok((frames, output.resolution))
+    Ok((frames, resolution))
 }
 
 fn extract_video_source_frames_rgba(
@@ -3126,56 +3119,100 @@ fn extract_video_source_frames_rgba(
     frame_width: u32,
     frame_height: u32,
     locale: UiLocale,
+    context: Option<&OperationContext>,
 ) -> Result<(BTreeMap<u32, RgbaImage>, ToolResolution), PipelineError> {
     if frame_indexes.is_empty() {
         return Err(PipelineError::InvalidRequest {
             reason: "no-frames-selected",
         });
     }
-    let frame_bytes = checked_rgba_bytes(frame_width, frame_height, MediaLimits::default())?;
+    let limits = MediaLimits::default();
+    let frame_size = checked_rgba_bytes(frame_width, frame_height, limits)?;
     preflight_animation_decoded_bytes(
-        frame_bytes,
+        frame_size,
         u64::try_from(frame_indexes.len()).unwrap_or(u64::MAX),
-        MediaLimits::default(),
+        limits,
     )?;
+    let stdout_limit =
+        frame_size
+            .checked_mul(frame_indexes.len())
+            .ok_or(PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: limits.max_total_decoded_bytes,
+                actual: u64::MAX,
+            })?;
 
     let select_filter = build_source_frame_select_filter(frame_indexes);
     let args = [
-        "-v",
-        "error",
-        "-i",
-        input_path,
-        "-vf",
-        select_filter.as_str(),
-        "-pix_fmt",
-        "rgba",
-        "-f",
-        "rawvideo",
-        "-an",
-        "-",
+        OsString::from("-v"),
+        OsString::from("error"),
+        OsString::from("-i"),
+        OsString::from(input_path),
+        OsString::from("-vf"),
+        OsString::from(select_filter),
+        OsString::from("-pix_fmt"),
+        OsString::from("rgba"),
+        OsString::from("-f"),
+        OsString::from("rawvideo"),
+        OsString::from("-an"),
+        OsString::from("-"),
     ];
-
-    let output = run_with_fallback("ffmpeg", &args, locale)
-        .map_err(|error| tool_run_pipeline_error("ffmpeg", error))?;
-    let (frame_size, _) = validate_raw_rgba_output(
-        frame_width,
-        frame_height,
-        output.stdout.len(),
-        Some(frame_indexes.len()),
-        MediaLimits::default(),
+    let resolution = resolve_tool("ffmpeg", locale)
+        .map_err(|_| PipelineError::ToolMissing { tool: "ffmpeg" })?;
+    let detached = context
+        .is_none()
+        .then(|| OperationContext::detached(RAW_DECODE_PROCESS_TIMEOUT));
+    let context = context.unwrap_or_else(|| detached.as_ref().expect("detached decode context"));
+    let mut indexes = frame_indexes.iter().copied();
+    let mut frames = BTreeMap::new();
+    let summary = stream_fixed_rgba_frames(
+        &resolution.command,
+        &args,
+        frame_size,
+        frame_indexes.len(),
+        ProcessLimits {
+            timeout: RAW_DECODE_PROCESS_TIMEOUT,
+            max_stdout_bytes: stdout_limit,
+            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+        },
+        context,
+        |frame| {
+            let frame_index = indexes.next().ok_or(PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: u64::try_from(stdout_limit).unwrap_or(u64::MAX),
+                actual: u64::try_from(stdout_limit)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(frame_size).unwrap_or(u64::MAX)),
+            })?;
+            let pixels = rgba_frame_from_bytes(frame_width, frame_height, frame.to_vec())?;
+            frames.insert(frame_index, pixels);
+            Ok(())
+        },
     )?;
+    validate_exact_selected_frame_stream(frame_indexes.len(), summary.frame_count)?;
 
-    let frames = frame_indexes
-        .iter()
-        .copied()
-        .zip(output.stdout.chunks(frame_size))
-        .map(|(frame_index, chunk)| {
-            rgba_frame_from_bytes(frame_width, frame_height, chunk.to_vec())
-                .map(|pixels| (frame_index, pixels))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok((frames, resolution))
+}
 
-    Ok((frames, output.resolution))
+fn validate_resampled_frame_stream(frame_count: usize) -> Result<(), PipelineError> {
+    if frame_count == 0 {
+        return Err(PipelineError::MalformedProcessOutput {
+            reason: "raw RGBA output did not contain any frames".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_exact_selected_frame_stream(
+    expected_frame_count: usize,
+    actual_frame_count: usize,
+) -> Result<(), PipelineError> {
+    if expected_frame_count != actual_frame_count {
+        return Err(PipelineError::MalformedProcessOutput {
+            reason: "raw RGBA output frame count did not match the request".into(),
+        });
+    }
+    Ok(())
 }
 
 fn normalized_fit_mode(raw: Option<&str>, locale: UiLocale) -> (&'static str, Option<String>) {
@@ -3737,6 +3774,7 @@ fn encode_candidate_from_video_timeline_internal(
     candidate: &CandidatePreview,
     timeline_frames: &[ResolvedTimelineFrame],
     expected_source: Option<&SourceIdentity>,
+    context: Option<&OperationContext>,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<EncodeResult, PipelineError> {
     let output_directory =
@@ -3772,6 +3810,7 @@ fn encode_candidate_from_video_timeline_internal(
         source_width,
         source_height,
         locale,
+        context,
     );
     checkpoint()?;
     let (source_frames, resolution) = decoded?;
@@ -3830,6 +3869,7 @@ fn encode_candidate_with_ffmpeg_frames_internal(
     candidate: &CandidatePreview,
     selected_frames: Option<&[u32]>,
     expected_source: Option<&SourceIdentity>,
+    context: Option<&OperationContext>,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<EncodeResult, PipelineError> {
     let output_directory =
@@ -3863,6 +3903,7 @@ fn encode_candidate_with_ffmpeg_frames_internal(
         frame_width,
         frame_height,
         locale,
+        context,
     );
     checkpoint()?;
     let (pixels, resolution) = decoded?;
@@ -3924,6 +3965,7 @@ fn encode_candidate_internal(
         selected_frames,
         timeline_frames,
         expected_source,
+        None,
         &mut || Ok(()),
     )
 }
@@ -3939,6 +3981,7 @@ fn encode_candidate_with_checkpoint(
     selected_frames: Option<&[u32]>,
     timeline_frames: Option<&[ResolvedTimelineFrame]>,
     expected_source: Option<&SourceIdentity>,
+    context: Option<&OperationContext>,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<EncodeResult, PipelineError> {
     let extension = lowercase_source_extension(input_path).unwrap_or_default();
@@ -3967,6 +4010,7 @@ fn encode_candidate_with_checkpoint(
                 candidate,
                 timeline_frames,
                 expected_source,
+                context,
                 checkpoint,
             ),
         };
@@ -4052,6 +4096,7 @@ fn encode_candidate_with_checkpoint(
         candidate,
         selected_frames,
         expected_source,
+        context,
         checkpoint,
     )
 }
@@ -4069,6 +4114,7 @@ fn convert_static_image_to_png_internal(
         crop_region,
         locale,
         expected_source,
+        None,
         || Ok(()),
         |_, _, _| {},
     )
@@ -4089,6 +4135,7 @@ fn convert_static_image_to_png_with_operation(
         crop_region,
         locale,
         expected_source,
+        Some(context),
         || context.checkpoint(),
         |stage, completed, total| {
             publish_progress(progress, context, stage, completed, total);
@@ -4102,12 +4149,18 @@ fn convert_static_image_to_png_with_callbacks(
     crop_region: Option<&CropRegion>,
     locale: UiLocale,
     expected_source: Option<&SourceIdentity>,
+    context: Option<&OperationContext>,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> StaticImageConversionResult {
     progress(ProgressStage::Inspecting, 0, Some(1));
-    let inspection =
-        inspect_input_media_with_callbacks(input_path, locale, || checkpoint(), |_, _, _| {});
+    let inspection = inspect_input_media_with_callbacks(
+        input_path,
+        locale,
+        context,
+        || checkpoint(),
+        |_, _, _| {},
+    );
 
     if !inspection.ok {
         return StaticImageConversionResult {
@@ -4471,25 +4524,6 @@ fn ffmpeg_inspection_failure_diagnostic(locale: UiLocale, process_succeeded: boo
     } else {
         locale::media_pipeline_diagnostic(locale, "malformed-media")
     }
-}
-
-fn ffmpeg_inspection_process_failure(
-    input_path: &str,
-    tool: &ToolResolution,
-    process_succeeded: bool,
-    _stderr: &[u8],
-    locale: UiLocale,
-) -> Option<MediaInspection> {
-    (!process_succeeded).then(|| {
-        inspection_error(
-            input_path,
-            Some("sidecar".into()),
-            Some(tool.command_display.clone()),
-            tool.fallback_reason.clone(),
-            "inspect-failed",
-            ffmpeg_inspection_failure_diagnostic(locale, false),
-        )
-    })
 }
 
 fn canonical_error_code(error_code: &str) -> &'static str {
@@ -5469,13 +5503,19 @@ fn parse_duration_hms_to_seconds(value: &str) -> Option<f64> {
 
 #[cfg(target_os = "windows")]
 fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_mp4_family_with_media_foundation_and_checkpoint(input_path, locale, &mut || Ok(()))
+    inspect_mp4_family_with_media_foundation_and_checkpoint(
+        input_path,
+        locale,
+        None,
+        &mut || Ok(()),
+    )
 }
 
 #[cfg(target_os = "windows")]
 fn inspect_mp4_family_with_media_foundation_and_checkpoint(
     input_path: &str,
     locale: UiLocale,
+    _context: Option<&OperationContext>,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> MediaInspection {
     if let Err(error) = checkpoint() {
@@ -5600,25 +5640,32 @@ fn inspect_mp4_family_with_media_foundation_and_checkpoint(
 
 #[cfg(not(target_os = "windows"))]
 fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_mp4_family_with_media_foundation_and_checkpoint(input_path, locale, &mut || Ok(()))
+    inspect_mp4_family_with_media_foundation_and_checkpoint(
+        input_path,
+        locale,
+        None,
+        &mut || Ok(()),
+    )
 }
 
 #[cfg(not(target_os = "windows"))]
 fn inspect_mp4_family_with_media_foundation_and_checkpoint(
     input_path: &str,
     locale: UiLocale,
+    context: Option<&OperationContext>,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> MediaInspection {
-    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, checkpoint)
+    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, context, checkpoint)
 }
 
 fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, &mut || Ok(()))
+    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, None, &mut || Ok(()))
 }
 
 fn inspect_video_with_ffmpeg_and_checkpoint(
     input_path: &str,
     locale: UiLocale,
+    context: Option<&OperationContext>,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> MediaInspection {
     if let Err(error) = checkpoint() {
@@ -5639,51 +5686,51 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
     };
 
     let args = [
-        "-hide_banner",
-        "-i",
-        input_path,
-        "-map",
-        "0:v:0",
-        "-frames:v",
-        "1",
-        "-f",
-        "null",
-        "-",
+        OsString::from("-hide_banner"),
+        OsString::from("-i"),
+        OsString::from(input_path),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-frames:v"),
+        OsString::from("1"),
+        OsString::from("-f"),
+        OsString::from("null"),
+        OsString::from("-"),
     ];
-
-    let mut command = Command::new(&tool.command);
-    configure_child_process(&mut command);
-    // Task 9 replaces this direct child buffering with the shared bounded
-    // stdout/stderr streaming and kill/reap process runner.
+    let detached = context
+        .is_none()
+        .then(|| OperationContext::detached(TOOL_PROCESS_TIMEOUT));
+    let process_context =
+        context.unwrap_or_else(|| detached.as_ref().expect("detached inspection context"));
     if let Err(error) = checkpoint() {
         return inspection_pipeline_error(input_path, &error, locale);
     }
-    let output_result = command.args(args).output();
+    let output_result = run_captured(
+        &tool.command,
+        &args,
+        ProcessLimits {
+            timeout: TOOL_PROCESS_TIMEOUT,
+            max_stdout_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+        },
+        process_context,
+    );
     if let Err(error) = checkpoint() {
         return inspection_pipeline_error(input_path, &error, locale);
     }
     let output = match output_result {
         Ok(output) => output,
-        Err(_) => {
+        Err(error) => {
             return inspection_error(
                 input_path,
                 Some("sidecar".into()),
                 Some(tool.command_display.clone()),
                 tool.fallback_reason.clone(),
-                "process-failed",
-                locale::media_pipeline_diagnostic(locale, "process-failed"),
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
             );
         }
     };
-    if let Some(failure) = ffmpeg_inspection_process_failure(
-        input_path,
-        &tool,
-        output.status.success(),
-        &output.stderr,
-        locale,
-    ) {
-        return failure;
-    }
 
     static FORMAT_REGEX: OnceLock<Regex> = OnceLock::new();
     static DURATION_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -5711,7 +5758,7 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
     let stream_captures = match stream_regex.captures(&stderr) {
         Some(captures) => captures,
         None => {
-            let message = ffmpeg_inspection_failure_diagnostic(locale, output.status.success());
+            let message = ffmpeg_inspection_failure_diagnostic(locale, true);
 
             return inspection_error(
                 input_path,
@@ -5772,12 +5819,13 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
 }
 
 fn inspect_input_media_canonical_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_input_media_canonical_with_checkpoint(input_path, locale, &mut || Ok(()))
+    inspect_input_media_canonical_with_checkpoint(input_path, locale, None, &mut || Ok(()))
 }
 
 fn inspect_input_media_canonical_with_checkpoint(
     input_path: &str,
     locale: UiLocale,
+    context: Option<&OperationContext>,
     checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
 ) -> MediaInspection {
     if let Err(error) = checkpoint() {
@@ -5839,12 +5887,12 @@ fn inspect_input_media_canonical_with_checkpoint(
 
     if matches!(extension.as_str(), "mp4" | "m4v" | "mov") {
         return inspect_mp4_family_with_media_foundation_and_checkpoint(
-            input_path, locale, checkpoint,
+            input_path, locale, context, checkpoint,
         );
     }
 
     if is_supported_video_extension(&extension) {
-        return inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, checkpoint);
+        return inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, context, checkpoint);
     }
 
     inspection_error(
@@ -5858,7 +5906,7 @@ fn inspect_input_media_canonical_with_checkpoint(
 }
 
 fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_input_media_with_callbacks(input_path, locale, || Ok(()), |_, _, _| {})
+    inspect_input_media_with_callbacks(input_path, locale, None, || Ok(()), |_, _, _| {})
 }
 
 fn inspect_input_media_with_operation(
@@ -5870,6 +5918,7 @@ fn inspect_input_media_with_operation(
     inspect_input_media_with_callbacks(
         input_path,
         locale,
+        Some(context),
         || context.checkpoint(),
         |stage, completed, total| {
             publish_progress(progress, context, stage, completed, total);
@@ -5880,6 +5929,7 @@ fn inspect_input_media_with_operation(
 fn inspect_input_media_with_callbacks(
     input_path: &str,
     locale: UiLocale,
+    context: Option<&OperationContext>,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> MediaInspection {
@@ -5901,8 +5951,12 @@ fn inspect_input_media_with_callbacks(
         }
     };
     let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
-    let inspection =
-        inspect_input_media_canonical_with_checkpoint(&canonical_path, locale, &mut checkpoint);
+    let inspection = inspect_input_media_canonical_with_checkpoint(
+        &canonical_path,
+        locale,
+        context,
+        &mut checkpoint,
+    );
     let inspection = apply_inspection_source_revision(&identity, input_path, inspection);
     let inspection = enforce_desktop_inspection_frame_limit(inspection, locale);
     let tool_detail = inspection.tool_detail.clone();
@@ -6123,7 +6177,7 @@ fn run_optimizer_search_internal(
     mut request: OptimizerSearchRequest,
     locale: UiLocale,
 ) -> OptimizerSearchResponse {
-    run_optimizer_search_with_callbacks(request, locale, || Ok(()), |_, _, _| {})
+    run_optimizer_search_with_callbacks(request, locale, None, || Ok(()), |_, _, _| {})
 }
 
 fn run_optimizer_search_with_operation(
@@ -6135,6 +6189,7 @@ fn run_optimizer_search_with_operation(
     run_optimizer_search_with_callbacks(
         request,
         locale,
+        Some(context),
         || context.checkpoint(),
         |stage, completed, total| {
             publish_progress(progress, context, stage, completed, total);
@@ -6145,6 +6200,7 @@ fn run_optimizer_search_with_operation(
 fn run_optimizer_search_with_callbacks(
     mut request: OptimizerSearchRequest,
     locale: UiLocale,
+    context: Option<&OperationContext>,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> OptimizerSearchResponse {
@@ -6459,6 +6515,7 @@ fn run_optimizer_search_with_callbacks(
                     None,
                     Some(timeline_frames),
                     Some(&source_identity),
+                    context,
                     &mut checkpoint,
                 )
             } else {
@@ -6477,6 +6534,7 @@ fn run_optimizer_search_with_callbacks(
                     }),
                     None,
                     Some(&source_identity),
+                    context,
                     &mut checkpoint,
                 )
             };
@@ -6661,6 +6719,139 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_offset = source.find(start).expect("source section start");
+        let tail = &source[start_offset..];
+        let end_offset = tail.find(end).expect("source section end");
+        &tail[..end_offset]
+    }
+
+    #[test]
+    fn successful_zero_frame_and_selected_underproduction_are_malformed() {
+        assert!(matches!(
+            validate_resampled_frame_stream(0),
+            Err(PipelineError::MalformedProcessOutput { .. })
+        ));
+        assert!(matches!(
+            validate_exact_selected_frame_stream(3, 2),
+            Err(PipelineError::MalformedProcessOutput { .. })
+        ));
+        assert_eq!(validate_resampled_frame_stream(1), Ok(()));
+        assert_eq!(validate_exact_selected_frame_stream(3, 3), Ok(()));
+    }
+
+    #[test]
+    fn process_runner_source_maps_all_managed_callers_and_only_folder_spawns_remain() {
+        let lib_source = include_str!("lib.rs");
+        let runner_source = include_str!("process_runner.rs");
+
+        let sidecar = source_section(lib_source, "fn run_resolved_command(", "fn check_tool(");
+        assert!(sidecar.contains("run_captured("));
+        let health = source_section(
+            lib_source,
+            "fn check_tool(",
+            "fn lowercase_source_extension(",
+        );
+        assert!(health.contains("OperationContext::detached"));
+        assert!(health.contains("run_sidecar_tool("));
+
+        let inspection = source_section(
+            lib_source,
+            "fn inspect_video_with_ffmpeg_and_checkpoint(",
+            "fn inspect_input_media_canonical_internal(",
+        );
+        assert!(inspection.contains("run_captured("));
+        assert!(inspection.contains("context.unwrap_or"));
+
+        let resampled = source_section(
+            lib_source,
+            "fn decode_video_frames_with_ffmpeg(",
+            "fn extract_video_source_frames_rgba(",
+        );
+        assert!(resampled.contains("stream_fixed_rgba_frames("));
+        assert!(resampled.contains("validate_resampled_frame_stream("));
+        assert!(resampled.contains("context.unwrap_or"));
+        let selected = source_section(
+            lib_source,
+            "fn extract_video_source_frames_rgba(",
+            "fn validate_resampled_frame_stream(",
+        );
+        assert!(selected.contains("stream_fixed_rgba_frames("));
+        assert!(selected.contains("validate_exact_selected_frame_stream("));
+        assert!(selected.contains("context.unwrap_or"));
+
+        let inspect_direct = source_section(
+            lib_source,
+            "fn inspect_input_media_internal(",
+            "fn inspect_input_media_with_operation(",
+        );
+        let inspect_managed = source_section(
+            lib_source,
+            "fn inspect_input_media_with_operation(",
+            "fn inspect_input_media_with_callbacks(",
+        );
+        assert!(inspect_direct.contains("None,"));
+        assert!(inspect_managed.contains("Some(context),"));
+
+        let static_direct = source_section(
+            lib_source,
+            "fn convert_static_image_to_png_internal(",
+            "fn convert_static_image_to_png_with_operation(",
+        );
+        let static_managed = source_section(
+            lib_source,
+            "fn convert_static_image_to_png_with_operation(",
+            "fn convert_static_image_to_png_with_callbacks(",
+        );
+        assert!(static_direct.contains("None,"));
+        assert!(static_managed.contains("Some(context),"));
+
+        let search_direct = source_section(
+            lib_source,
+            "fn run_optimizer_search_internal(",
+            "fn run_optimizer_search_with_operation(",
+        );
+        let search_managed = source_section(
+            lib_source,
+            "fn run_optimizer_search_with_operation(",
+            "fn run_optimizer_search_with_callbacks(",
+        );
+        assert!(search_direct.contains("None,"));
+        assert!(search_managed.contains("Some(context),"));
+
+        let encode_direct = source_section(
+            lib_source,
+            "fn encode_candidate_internal(",
+            "fn encode_candidate_with_checkpoint(",
+        );
+        let encode_propagation = source_section(
+            lib_source,
+            "fn encode_candidate_with_checkpoint(",
+            "fn convert_static_image_to_png_internal(",
+        );
+        assert!(encode_direct.contains("None,"));
+        assert!(encode_propagation.contains("context,"));
+
+        let command_new = ["Command", "::new("].concat();
+        let spawn = [".", "spawn()"].concat();
+        let kill = ["Child", "::kill(self)"].concat();
+        let wait = ["Child", "::wait(self)"].concat();
+        let output = [".", "output()"].concat();
+        assert_eq!(lib_source.matches(&command_new).count(), 3);
+        assert_eq!(lib_source.matches(&spawn).count(), 3);
+        assert_eq!(lib_source.matches(&output).count(), 0);
+        let folder_open = source_section(lib_source, "fn open_folder_path(", "pub fn run()");
+        assert_eq!(folder_open.matches(&command_new).count(), 3);
+        assert_eq!(folder_open.matches(&spawn).count(), 3);
+        assert_eq!(runner_source.matches(&command_new).count(), 1);
+        assert_eq!(runner_source.matches(&spawn).count(), 1);
+        assert_eq!(runner_source.matches(&kill).count(), 1);
+        assert_eq!(runner_source.matches(&wait).count(), 1);
+        assert_eq!(runner_source.matches(&output).count(), 0);
+        assert!(runner_source.contains("Stdio::null()"));
+        assert!(runner_source.contains("sync_channel::<FrameEvent>(2)"));
+    }
 
     #[derive(Debug)]
     struct PanicOnFrame301;
@@ -7173,36 +7364,6 @@ mod tests {
             ffmpeg_inspection_failure_diagnostic(UiLocale::En, false),
             locale::media_pipeline_diagnostic(UiLocale::En, "malformed-media")
         );
-    }
-
-    #[test]
-    fn failed_ffmpeg_inspection_cannot_become_success_from_stderr_metadata() {
-        let tool = ToolResolution {
-            source: "sidecar",
-            command: OsString::from("C:\\private\\ffmpeg.exe"),
-            command_display: "ffmpeg.exe".into(),
-            attempted_sidecar_paths: vec!["ffmpeg.exe".into()],
-            fallback_reason: None,
-        };
-        let stderr = b"Input #0, mov, from 'C:\\private\\source.mp4':\n\
-            Stream #0:0: Video: h264, yuv420p, 320x240, 30 fps";
-
-        let failure = ffmpeg_inspection_process_failure(
-            "C:\\private\\source.mp4",
-            &tool,
-            false,
-            stderr,
-            UiLocale::En,
-        )
-        .expect("non-zero FFmpeg status must fail before metadata parsing");
-
-        assert!(!failure.ok);
-        assert_eq!(failure.error_code.as_deref(), Some("malformed-media"));
-        assert_eq!(failure.reason_code.as_deref(), Some("decode-failed"));
-        assert!(!failure
-            .error_message
-            .unwrap_or_default()
-            .contains("C:\\private"));
     }
 
     #[test]

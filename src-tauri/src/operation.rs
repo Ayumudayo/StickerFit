@@ -64,6 +64,21 @@ impl OperationContext {
         }
     }
 
+    pub(crate) fn detached(timeout: Duration) -> Self {
+        let now = Instant::now();
+        let mut bounded_timeout = timeout;
+        let deadline = loop {
+            if let Some(deadline) = now.checked_add(bounded_timeout) {
+                break deadline;
+            }
+            bounded_timeout = bounded_timeout.checked_div(2).unwrap_or(Duration::ZERO);
+            if bounded_timeout.is_zero() {
+                break now.checked_add(Duration::from_nanos(1)).unwrap_or(now);
+            }
+        };
+        Self::new("detached-process".into(), deadline)
+    }
+
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
     }
@@ -508,6 +523,23 @@ mod tests {
             "cancelled-and-expired".into(),
             Instant::now() - Duration::from_millis(1),
         );
+        context.cancel();
+
+        assert_eq!(context.checkpoint(), Err(PipelineError::Cancelled));
+    }
+
+    #[test]
+    fn detached_context_is_registry_free_live_and_uses_fixed_internal_id() {
+        let context = OperationContext::detached(Duration::from_secs(1));
+
+        assert_eq!(context.operation_id(), "detached-process");
+        assert!(context.deadline() > Instant::now());
+        assert_eq!(context.checkpoint(), Ok(()));
+    }
+
+    #[test]
+    fn detached_context_preserves_cancellation_before_deadline_precedence() {
+        let context = OperationContext::detached(Duration::ZERO);
         context.cancel();
 
         assert_eq!(context.checkpoint(), Err(PipelineError::Cancelled));
