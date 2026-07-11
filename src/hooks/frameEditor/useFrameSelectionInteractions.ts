@@ -11,9 +11,15 @@ import {
   useState,
 } from "react";
 
-import { releasePointerCaptureIfHeld, resolveFrameDropTargetFromList } from "../../utils/frameDnD";
+import {
+  advanceFrameRailAutoScroll,
+  computeFrameRailAutoScrollDelta,
+  releasePointerCaptureIfHeld,
+  resolveFrameDropTargetFromVirtualGeometry,
+} from "../../utils/frameDnD";
 import { buildFramePointerSelection } from "../../utils/frameSelection";
 import { moveSelectedFramesAroundAnchor } from "../../utils/frameEditing";
+import { FRAME_RAIL_ROW_HEIGHT } from "../../utils/virtualFrameList";
 import { useFrameContextMenuState } from "./useFrameContextMenuState";
 import { useFrameSelectionCommands } from "./useFrameSelectionCommands";
 import type {
@@ -58,6 +64,8 @@ export function useFrameSelectionInteractions({
   const selectionAnchorInstanceIdRef = useRef<string | null>(null);
   const frameReorderStateRef = useRef<FrameReorderState | null>(null);
   const frameDropTargetRef = useRef<FrameDropTargetState | null>(null);
+  const framePointerPositionRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const frameAutoScrollRafRef = useRef<number | null>(null);
   const selectedInstanceIdSet = useMemo(
     () => new Set(selectedInstanceIds),
     [selectedInstanceIds],
@@ -104,6 +112,11 @@ export function useFrameSelectionInteractions({
     frameReorderStateRef.current = null;
     setFrameDropTarget(null);
     setFrameReorderState(null);
+    framePointerPositionRef.current = null;
+    if (frameAutoScrollRafRef.current !== null) {
+      window.cancelAnimationFrame(frameAutoScrollRafRef.current);
+      frameAutoScrollRafRef.current = null;
+    }
     selectionAnchorInstanceIdRef.current = null;
   }, [setFrameContextMenu]);
 
@@ -298,6 +311,80 @@ export function useFrameSelectionInteractions({
   );
 
   useEffect(() => {
+    const stopAutoScroll = () => {
+      if (frameAutoScrollRafRef.current !== null) {
+        window.cancelAnimationFrame(frameAutoScrollRafRef.current);
+        frameAutoScrollRafRef.current = null;
+      }
+    };
+
+    const updateDropTargetForPointer = (clientX: number, clientY: number) => {
+      const listElement = frameTableBodyRef.current;
+      const reorderState = frameReorderStateRef.current;
+      if (!listElement || !reorderState?.active) {
+        updateFrameDropTarget(null);
+        return;
+      }
+      const bounds = listElement.getBoundingClientRect();
+      updateFrameDropTarget(
+        resolveFrameDropTargetFromVirtualGeometry({
+          listBounds: {
+            left: bounds.left,
+            right: bounds.right,
+            top: bounds.top,
+            bottom: bounds.bottom,
+          },
+          scrollTop: listElement.scrollTop,
+          rowHeight: FRAME_RAIL_ROW_HEIGHT,
+          orderedInstanceIds: orderedFrameIds,
+          draggedInstanceIds: reorderState.draggedInstanceIds,
+          clientX,
+          clientY,
+        }),
+      );
+    };
+
+    const runAutoScrollFrame = () => {
+      frameAutoScrollRafRef.current = null;
+      const pointer = framePointerPositionRef.current;
+      const listElement = frameTableBodyRef.current;
+      const reorderState = frameReorderStateRef.current;
+      if (!pointer || !listElement || !reorderState?.active) return;
+
+      const bounds = listElement.getBoundingClientRect();
+      const listBounds = {
+        left: bounds.left,
+        right: bounds.right,
+        top: bounds.top,
+        bottom: bounds.bottom,
+      };
+      const delta = computeFrameRailAutoScrollDelta({
+        clientY: pointer.clientY,
+        listBounds,
+        edgeSize: 32,
+        maxStep: 18,
+      });
+      const advanced = advanceFrameRailAutoScroll({
+        scrollTop: listElement.scrollTop,
+        delta,
+        scrollHeight: listElement.scrollHeight,
+        clientHeight: listElement.clientHeight,
+      });
+      if (advanced.didScroll) {
+        listElement.scrollTop = advanced.scrollTop;
+        updateDropTargetForPointer(pointer.clientX, pointer.clientY);
+      }
+      if (delta !== 0 && advanced.didScroll) {
+        frameAutoScrollRafRef.current = window.requestAnimationFrame(runAutoScrollFrame);
+      }
+    };
+
+    const ensureAutoScroll = () => {
+      if (frameAutoScrollRafRef.current === null) {
+        frameAutoScrollRafRef.current = window.requestAnimationFrame(runAutoScrollFrame);
+      }
+    };
+
     const handlePointerMove = (event: PointerEvent) => {
       const reorderState = frameReorderStateRef.current;
       if (!reorderState || event.pointerId !== reorderState.pointerId) {
@@ -310,6 +397,8 @@ export function useFrameSelectionInteractions({
         return;
       }
 
+      framePointerPositionRef.current = { clientX: event.clientX, clientY: event.clientY };
+
       if (!reorderState.active || reorderState.currentY !== event.clientY) {
         updateFrameReorderState({
           ...reorderState,
@@ -318,23 +407,18 @@ export function useFrameSelectionInteractions({
         });
       }
 
-      const nextTarget = resolveFrameDropTargetFromList(
-        frameTableBodyRef.current,
-        reorderState.draggedInstanceIds,
-        event.clientX,
-        event.clientY,
-      );
-      updateFrameDropTarget(nextTarget);
+      updateDropTargetForPointer(event.clientX, event.clientY);
+      ensureAutoScroll();
     };
 
-    const handlePointerEnd = (event: PointerEvent) => {
+    const finishPointerInteraction = (event: PointerEvent, cancelled: boolean) => {
       const reorderState = frameReorderStateRef.current;
       const dropTarget = frameDropTargetRef.current;
       if (!reorderState || event.pointerId !== reorderState.pointerId) {
         return;
       }
 
-      if (reorderState.active) {
+      if (!cancelled && reorderState.active) {
         if (dropTarget) {
           setTimelineFrames((current) =>
             moveSelectedFramesAroundAnchor(
@@ -345,24 +429,35 @@ export function useFrameSelectionInteractions({
             ),
           );
         }
-      } else if (reorderState.collapseToInstanceIdOnClick) {
+      } else if (!cancelled && reorderState.collapseToInstanceIdOnClick) {
         setSelectedInstanceIds([reorderState.collapseToInstanceIdOnClick]);
         selectionAnchorInstanceIdRef.current = reorderState.collapseToInstanceIdOnClick;
       }
 
       updateFrameReorderState(null);
       updateFrameDropTarget(null);
+      framePointerPositionRef.current = null;
+      stopAutoScroll();
     };
+    const handlePointerUp = (event: PointerEvent) => finishPointerInteraction(event, false);
+    const handlePointerCancel = (event: PointerEvent) => finishPointerInteraction(event, true);
 
     window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerEnd);
-    window.addEventListener("pointercancel", handlePointerEnd);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
     return () => {
       window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerEnd);
-      window.removeEventListener("pointercancel", handlePointerEnd);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+      framePointerPositionRef.current = null;
+      stopAutoScroll();
     };
-  }, [setTimelineFrames, updateFrameDropTarget, updateFrameReorderState]);
+  }, [
+    orderedFrameIds,
+    setTimelineFrames,
+    updateFrameDropTarget,
+    updateFrameReorderState,
+  ]);
 
 
   const {

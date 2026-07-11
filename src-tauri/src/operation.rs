@@ -8,6 +8,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::media_error::PipelineError;
+use crate::preview_cache::{PreviewCache, MAX_PREVIEW_CACHE_BYTES};
 
 const MAX_OPERATION_ID_BYTES: usize = 128;
 const TOMBSTONE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -293,6 +294,7 @@ pub(crate) struct PipelineState {
     output: Arc<Semaphore>,
     estimate: Arc<Semaphore>,
     decode: Arc<Semaphore>,
+    preview_cache: Arc<PreviewCache>,
 }
 
 impl PipelineState {
@@ -302,6 +304,7 @@ impl PipelineState {
             output: Arc::new(Semaphore::new(1)),
             estimate: Arc::new(Semaphore::new(1)),
             decode: Arc::new(Semaphore::new(2)),
+            preview_cache: Arc::new(PreviewCache::new(MAX_PREVIEW_CACHE_BYTES)),
         }
     }
 
@@ -315,6 +318,10 @@ impl PipelineState {
 
     pub(crate) fn cancel(&self, operation_id: &str) -> bool {
         self.registry.cancel(operation_id)
+    }
+
+    pub(crate) fn preview_cache(&self) -> Arc<PreviewCache> {
+        Arc::clone(&self.preview_cache)
     }
 
     pub(crate) async fn acquire_decode(

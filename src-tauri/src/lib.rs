@@ -4,6 +4,7 @@ mod media_error;
 mod media_limits;
 mod operation;
 mod output_file;
+mod preview_cache;
 mod process_runner;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -66,12 +67,18 @@ use crate::operation::{
     OperationContext, OperationProgress, PipelineState, ProgressSink, ProgressStage,
 };
 use crate::output_file::PendingOutput;
+use crate::preview_cache::{
+    CachedPreview, PreviewCache, PreviewCachePublication, PreviewSourceKey, PreviewVariant,
+    MAX_PREVIEW_CACHE_BYTES,
+};
 use crate::process_runner::{
     run_captured, stream_fixed_rgba_frames, CapturedProcess, ProcessLimits,
 };
 
 const CANONICAL_FIT_MODE: &str = "contain";
 const MAX_MEDIA_FRAME_COUNT: usize = 300;
+const MAX_PREVIEW_BATCH_IDS: usize = 24;
+const MAX_PREVIEW_EDGE: u32 = 128;
 const MEDIA_FOUNDATION_FAILED_REASON_CODE: &str = "media-foundation-failed";
 
 struct BoundedVecVisitor<T>(PhantomData<T>);
@@ -3080,12 +3087,422 @@ fn encode_native_png_bytes(pixels: &RgbaImage) -> Result<Vec<u8>, PipelineError>
     Ok(bytes)
 }
 
-fn encode_native_png_data_url(pixels: &RgbaImage) -> Result<String, PipelineError> {
-    let bytes = encode_native_png_bytes(pixels)?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        general_purpose::STANDARD.encode(bytes)
-    ))
+fn normalize_preview_source_frame_ids(source_frame_ids: &[u32]) -> Result<Vec<u32>, PipelineError> {
+    if source_frame_ids.len() > MAX_MEDIA_FRAME_COUNT {
+        return Err(PipelineError::LimitExceeded {
+            resource: "frame-count",
+            limit: MAX_MEDIA_FRAME_COUNT as u64,
+            actual: u64::try_from(source_frame_ids.len()).unwrap_or(u64::MAX),
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(source_frame_ids.len().min(MAX_PREVIEW_BATCH_IDS));
+    for source_frame_id in source_frame_ids.iter().copied() {
+        if source_frame_id == 0 {
+            return Err(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            });
+        }
+        if seen.insert(source_frame_id) {
+            normalized.push(source_frame_id);
+        }
+    }
+
+    if normalized.is_empty() {
+        return Err(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        });
+    }
+    if normalized.len() > MAX_PREVIEW_BATCH_IDS {
+        return Err(PipelineError::LimitExceeded {
+            resource: "frame-count",
+            limit: MAX_PREVIEW_BATCH_IDS as u64,
+            actual: u64::try_from(normalized.len()).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(normalized)
+}
+
+fn preview_output_dimensions(width: u32, height: u32) -> Result<(u32, u32), PipelineError> {
+    if width == 0 || height == 0 {
+        return Err(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        });
+    }
+    let largest = width.max(height);
+    if largest <= MAX_PREVIEW_EDGE {
+        return Ok((width, height));
+    }
+
+    let scale = f64::from(MAX_PREVIEW_EDGE) / f64::from(largest);
+    let scaled_width = (f64::from(width) * scale)
+        .round()
+        .clamp(1.0, f64::from(MAX_PREVIEW_EDGE)) as u32;
+    let scaled_height = (f64::from(height) * scale)
+        .round()
+        .clamp(1.0, f64::from(MAX_PREVIEW_EDGE)) as u32;
+    Ok((scaled_width, scaled_height))
+}
+
+fn ascending_video_preview_extraction(
+    requested_source_frame_ids: &[u32],
+) -> Result<Vec<(u32, u32)>, PipelineError> {
+    let mut extraction = requested_source_frame_ids
+        .iter()
+        .copied()
+        .map(|source_frame_id| {
+            source_frame_id
+                .checked_sub(1)
+                .map(|frame_index| (frame_index, source_frame_id))
+                .ok_or(PipelineError::InvalidRequest {
+                    reason: "invalid-frame-selection",
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    extraction.sort_unstable_by_key(|(frame_index, _)| *frame_index);
+    Ok(extraction)
+}
+
+fn build_native_preview_group(
+    input_path: &Path,
+    expected_source: &SourceIdentity,
+    context: &OperationContext,
+    progress: &mut impl FnMut(ProgressStage, u32, Option<u32>),
+) -> Result<Vec<CachedPreview>, PipelineError> {
+    let mut previews = Vec::new();
+    visit_native_animation_frames(
+        input_path,
+        MediaLimits::default(),
+        context,
+        |source_frame_id, frame| {
+            context.checkpoint()?;
+            let pixels = frame.into_buffer();
+            let (width, height) = preview_output_dimensions(pixels.width(), pixels.height())?;
+            let scaled = if pixels.dimensions() == (width, height) {
+                pixels
+            } else {
+                imageops::resize(&pixels, width, height, FilterType::Lanczos3)
+            };
+            context.checkpoint()?;
+            let png_bytes = encode_native_png_bytes(&scaled)?;
+            previews.push(CachedPreview {
+                source_frame_id,
+                png_bytes: Arc::from(png_bytes.into_boxed_slice()),
+                width,
+                height,
+            });
+            progress(
+                ProgressStage::Decoding,
+                u32::try_from(previews.len()).unwrap_or(u32::MAX),
+                None,
+            );
+            context.checkpoint()
+        },
+    )?;
+    context.checkpoint()?;
+    ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    Ok(previews)
+}
+
+fn build_video_preview_filter(extraction: &[(u32, u32)], width: u32, height: u32) -> String {
+    let selection = extraction
+        .iter()
+        .map(|(frame_index, _)| format!("eq(n,{frame_index})"))
+        .collect::<Vec<_>>()
+        .join("+");
+    format!("select='{selection}',scale={width}:{height}:flags=lanczos,format=rgba,setsar=1")
+}
+
+fn extract_video_preview_batch(
+    input_path: &Path,
+    extraction: &[(u32, u32)],
+    width: u32,
+    height: u32,
+    locale: UiLocale,
+    expected_source: &SourceIdentity,
+    context: &OperationContext,
+    progress: &mut impl FnMut(ProgressStage, u32, Option<u32>),
+) -> Result<Vec<CachedPreview>, PipelineError> {
+    if extraction.is_empty() {
+        return Ok(Vec::new());
+    }
+    let frame_size = checked_rgba_bytes(width, height, MediaLimits::default())?;
+    let stdout_limit =
+        frame_size
+            .checked_mul(extraction.len())
+            .ok_or(PipelineError::LimitExceeded {
+                resource: "decoded-bytes",
+                limit: MediaLimits::default().max_total_decoded_bytes,
+                actual: u64::MAX,
+            })?;
+    let resolution = resolve_tool("ffmpeg", locale)
+        .map_err(|_| PipelineError::ToolMissing { tool: "ffmpeg" })?;
+    let filter = build_video_preview_filter(extraction, width, height);
+    let args = vec![
+        OsString::from("-v"),
+        OsString::from("error"),
+        OsString::from("-i"),
+        input_path.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-vf"),
+        OsString::from(filter),
+        OsString::from("-fps_mode"),
+        OsString::from("passthrough"),
+        OsString::from("-pix_fmt"),
+        OsString::from("rgba"),
+        OsString::from("-f"),
+        OsString::from("rawvideo"),
+        OsString::from("-an"),
+        OsString::from("-"),
+    ];
+    let mut expected_frames = extraction.iter().copied();
+    let mut previews = Vec::with_capacity(extraction.len());
+    let summary = stream_fixed_rgba_frames(
+        &resolution.command,
+        &args,
+        frame_size,
+        extraction.len(),
+        ProcessLimits {
+            timeout: RAW_DECODE_PROCESS_TIMEOUT,
+            max_stdout_bytes: stdout_limit,
+            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+        },
+        context,
+        |frame| {
+            context.checkpoint()?;
+            let (_, source_frame_id) =
+                expected_frames
+                    .next()
+                    .ok_or(PipelineError::MalformedProcessOutput {
+                        reason: "video preview stream produced an unexpected frame".into(),
+                    })?;
+            let pixels = rgba_frame_from_bytes(width, height, frame.to_vec())?;
+            let png_bytes = encode_native_png_bytes(&pixels)?;
+            previews.push(CachedPreview {
+                source_frame_id,
+                png_bytes: Arc::from(png_bytes.into_boxed_slice()),
+                width,
+                height,
+            });
+            progress(
+                ProgressStage::Encoding,
+                u32::try_from(previews.len()).unwrap_or(u32::MAX),
+                Some(u32::try_from(extraction.len()).unwrap_or(u32::MAX)),
+            );
+            context.checkpoint()
+        },
+    )?;
+    validate_exact_selected_frame_stream(extraction.len(), summary.frame_count)?;
+    context.checkpoint()?;
+    ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    Ok(previews)
+}
+
+fn cached_preview_items_for_requested_ids(
+    requested_source_frame_ids: &[u32],
+    cached: &[CachedPreview],
+) -> Result<Vec<FramePreviewItem>, PipelineError> {
+    let by_id = cached
+        .iter()
+        .map(|preview| (preview.source_frame_id, preview))
+        .collect::<BTreeMap<_, _>>();
+    requested_source_frame_ids
+        .iter()
+        .map(|source_frame_id| {
+            let preview = by_id
+                .get(source_frame_id)
+                .ok_or(PipelineError::InvalidRequest {
+                    reason: "invalid-frame-selection",
+                })?;
+            Ok(FramePreviewItem {
+                source_frame_id: *source_frame_id,
+                data_url: format!(
+                    "data:image/png;base64,{}",
+                    general_purpose::STANDARD.encode(preview.png_bytes.as_ref())
+                ),
+                width: preview.width,
+                height: preview.height,
+            })
+        })
+        .collect()
+}
+
+fn cached_previews_for_requested_ids(
+    requested_source_frame_ids: &[u32],
+    cached: &[CachedPreview],
+) -> Result<Vec<CachedPreview>, PipelineError> {
+    let by_id = cached
+        .iter()
+        .map(|preview| (preview.source_frame_id, preview))
+        .collect::<BTreeMap<_, _>>();
+    requested_source_frame_ids
+        .iter()
+        .map(|source_frame_id| {
+            by_id
+                .get(source_frame_id)
+                .cloned()
+                .cloned()
+                .ok_or(PipelineError::InvalidRequest {
+                    reason: "invalid-frame-selection",
+                })
+        })
+        .collect()
+}
+
+fn preview_source_key(
+    input_path: &Path,
+    identity: &SourceIdentity,
+    source_revision: &str,
+    source_width: Option<u32>,
+    source_height: Option<u32>,
+) -> Result<PreviewSourceKey, PipelineError> {
+    let extension = input_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or(PipelineError::InvalidRequest {
+            reason: "unsupported-source-format",
+        })?;
+    let variant = if matches!(extension.as_str(), "gif" | "apng" | "png") {
+        PreviewVariant::Native
+    } else if is_supported_video_extension(&extension) {
+        let source_width = source_width.ok_or(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        })?;
+        let source_height = source_height.ok_or(PipelineError::InvalidRequest {
+            reason: "invalid-frame-selection",
+        })?;
+        let limits = MediaLimits::default();
+        if source_width > limits.max_dimension || source_height > limits.max_dimension {
+            return Err(PipelineError::LimitExceeded {
+                resource: "image-dimensions",
+                limit: u64::from(limits.max_dimension),
+                actual: u64::from(source_width.max(source_height)),
+            });
+        }
+        let (width, height) = preview_output_dimensions(source_width, source_height)?;
+        PreviewVariant::Video { width, height }
+    } else {
+        return Err(PipelineError::InvalidRequest {
+            reason: "unsupported-frame-preview",
+        });
+    };
+    Ok(PreviewSourceKey {
+        identity: identity.clone(),
+        source_revision: source_revision.to_owned(),
+        variant,
+    })
+}
+
+fn finalize_preview_cache_publication(
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
+    expected_source: &SourceIdentity,
+) -> Result<(), PipelineError> {
+    if let Err(error) = ensure_source_unchanged(expected_source, MediaLimits::default()) {
+        cache.invalidate(key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn checkpoint_preview_cache_publication(
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
+    context: &OperationContext,
+    publication: Option<&PreviewCachePublication>,
+) -> Result<(), PipelineError> {
+    if let Err(error) = context.checkpoint() {
+        if let Some(publication) = publication {
+            cache.invalidate_publication(key, publication);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct LoadedCachedFramePreviews {
+    previews: Vec<CachedPreview>,
+    publication: Option<PreviewCachePublication>,
+}
+
+fn load_cached_frame_previews(
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
+    input_path: &Path,
+    requested_source_frame_ids: &[u32],
+    locale: UiLocale,
+    expected_source: &SourceIdentity,
+    context: &OperationContext,
+    progress: &mut impl FnMut(ProgressStage, u32, Option<u32>),
+) -> Result<LoadedCachedFramePreviews, PipelineError> {
+    context.checkpoint()?;
+    let requested = normalize_preview_source_frame_ids(requested_source_frame_ids)?;
+    let (previews, publication) = match &key.variant {
+        PreviewVariant::Native => {
+            let lookup = cache.get_or_try_build_complete(key, &requested, || {
+                build_native_preview_group(input_path, expected_source, context, progress)
+            })?;
+            (lookup.previews, lookup.publication)
+        }
+        PreviewVariant::Video { width, height } => {
+            let mut available = Vec::new();
+            let mut missing = Vec::new();
+            let mut publication = None;
+            for source_frame_id in requested.iter().copied() {
+                match cache.get_requested(key, &[source_frame_id]) {
+                    Some(mut cached) => available.append(&mut cached),
+                    None => missing.push(source_frame_id),
+                }
+            }
+            if !missing.is_empty() {
+                let extraction = ascending_video_preview_extraction(&missing)?;
+                let extracted = extract_video_preview_batch(
+                    input_path,
+                    &extraction,
+                    *width,
+                    *height,
+                    locale,
+                    expected_source,
+                    context,
+                    progress,
+                )?;
+                publication = cache.merge_partial(key.clone(), extracted.clone());
+                available.extend(extracted);
+            }
+            (
+                cached_previews_for_requested_ids(&requested, &available)?,
+                publication,
+            )
+        }
+    };
+    checkpoint_preview_cache_publication(cache, key, context, publication.as_ref())?;
+    finalize_preview_cache_publication(cache, key, expected_source)?;
+    Ok(LoadedCachedFramePreviews {
+        previews,
+        publication,
+    })
+}
+
+fn frame_preview_response_from_cached(
+    requested_source_frame_id: u32,
+    cached: &[CachedPreview],
+) -> Result<FramePreviewResponse, PipelineError> {
+    let mut items = cached_preview_items_for_requested_ids(&[requested_source_frame_id], cached)?;
+    let item = items.pop().ok_or(PipelineError::InvalidRequest {
+        reason: "invalid-frame-selection",
+    })?;
+    Ok(FramePreviewResponse {
+        ok: true,
+        data_url: Some(item.data_url),
+        width: Some(item.width),
+        height: Some(item.height),
+        reason_code: None,
+        error_code: None,
+        error_message: None,
+    })
 }
 
 fn extract_frame_preview_internal(
@@ -3103,21 +3520,43 @@ fn extract_frame_preview_internal(
 }
 
 fn extract_frame_preview_with_operation(
-    input_path: &str,
+    input_path: &Path,
     source_frame_id: u32,
     locale: UiLocale,
+    identity: &SourceIdentity,
+    key: &PreviewSourceKey,
+    cache: &PreviewCache,
     context: &OperationContext,
     progress: &impl ProgressSink,
 ) -> FramePreviewResponse {
-    extract_frame_preview_with_callbacks(
+    let mut publish = |stage, completed, total| {
+        publish_progress(progress, context, stage, completed, total);
+    };
+    publish(ProgressStage::Decoding, 0, Some(1));
+    let loaded = match load_cached_frame_previews(
+        cache,
+        key,
         input_path,
-        source_frame_id,
+        &[source_frame_id],
         locale,
-        || context.checkpoint(),
-        |stage, completed, total| {
-            publish_progress(progress, context, stage, completed, total);
-        },
-    )
+        identity,
+        context,
+        &mut publish,
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => return frame_preview_pipeline_error(&error, locale),
+    };
+    let response = match frame_preview_response_from_cached(source_frame_id, &loaded.previews) {
+        Ok(response) => response,
+        Err(error) => frame_preview_pipeline_error(&error, locale),
+    };
+    if let Err(error) =
+        checkpoint_preview_cache_publication(cache, key, context, loaded.publication.as_ref())
+    {
+        return frame_preview_pipeline_error(&error, locale);
+    }
+    publish(ProgressStage::Finalizing, 1, Some(1));
+    response
 }
 
 fn extract_frame_preview_with_callbacks(
@@ -3127,69 +3566,49 @@ fn extract_frame_preview_with_callbacks(
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> FramePreviewResponse {
-    let Some(extension) = lowercase_source_extension(input_path) else {
-        return frame_preview_pipeline_error(
-            &PipelineError::InvalidRequest {
-                reason: "unsupported-source-format",
-            },
-            locale,
-        );
-    };
-
-    if source_frame_id == 0 {
-        return frame_preview_pipeline_error(
-            &PipelineError::InvalidRequest {
-                reason: "invalid-frame-selection",
-            },
-            locale,
-        );
+    if let Err(error) = normalize_preview_source_frame_ids(&[source_frame_id]) {
+        return frame_preview_pipeline_error(&error, locale);
     }
-
-    if !matches!(extension.as_str(), "gif" | "apng" | "png") {
-        return frame_preview_pipeline_error(
-            &PipelineError::InvalidRequest {
-                reason: "unsupported-frame-preview",
-            },
-            locale,
-        );
-    }
-
-    progress(ProgressStage::Decoding, 0, Some(1));
-    let frame = match decode_native_animation_frame(
-        input_path,
-        source_frame_id,
-        MediaLimits::default(),
-        || checkpoint(),
-    ) {
-        Ok(frame) => frame,
+    let identity = match SourceIdentity::from_path(Path::new(input_path), MediaLimits::default()) {
+        Ok(identity) => identity,
         Err(error) => return frame_preview_pipeline_error(&error, locale),
     };
-
-    progress(ProgressStage::Encoding, 0, Some(1));
-    if let Err(error) = checkpoint() {
-        return frame_preview_pipeline_error(&error, locale);
-    }
-    let data_url = match encode_native_png_data_url(&frame.pixels) {
-        Ok(data_url) => data_url,
+    let revision = identity.revision();
+    let key = match preview_source_key(Path::new(input_path), &identity, &revision, None, None) {
+        Ok(key) => key,
         Err(error) => return frame_preview_pipeline_error(&error, locale),
     };
+    let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+    let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
     if let Err(error) = checkpoint() {
         return frame_preview_pipeline_error(&error, locale);
     }
-    progress(ProgressStage::Encoding, 1, Some(1));
-    progress(ProgressStage::Finalizing, 1, Some(1));
+    let loaded = load_cached_frame_previews(
+        &cache,
+        &key,
+        Path::new(input_path),
+        &[source_frame_id],
+        locale,
+        &identity,
+        &context,
+        &mut progress,
+    );
+    let (result, publication) = match loaded {
+        Ok(loaded) => (
+            frame_preview_response_from_cached(source_frame_id, &loaded.previews),
+            loaded.publication,
+        ),
+        Err(error) => (Err(error), None),
+    };
     if let Err(error) = checkpoint() {
+        if let Some(publication) = publication.as_ref() {
+            cache.invalidate_publication(&key, publication);
+        }
         return frame_preview_pipeline_error(&error, locale);
     }
-
-    FramePreviewResponse {
-        ok: true,
-        data_url: Some(data_url),
-        width: Some(frame.pixels.width()),
-        height: Some(frame.pixels.height()),
-        reason_code: None,
-        error_code: None,
-        error_message: None,
+    match result {
+        Ok(response) => response,
+        Err(error) => frame_preview_pipeline_error(&error, locale),
     }
 }
 
@@ -3230,21 +3649,54 @@ fn extract_frame_previews_internal(
 }
 
 fn extract_frame_previews_with_operation(
-    input_path: &str,
+    input_path: &Path,
     source_frame_ids: &[u32],
     locale: UiLocale,
+    identity: &SourceIdentity,
+    key: &PreviewSourceKey,
+    cache: &PreviewCache,
     context: &OperationContext,
     progress: &impl ProgressSink,
 ) -> FramePreviewsResponse {
-    extract_frame_previews_with_callbacks(
+    let mut publish = |stage, completed, total| {
+        publish_progress(progress, context, stage, completed, total);
+    };
+    let requested = match normalize_preview_source_frame_ids(source_frame_ids) {
+        Ok(requested) => requested,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
+    };
+    let total = u32::try_from(requested.len()).unwrap_or(u32::MAX);
+    publish(ProgressStage::Decoding, 0, Some(total));
+    let loaded = match load_cached_frame_previews(
+        cache,
+        key,
         input_path,
-        source_frame_ids,
+        &requested,
         locale,
-        || context.checkpoint(),
-        |stage, completed, total| {
-            publish_progress(progress, context, stage, completed, total);
+        identity,
+        context,
+        &mut publish,
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
+    };
+    let response = match cached_preview_items_for_requested_ids(&requested, &loaded.previews) {
+        Ok(previews) => FramePreviewsResponse {
+            ok: true,
+            previews,
+            reason_code: None,
+            error_code: None,
+            error_message: None,
         },
-    )
+        Err(error) => frame_previews_pipeline_error(&error, locale),
+    };
+    if let Err(error) =
+        checkpoint_preview_cache_publication(cache, key, context, loaded.publication.as_ref())
+    {
+        return frame_previews_pipeline_error(&error, locale);
+    }
+    publish(ProgressStage::Finalizing, total, Some(total));
+    response
 }
 
 fn extract_frame_previews_with_callbacks(
@@ -3254,108 +3706,56 @@ fn extract_frame_previews_with_callbacks(
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> FramePreviewsResponse {
-    if source_frame_ids.len() > MAX_MEDIA_FRAME_COUNT {
-        return frame_previews_pipeline_error(
-            &PipelineError::LimitExceeded {
-                resource: "frame-count",
-                limit: MAX_MEDIA_FRAME_COUNT as u64,
-                actual: u64::try_from(source_frame_ids.len()).unwrap_or(u64::MAX),
-            },
-            locale,
-        );
-    }
-    if source_frame_ids
-        .iter()
-        .any(|source_frame_id| *source_frame_id == 0)
-    {
-        return frame_previews_pipeline_error(
-            &PipelineError::InvalidRequest {
-                reason: "invalid-frame-selection",
-            },
-            locale,
-        );
-    }
-
-    let Some(extension) = lowercase_source_extension(input_path) else {
-        return frame_previews_pipeline_error(
-            &PipelineError::InvalidRequest {
-                reason: "unsupported-source-format",
-            },
-            locale,
-        );
+    let requested = match normalize_preview_source_frame_ids(source_frame_ids) {
+        Ok(requested) => requested,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
     };
-
-    if !matches!(extension.as_str(), "gif" | "apng" | "png") {
-        return frame_previews_pipeline_error(
-            &PipelineError::InvalidRequest {
-                reason: "unsupported-frame-preview",
-            },
-            locale,
-        );
-    }
-
-    let requested_frame_ids = source_frame_ids.iter().copied().collect::<BTreeSet<_>>();
-    if requested_frame_ids.is_empty() {
-        return frame_previews_pipeline_error(
-            &PipelineError::InvalidRequest {
-                reason: "invalid-frame-selection",
-            },
-            locale,
-        );
-    }
-
-    let total = u32::try_from(requested_frame_ids.len()).unwrap_or(u32::MAX);
-    progress(ProgressStage::Decoding, 0, Some(total));
-    let frames =
-        match decode_native_animation_frames(input_path, MediaLimits::default(), || checkpoint()) {
-            Ok(frames) => frames,
-            Err(error) => return frame_previews_pipeline_error(&error, locale),
-        };
-
-    progress(ProgressStage::Encoding, 0, Some(total));
-    let mut previews = Vec::with_capacity(requested_frame_ids.len());
-    for source_frame_id in requested_frame_ids {
-        if let Err(error) = checkpoint() {
-            return frame_previews_pipeline_error(&error, locale);
-        }
-        let Some(frame) = frames.get((source_frame_id - 1) as usize) else {
-            return frame_previews_pipeline_error(
-                &PipelineError::InvalidRequest {
-                    reason: "invalid-frame-selection",
-                },
-                locale,
-            );
-        };
-
-        let data_url = match encode_native_png_data_url(&frame.pixels) {
-            Ok(data_url) => data_url,
-            Err(error) => return frame_previews_pipeline_error(&error, locale),
-        };
-
-        previews.push(FramePreviewItem {
-            source_frame_id,
-            data_url,
-            width: frame.pixels.width(),
-            height: frame.pixels.height(),
-        });
-        progress(
-            ProgressStage::Encoding,
-            u32::try_from(previews.len()).unwrap_or(u32::MAX),
-            Some(total),
-        );
-    }
-
-    progress(ProgressStage::Finalizing, total, Some(total));
+    let identity = match SourceIdentity::from_path(Path::new(input_path), MediaLimits::default()) {
+        Ok(identity) => identity,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
+    };
+    let revision = identity.revision();
+    let key = match preview_source_key(Path::new(input_path), &identity, &revision, None, None) {
+        Ok(key) => key,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
+    };
+    let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+    let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
     if let Err(error) = checkpoint() {
         return frame_previews_pipeline_error(&error, locale);
     }
-
-    FramePreviewsResponse {
-        ok: true,
-        previews,
-        reason_code: None,
-        error_code: None,
-        error_message: None,
+    let loaded = load_cached_frame_previews(
+        &cache,
+        &key,
+        Path::new(input_path),
+        &requested,
+        locale,
+        &identity,
+        &context,
+        &mut progress,
+    );
+    let (result, publication) = match loaded {
+        Ok(loaded) => (
+            cached_preview_items_for_requested_ids(&requested, &loaded.previews),
+            loaded.publication,
+        ),
+        Err(error) => (Err(error), None),
+    };
+    if let Err(error) = checkpoint() {
+        if let Some(publication) = publication.as_ref() {
+            cache.invalidate_publication(&key, publication);
+        }
+        return frame_previews_pipeline_error(&error, locale);
+    }
+    match result {
+        Ok(previews) => FramePreviewsResponse {
+            ok: true,
+            previews,
+            reason_code: None,
+            error_code: None,
+            error_message: None,
+        },
+        Err(error) => frame_previews_pipeline_error(&error, locale),
     }
 }
 
@@ -10433,8 +10833,14 @@ mod tests {
 
         let preview = extract_frame_preview_internal(&input_path, 1, UiLocale::En);
         assert!(preview.ok, "sample GIF frame preview should succeed");
-        assert_eq!(preview.width, inspection.width);
-        assert_eq!(preview.height, inspection.height);
+        let expected_dimensions = preview_output_dimensions(
+            inspection.width.expect("sample width"),
+            inspection.height.expect("sample height"),
+        )
+        .expect("sample preview dimensions must be bounded");
+        assert_eq!(preview.width, Some(expected_dimensions.0));
+        assert_eq!(preview.height, Some(expected_dimensions.1));
+        assert!(expected_dimensions.0 <= 128 && expected_dimensions.1 <= 128);
         assert!(
             preview
                 .data_url
@@ -12099,6 +12505,281 @@ mod tests {
             "two-stage resize MAE was {mean_absolute_channel_error}"
         );
     }
+
+    #[test]
+    fn preview_ids_are_stably_deduplicated_and_bounded_to_twenty_four() {
+        assert_eq!(
+            normalize_preview_source_frame_ids(&[50, 1, 20, 1]),
+            Ok(vec![50, 1, 20])
+        );
+        assert_eq!(
+            normalize_preview_source_frame_ids(&(1..=24).collect::<Vec<_>>()),
+            Ok((1..=24).collect::<Vec<_>>())
+        );
+        assert!(normalize_preview_source_frame_ids(&(1..=25).collect::<Vec<_>>()).is_err());
+        assert!(normalize_preview_source_frame_ids(&[1, 0, 2]).is_err());
+        assert!(normalize_preview_source_frame_ids(&[]).is_err());
+    }
+
+    #[test]
+    fn preview_dimensions_cap_landscape_and_portrait_without_upscaling() {
+        assert_eq!(preview_output_dimensions(640, 320), Ok((128, 64)));
+        assert_eq!(preview_output_dimensions(320, 640), Ok((64, 128)));
+        assert_eq!(preview_output_dimensions(64, 32), Ok((64, 32)));
+        assert!(preview_output_dimensions(0, 320).is_err());
+        assert!(preview_output_dimensions(320, 0).is_err());
+
+        let identity = SourceIdentity {
+            canonical_path: PathBuf::from("C:/preview/bounded.mp4"),
+            file_len: 1,
+            modified_nanos: 1,
+        };
+        assert!(matches!(
+            preview_source_key(
+                &identity.canonical_path,
+                &identity,
+                "source-bounded",
+                Some(MediaLimits::default().max_dimension + 1),
+                Some(1),
+            ),
+            Err(PipelineError::LimitExceeded {
+                resource: "image-dimensions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn video_extraction_uses_ascending_decode_order_but_retains_response_order() {
+        let requested = normalize_preview_source_frame_ids(&[50, 1, 20, 1])
+            .expect("fixture IDs must normalize");
+        let extraction = ascending_video_preview_extraction(&requested)
+            .expect("video extraction plan must be created");
+
+        assert_eq!(requested, vec![50, 1, 20]);
+        assert_eq!(extraction, vec![(0, 1), (19, 20), (49, 50)]);
+    }
+
+    #[test]
+    fn cancelled_cache_hit_checkpoint_retains_the_resident_cache_key() {
+        let identity = SourceIdentity {
+            canonical_path: PathBuf::from("C:/preview/cancelled.gif"),
+            file_len: 1,
+            modified_nanos: 1,
+        };
+        let key = PreviewSourceKey {
+            identity,
+            source_revision: "source-cancelled".into(),
+            variant: PreviewVariant::Native,
+        };
+        let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+        assert!(cache.publish_complete(
+            key.clone(),
+            vec![CachedPreview {
+                source_frame_id: 1,
+                png_bytes: Arc::from([1_u8, 2, 3].as_slice()),
+                width: 1,
+                height: 1,
+            }],
+        ));
+        let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
+        context.cancel();
+
+        assert!(matches!(
+            checkpoint_preview_cache_publication(&cache, &key, &context, None),
+            Err(PipelineError::Cancelled)
+        ));
+        assert!(cache.contains_key(&key));
+    }
+
+    #[test]
+    fn cancelled_new_publication_checkpoint_invalidates_the_cache_key() {
+        let identity = SourceIdentity {
+            canonical_path: PathBuf::from("C:/preview/cancelled.gif"),
+            file_len: 1,
+            modified_nanos: 1,
+        };
+        let key = PreviewSourceKey {
+            identity,
+            source_revision: "source-cancelled".into(),
+            variant: PreviewVariant::Native,
+        };
+        let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+        let publication = cache
+            .get_or_try_build_complete(&key, &[1], || {
+                Ok::<_, PipelineError>(vec![CachedPreview {
+                    source_frame_id: 1,
+                    png_bytes: Arc::from([1_u8, 2, 3].as_slice()),
+                    width: 1,
+                    height: 1,
+                }])
+            })
+            .expect("new complete group must be published")
+            .publication
+            .expect("successful resident publication must return a receipt");
+        let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
+        context.cancel();
+
+        assert!(matches!(
+            checkpoint_preview_cache_publication(&cache, &key, &context, Some(&publication)),
+            Err(PipelineError::Cancelled)
+        ));
+        assert!(!cache.contains_key(&key));
+    }
+
+    #[test]
+    fn changed_source_finalization_invalidates_the_published_cache_key() {
+        let test_dir = TestDir::new("preview-cache-source-change");
+        let source_path = test_dir.path.join("input.gif");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let key = PreviewSourceKey {
+            identity: identity.clone(),
+            source_revision: identity.revision(),
+            variant: PreviewVariant::Native,
+        };
+        let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+        assert!(cache.publish_complete(
+            key.clone(),
+            vec![CachedPreview {
+                source_frame_id: 1,
+                png_bytes: Arc::from([1_u8, 2, 3].as_slice()),
+                width: 1,
+                height: 1,
+            }],
+        ));
+
+        fs::write(&source_path, b"source changed to a different length")
+            .expect("source fixture must be changed");
+        let changed_len = fs::metadata(&source_path)
+            .expect("changed source metadata must be readable")
+            .len();
+        assert_ne!(changed_len, identity.file_len);
+
+        let error = finalize_preview_cache_publication(&cache, &key, &identity)
+            .expect_err("changed source must reject preview-cache publication");
+
+        assert_eq!(error, PipelineError::SourceChanged);
+        assert!(!cache.contains_key(&key));
+    }
+
+    #[test]
+    fn video_preview_filter_selects_then_scales_to_fixed_rgba_square_pixels() {
+        let extraction = vec![(0, 1), (19, 20), (49, 50)];
+        let filter = build_video_preview_filter(&extraction, 128, 64);
+
+        assert_eq!(
+            filter,
+            "select='eq(n,0)+eq(n,19)+eq(n,49)',scale=128:64:flags=lanczos,format=rgba,setsar=1"
+        );
+    }
+
+    #[test]
+    fn requested_only_response_reconstructs_stable_order_and_base64_at_the_edge() {
+        use crate::preview_cache::CachedPreview;
+
+        let cached = vec![
+            CachedPreview {
+                source_frame_id: 1,
+                png_bytes: Arc::from([1_u8, 2, 3].as_slice()),
+                width: 128,
+                height: 64,
+            },
+            CachedPreview {
+                source_frame_id: 20,
+                png_bytes: Arc::from([4_u8, 5, 6].as_slice()),
+                width: 128,
+                height: 64,
+            },
+            CachedPreview {
+                source_frame_id: 50,
+                png_bytes: Arc::from([7_u8, 8, 9].as_slice()),
+                width: 128,
+                height: 64,
+            },
+            CachedPreview {
+                source_frame_id: 99,
+                png_bytes: Arc::from([10_u8].as_slice()),
+                width: 128,
+                height: 64,
+            },
+        ];
+
+        let response = cached_preview_items_for_requested_ids(&[50, 1, 20], &cached)
+            .expect("requested cached previews must map to IPC items");
+
+        assert_eq!(
+            response
+                .iter()
+                .map(|item| item.source_frame_id)
+                .collect::<Vec<_>>(),
+            vec![50, 1, 20]
+        );
+        assert!(response
+            .iter()
+            .all(|item| item.data_url.starts_with("data:image/png;base64,")));
+        assert!(!response.iter().any(|item| item.source_frame_id == 99));
+    }
+
+    #[test]
+    fn preview_video_stream_requires_the_exact_selected_frame_count() {
+        assert_eq!(validate_exact_selected_frame_stream(3, 3), Ok(()));
+        assert!(matches!(
+            validate_exact_selected_frame_stream(3, 2),
+            Err(PipelineError::MalformedProcessOutput { .. })
+        ));
+        assert!(matches!(
+            validate_exact_selected_frame_stream(3, 4),
+            Err(PipelineError::MalformedProcessOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn preview_backend_source_contract_is_streaming_shared_and_source_atomic() {
+        let source = include_str!("lib.rs");
+        let native = source_section(
+            source,
+            "fn build_native_preview_group(",
+            "fn build_video_preview_filter(",
+        );
+        assert_eq!(native.matches("visit_native_animation_frames(").count(), 1);
+        assert!(!native.contains("decode_native_animation_frames("));
+        assert!(!native.contains("Vec<StickerFrame>"));
+
+        let video = source_section(
+            source,
+            "fn extract_video_preview_batch(",
+            "fn cached_preview_items_for_requested_ids(",
+        );
+        assert_eq!(video.matches("stream_fixed_rgba_frames(").count(), 1);
+        assert!(video.contains("validate_exact_selected_frame_stream("));
+        assert!(video.contains("\"-map\""));
+        assert!(video.contains("\"0:v:0\""));
+        assert!(video.contains("\"-fps_mode\""));
+        assert!(video.contains("\"passthrough\""));
+
+        let single = source_section(
+            source,
+            "fn extract_frame_preview_with_operation(",
+            "fn extract_frame_preview_with_callbacks(",
+        );
+        let batch = source_section(
+            source,
+            "fn extract_frame_previews_with_operation(",
+            "fn extract_frame_previews_with_callbacks(",
+        );
+        assert!(single.contains("load_cached_frame_previews("));
+        assert!(batch.contains("load_cached_frame_previews("));
+
+        let finalization = source_section(
+            source,
+            "fn finalize_preview_cache_publication(",
+            "fn malformed_png(",
+        );
+        assert!(finalization.contains("ensure_source_unchanged("));
+        assert!(finalization.contains("invalidate("));
+    }
 }
 
 #[tauri::command]
@@ -12158,6 +12839,8 @@ async fn extract_frame_preview(
     input_path: String,
     source_revision: Option<String>,
     source_frame_id: u32,
+    source_width: Option<u32>,
+    source_height: Option<u32>,
     locale: Option<String>,
     operation_id: String,
     on_progress: Channel<OperationProgress>,
@@ -12165,6 +12848,7 @@ async fn extract_frame_preview(
 ) -> FramePreviewResponse {
     let locale = parse_ui_locale(locale.as_deref());
     let state = pipeline_state.inner().clone();
+    let preview_cache = state.preview_cache();
     let progress = ChannelProgressSink::new(on_progress);
     let registered = match state.register(&operation_id, MediaOperationKind::Preview.timeout()) {
         Ok(registered) => registered,
@@ -12186,15 +12870,31 @@ async fn extract_frame_preview(
             Ok(identity) => identity,
             Err(error) => return frame_preview_pipeline_error(&error, locale),
         };
-        let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
+        let validated_revision = identity.revision();
+        let key = match preview_source_key(
+            &identity.canonical_path,
+            &identity,
+            &validated_revision,
+            source_width,
+            source_height,
+        ) {
+            Ok(key) => key,
+            Err(error) => return frame_preview_pipeline_error(&error, locale),
+        };
         let response = extract_frame_preview_with_operation(
-            &canonical_path,
+            &identity.canonical_path,
             source_frame_id,
             locale,
+            &identity,
+            &key,
+            &preview_cache,
             &context,
             &progress,
         );
-        finalize_frame_preview_source(&identity, response, locale)
+        match finalize_preview_cache_publication(&preview_cache, &key, &identity) {
+            Ok(()) => response,
+            Err(error) => frame_preview_pipeline_error(&error, locale),
+        }
     })
     .await
     {
@@ -12214,6 +12914,8 @@ async fn extract_frame_previews(
     input_path: String,
     source_revision: Option<String>,
     source_frame_ids: BoundedFrameIds,
+    source_width: Option<u32>,
+    source_height: Option<u32>,
     locale: Option<String>,
     operation_id: String,
     on_progress: Channel<OperationProgress>,
@@ -12222,6 +12924,7 @@ async fn extract_frame_previews(
     let locale = parse_ui_locale(locale.as_deref());
     let source_frame_ids = source_frame_ids.0;
     let state = pipeline_state.inner().clone();
+    let preview_cache = state.preview_cache();
     let progress = ChannelProgressSink::new(on_progress);
     let registered = match state.register(&operation_id, MediaOperationKind::Preview.timeout()) {
         Ok(registered) => registered,
@@ -12243,15 +12946,31 @@ async fn extract_frame_previews(
             Ok(identity) => identity,
             Err(error) => return frame_previews_pipeline_error(&error, locale),
         };
-        let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
+        let validated_revision = identity.revision();
+        let key = match preview_source_key(
+            &identity.canonical_path,
+            &identity,
+            &validated_revision,
+            source_width,
+            source_height,
+        ) {
+            Ok(key) => key,
+            Err(error) => return frame_previews_pipeline_error(&error, locale),
+        };
         let response = extract_frame_previews_with_operation(
-            &canonical_path,
+            &identity.canonical_path,
             &source_frame_ids,
             locale,
+            &identity,
+            &key,
+            &preview_cache,
             &context,
             &progress,
         );
-        finalize_frame_previews_source(&identity, response, locale)
+        match finalize_preview_cache_publication(&preview_cache, &key, &identity) {
+            Ok(()) => response,
+            Err(error) => frame_previews_pipeline_error(&error, locale),
+        }
     })
     .await
     {

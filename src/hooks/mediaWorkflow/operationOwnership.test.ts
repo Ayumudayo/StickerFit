@@ -245,7 +245,7 @@ describe("media operation AbortController ownership", () => {
     );
     expectCentralCommand(preview, "extract_frame_preview");
     expect(preview).toMatch(
-      /"extract_frame_preview",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameId: request\.sourceFrameId,\s*locale: request\.locale,\s*\},\s*options,/,
+      /"extract_frame_preview",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameId: request\.sourceFrameId,\s*sourceWidth: request\.sourceWidth,\s*sourceHeight: request\.sourceHeight,\s*locale: request\.locale,\s*\},\s*options,/,
     );
 
     const previews = sourceBlock(
@@ -255,7 +255,7 @@ describe("media operation AbortController ownership", () => {
     );
     expectCentralCommand(previews, "extract_frame_previews");
     expect(previews).toMatch(
-      /"extract_frame_previews",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameIds: request\.sourceFrameIds,\s*locale: request\.locale,\s*\},\s*options,/,
+      /"extract_frame_previews",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameIds: request\.sourceFrameIds,\s*sourceWidth: request\.sourceWidth,\s*sourceHeight: request\.sourceHeight,\s*locale: request\.locale,\s*\},\s*options,/,
     );
 
     const folder = sourceBlock(

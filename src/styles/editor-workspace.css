@@ -152,6 +152,11 @@
   align-items: center;
 }
 
+.frameTable.with-preview,
+.frameRow.with-preview {
+  grid-template-columns: 42px minmax(52px, 0.8fr) minmax(64px, 1fr);
+}
+
 .frameTableHeader {
   color: #71717a;
   font-size: 0.78rem;
@@ -160,21 +165,34 @@
 }
 
 .frameTableBody {
-  --frame-row-intrinsic-size: 42px;
-  display: grid;
-  gap: 2px;
+  --frame-row-height: 48px;
+  display: block;
   max-height: min(58vh, 640px);
   overflow-y: auto;
   padding-right: 4px;
+  position: relative;
 }
 
-.frameTableBody.is-large .frameRow {
-  content-visibility: auto;
-  contain-intrinsic-size: var(--frame-row-intrinsic-size);
+.frameVirtualSpacer {
+  position: relative;
+  width: 100%;
+}
+
+.frameVirtualRows {
+  position: absolute;
+  inset: 0 0 auto;
+  width: 100%;
+  will-change: transform;
+}
+
+.frameVirtualItem {
+  position: relative;
+  width: 100%;
 }
 
 .frameRow {
   width: 100%;
+  height: 100%;
   border: 1px solid transparent;
   border-radius: 8px;
   padding: 6px 10px;
@@ -188,6 +206,72 @@
     border-color 120ms ease,
     background 120ms ease,
     opacity 120ms ease;
+}
+
+.framePreviewCell {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #a1a1aa;
+}
+
+.framePreviewCell img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.framePreviewStatus {
+  max-width: 32px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.58rem;
+  line-height: 1.1;
+}
+
+.framePreviewPlaceholder {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.framePreviewCell.is-error {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.frameVirtualItem.has-preview-error .frameRow {
+  padding-right: 70px;
+}
+
+.framePreviewRetry {
+  position: absolute;
+  z-index: 4;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 62px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: rgba(127, 29, 29, 0.45);
+  color: #fecaca;
+  font-size: 0.68rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.framePreviewRetry:hover,
+.framePreviewRetry:focus-visible {
+  background: rgba(153, 27, 27, 0.7);
+  outline: none;
 }
 
 .frameRow::before,
@@ -238,14 +322,29 @@
 }
 
 .frameRow.is-dragged {
-  will-change: transform;
-  opacity: 0.96;
+  opacity: 0.24;
   cursor: grabbing;
-  z-index: 3;
   pointer-events: none;
-  transform: translateY(var(--frame-row-drag-y, 0px)) scale(1.02);
-  box-shadow: 0 18px 32px rgba(15, 23, 42, 0.42);
   transition: none;
+}
+
+.frameDragOverlay {
+  position: absolute;
+  z-index: 6;
+  left: 4px;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(129, 140, 248, 0.72);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: rgba(30, 41, 59, 0.96);
+  color: #e0e7ff;
+  box-shadow: 0 18px 32px rgba(15, 23, 42, 0.42);
+  font-size: 0.78rem;
+  pointer-events: none;
 }
 
 .frameRow.is-drop-above {
@@ -551,17 +650,20 @@
   }
 
   .frameTableBody {
-    --frame-row-intrinsic-size: 68px;
-    gap: 8px;
+    --frame-row-height: 48px;
     padding-right: 0;
   }
 
   .frameRow {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px 14px;
-    padding: 10px 12px;
-    border-radius: 12px;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 8px;
     background: rgba(255, 255, 255, 0.02);
+  }
+
+  .frameRow.with-preview {
+    grid-template-columns: 42px minmax(52px, 0.8fr) minmax(64px, 1fr);
   }
 
   .frameIdCell,

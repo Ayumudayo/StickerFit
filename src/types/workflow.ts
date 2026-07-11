@@ -113,6 +113,8 @@ export type FramePreviewRequest = {
   inputPath: string;
   sourceRevision: string;
   sourceFrameId: number;
+  sourceWidth?: number | null;
+  sourceHeight?: number | null;
   locale: Locale;
 };
 
@@ -127,6 +129,8 @@ export type FramePreviewsRequest = {
   inputPath: string;
   sourceRevision: string;
   sourceFrameIds: number[];
+  sourceWidth?: number | null;
+  sourceHeight?: number | null;
   locale: Locale;
 };
 
@@ -141,6 +145,17 @@ export type FramePreviewsResult = {
   ok: boolean;
   previews: FramePreviewItem[];
 } & MediaOperationErrorFields;
+
+export type FramePreviewLoadState =
+  | { status: "idle" }
+  | { status: "loading"; batchToken: string }
+  | { status: "ready"; dataUrl: string; width: number; height: number }
+  | {
+      status: "error";
+      errorCode?: MediaOperationErrorCode;
+      reasonCode?: MediaOperationReasonCode;
+      message: string;
+    };
 
 export type ToolCheck = {
   tool: string;
