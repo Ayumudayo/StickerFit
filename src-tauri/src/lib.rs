@@ -1,6 +1,7 @@
 mod locale;
 mod media_error;
 mod media_limits;
+mod output_file;
 
 use base64::{engine::general_purpose, Engine as _};
 use image::codecs::gif::GifDecoder as ImageGifDecoder;
@@ -23,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
@@ -33,7 +34,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
@@ -52,6 +53,7 @@ use crate::media_error::PipelineError;
 use crate::media_limits::{
     checked_rgba_bytes, image_decode_limits, validate_file_metadata, MediaLimits, SourceIdentity,
 };
+use crate::output_file::PendingOutput;
 
 const CANONICAL_FIT_MODE: &str = "contain";
 const MAX_MEDIA_FRAME_COUNT: usize = 300;
@@ -473,7 +475,7 @@ struct ToolRunError {
 }
 
 struct EncodeResult {
-    output_path: PathBuf,
+    pending_output: PendingOutput,
     size_bytes: u64,
     elapsed_ms: u64,
     tool_source: String,
@@ -488,6 +490,16 @@ struct SelectedEncodeOutput {
     duration_seconds: f64,
     size_bytes: u64,
     source_similarity_score: f64,
+}
+
+struct PendingSelectedEncodeOutput {
+    selected: SelectedEncodeOutput,
+    pending_output: PendingOutput,
+}
+
+#[derive(Debug)]
+struct PublishedSelectedEncodeOutput {
+    selected: SelectedEncodeOutput,
     output_path: String,
 }
 
@@ -751,15 +763,6 @@ fn remaining_candidate_cannot_beat_within_limit(
         .unwrap_or(false)
 }
 
-fn clear_attempt_output_path(attempts: &mut [SearchAttemptResult], candidate_id: &str) {
-    if let Some(attempt) = attempts
-        .iter_mut()
-        .find(|attempt| attempt.candidate_id == candidate_id)
-    {
-        attempt.output_path = None;
-    }
-}
-
 #[cfg(test)]
 fn apng_compression_level_for_preset(preset: &str) -> &'static str {
     match preset {
@@ -929,35 +932,6 @@ fn select_ranked_candidate_subset(
     }
 
     selected
-}
-
-fn sanitize_path_fragment(value: &str, fallback: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    if sanitized.is_empty() {
-        fallback.into()
-    } else {
-        sanitized
-    }
-}
-
-fn sanitized_source_stem(input_path: &str) -> String {
-    let source_stem = Path::new(input_path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.trim().is_empty())
-        .unwrap_or("image");
-
-    sanitize_path_fragment(source_stem, "image")
 }
 
 fn source_output_directory(input_path: &str, locale: UiLocale) -> Result<PathBuf, String> {
@@ -2440,10 +2414,7 @@ fn decode_native_animation_frame(
     }
 }
 
-fn write_native_png(output_path: &Path, pixels: &RgbaImage) -> Result<(), PipelineError> {
-    let file =
-        File::create(output_path).map_err(|error| pipeline_io_error("create PNG output", error))?;
-    let writer = BufWriter::new(file);
+fn write_native_png<W: Write>(writer: W, pixels: &RgbaImage) -> Result<(), PipelineError> {
     let mut encoder = NativePngEncoder::new(writer, pixels.width(), pixels.height());
     encoder.set_color(PngColorType::Rgba);
     encoder.set_depth(PngBitDepth::Eight);
@@ -2729,8 +2700,66 @@ fn pipeline_io_error(operation: &'static str, error: impl std::fmt::Display) -> 
     }
 }
 
-fn write_native_apng(
-    output_path: &Path,
+fn pending_output_size(output: &mut PendingOutput) -> Result<u64, PipelineError> {
+    output
+        .writer()
+        .flush()
+        .map_err(|error| pipeline_io_error("flush temporary output", error))?;
+    output
+        .writer()
+        .metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|error| pipeline_io_error("read temporary output metadata", error))
+}
+
+fn commit_output_after_source_validation(
+    output: PendingOutput,
+    expected_source: Option<&SourceIdentity>,
+) -> Result<PathBuf, PipelineError> {
+    if let Some(expected_source) = expected_source {
+        ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    }
+    output.commit()
+}
+
+fn publish_optimizer_selection(
+    expected_source: &SourceIdentity,
+    best_within_limit: Option<PendingSelectedEncodeOutput>,
+    smallest_oversize: Option<PendingSelectedEncodeOutput>,
+    attempts: &mut [SearchAttemptResult],
+) -> Result<Option<PublishedSelectedEncodeOutput>, PipelineError> {
+    let selected = match best_within_limit {
+        Some(best) => {
+            drop(smallest_oversize);
+            best
+        }
+        None => match smallest_oversize {
+            Some(oversize) => oversize,
+            None => return Ok(None),
+        },
+    };
+    let PendingSelectedEncodeOutput {
+        selected,
+        pending_output,
+    } = selected;
+    let output_path = commit_output_after_source_validation(pending_output, Some(expected_source))?
+        .to_string_lossy()
+        .into_owned();
+    if let Some(attempt) = attempts
+        .iter_mut()
+        .find(|attempt| attempt.candidate_id == selected.candidate_id)
+    {
+        attempt.output_path = Some(output_path.clone());
+    }
+
+    Ok(Some(PublishedSelectedEncodeOutput {
+        selected,
+        output_path,
+    }))
+}
+
+fn write_native_apng<W: Write>(
+    writer: W,
     frames: &[StickerFrame],
     preset: &str,
 ) -> Result<(), PipelineError> {
@@ -2758,9 +2787,6 @@ fn write_native_apng(
     let frame_delays = quantize_apng_delays(&durations_us)
         .map_err(|reason| PipelineError::InvalidRequest { reason })?;
 
-    let file = File::create(output_path)
-        .map_err(|error| pipeline_io_error("create APNG output", error))?;
-    let writer = BufWriter::new(file);
     let mut encoder = NativePngEncoder::new(writer, width, height);
     encoder.set_color(PngColorType::Rgba);
     encoder.set_depth(PngBitDepth::Eight);
@@ -3436,25 +3462,6 @@ fn prepare_optimizer_plan(
     }
 }
 
-fn make_output_path(
-    output_directory: &Path,
-    input_path: &str,
-    suffix: &str,
-    extension: &str,
-) -> PathBuf {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    output_directory.join(format!(
-        "{}-{}-{}.{}",
-        sanitized_source_stem(input_path),
-        suffix,
-        timestamp,
-        extension
-    ))
-}
-
 fn encode_candidate_from_native_animation_internal(
     input_path: &str,
     output_directory: Option<&str>,
@@ -3472,7 +3479,6 @@ fn encode_candidate_from_native_animation_internal(
                 reason: "invalid-output-directory",
             }
         })?;
-    let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
     let source_frames =
         decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))?;
     let first_frame = source_frames
@@ -3508,13 +3514,18 @@ fn encode_candidate_from_native_animation_internal(
         ensure_source_unchanged(expected_source, MediaLimits::default())?;
     }
     let started = Instant::now();
-    write_native_apng(&output_path, &frames, &candidate.preset)?;
-    let metadata = fs::metadata(&output_path)
-        .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
+    let mut pending_output = PendingOutput::new(
+        &output_directory,
+        Path::new(input_path),
+        &candidate.id,
+        "png",
+    )?;
+    write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+    let size_bytes = pending_output_size(&mut pending_output)?;
 
     Ok(EncodeResult {
-        output_path,
-        size_bytes: metadata.len(),
+        pending_output,
+        size_bytes,
         elapsed_ms: started.elapsed().as_millis() as u64,
         tool_source: "native".into(),
         tool_command: None,
@@ -3539,7 +3550,6 @@ fn encode_candidate_from_video_timeline_internal(
                 reason: "invalid-output-directory",
             }
         })?;
-    let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
     let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)
         .map_err(|_| PipelineError::InvalidRequest {
             reason: "invalid-crop",
@@ -3590,13 +3600,18 @@ fn encode_candidate_from_video_timeline_internal(
         ensure_source_unchanged(expected_source, MediaLimits::default())?;
     }
     let started = Instant::now();
-    write_native_apng(&output_path, &frames, &candidate.preset)?;
-    let metadata = fs::metadata(&output_path)
-        .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
+    let mut pending_output = PendingOutput::new(
+        &output_directory,
+        Path::new(input_path),
+        &candidate.id,
+        "png",
+    )?;
+    write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+    let size_bytes = pending_output_size(&mut pending_output)?;
 
     Ok(EncodeResult {
-        output_path,
-        size_bytes: metadata.len(),
+        pending_output,
+        size_bytes,
         elapsed_ms: started.elapsed().as_millis() as u64,
         tool_source: resolution.source.into(),
         tool_command: Some(resolution.command_display),
@@ -3621,7 +3636,6 @@ fn encode_candidate_with_ffmpeg_frames_internal(
                 reason: "invalid-output-directory",
             }
         })?;
-    let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
     let resolved_crop_region = resolve_crop_region(crop_region, input_width, input_height, locale)
         .map_err(|_| PipelineError::InvalidRequest {
             reason: "invalid-crop",
@@ -3658,13 +3672,18 @@ fn encode_candidate_with_ffmpeg_frames_internal(
         ensure_source_unchanged(expected_source, MediaLimits::default())?;
     }
     let started = Instant::now();
-    write_native_apng(&output_path, &frames, &candidate.preset)?;
-    let metadata = fs::metadata(&output_path)
-        .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
+    let mut pending_output = PendingOutput::new(
+        &output_directory,
+        Path::new(input_path),
+        &candidate.id,
+        "png",
+    )?;
+    write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+    let size_bytes = pending_output_size(&mut pending_output)?;
 
     Ok(EncodeResult {
-        output_path,
-        size_bytes: metadata.len(),
+        pending_output,
+        size_bytes,
         elapsed_ms: started.elapsed().as_millis() as u64,
         tool_source: resolution.source.into(),
         tool_command: Some(resolution.command_display),
@@ -3718,7 +3737,6 @@ fn encode_candidate_internal(
             .map_err(|_| PipelineError::InvalidRequest {
                 reason: "invalid-output-directory",
             })?;
-        let output_path = make_output_path(&output_directory, input_path, &candidate.id, "png");
         let source_frames =
             decode_native_animation_frames(input_path, MediaLimits::default(), || Ok(()))?;
         let first_frame = source_frames
@@ -3755,13 +3773,18 @@ fn encode_candidate_internal(
             ensure_source_unchanged(expected_source, MediaLimits::default())?;
         }
         let started = Instant::now();
-        write_native_apng(&output_path, &frames, &candidate.preset)?;
-        let metadata = fs::metadata(&output_path)
-            .map_err(|error| pipeline_io_error("read APNG output metadata", error))?;
+        let mut pending_output = PendingOutput::new(
+            &output_directory,
+            Path::new(input_path),
+            &candidate.id,
+            "png",
+        )?;
+        write_native_apng(pending_output.writer(), &frames, &candidate.preset)?;
+        let size_bytes = pending_output_size(&mut pending_output)?;
 
         return Ok(EncodeResult {
-            output_path,
-            size_bytes: metadata.len(),
+            pending_output,
+            size_bytes,
             elapsed_ms: started.elapsed().as_millis() as u64,
             tool_source: "native".into(),
             tool_command: None,
@@ -3835,7 +3858,6 @@ fn convert_static_image_to_png_internal(
         }
     };
 
-    let output_path = make_output_path(&output_directory, input_path, "png", "png");
     let resolved_crop_region =
         match resolve_crop_region(crop_region, inspection.width, inspection.height, locale) {
             Ok(region) => region,
@@ -3894,31 +3916,29 @@ fn convert_static_image_to_png_internal(
         }
     }
     let output_pixels = transform_frame_for_static_png(&source_pixels, resolved_crop_region);
+    let publication = (|| -> Result<(PathBuf, u64), PipelineError> {
+        let mut pending_output =
+            PendingOutput::new(&output_directory, Path::new(input_path), "png", "png")?;
+        write_native_png(pending_output.writer(), &output_pixels)?;
+        let size_bytes = pending_output_size(&mut pending_output)?;
+        let output_path = commit_output_after_source_validation(pending_output, expected_source)?;
+        Ok((output_path, size_bytes))
+    })();
 
-    match write_native_png(&output_path, &output_pixels) {
-        Ok(()) => {
-            let metadata = match fs::metadata(&output_path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    let error = pipeline_io_error("read PNG output metadata", error);
-                    return static_conversion_pipeline_error(&error, locale);
-                }
-            };
-
-            StaticImageConversionResult {
-                ok: true,
-                output_path: Some(output_path.to_string_lossy().into_owned()),
-                size_bytes: Some(metadata.len()),
-                elapsed_ms: Some(started.elapsed().as_millis() as u64),
-                tool_source: Some("native".into()),
-                tool_command: None,
-                tool_detail: Some(locale::native_png_encode_detail(locale)),
-                warnings: Vec::new(),
-                reason_code: None,
-                error_code: None,
-                error_message: None,
-            }
-        }
+    match publication {
+        Ok((output_path, size_bytes)) => StaticImageConversionResult {
+            ok: true,
+            output_path: Some(output_path.to_string_lossy().into_owned()),
+            size_bytes: Some(size_bytes),
+            elapsed_ms: Some(started.elapsed().as_millis() as u64),
+            tool_source: Some("native".into()),
+            tool_command: None,
+            tool_detail: Some(locale::native_png_encode_detail(locale)),
+            warnings: Vec::new(),
+            reason_code: None,
+            error_code: None,
+            error_message: None,
+        },
         Err(error) => static_conversion_pipeline_error(&error, locale),
     }
 }
@@ -4219,6 +4239,18 @@ fn finalize_static_conversion_source(
     })
 }
 
+fn finalize_static_conversion_source_unless_published(
+    expected: &SourceIdentity,
+    response: StaticImageConversionResult,
+    locale: UiLocale,
+) -> StaticImageConversionResult {
+    if response.output_path.is_some() {
+        response
+    } else {
+        finalize_static_conversion_source(expected, response, locale)
+    }
+}
+
 fn finalize_optimizer_search_source(
     expected: &SourceIdentity,
     response: OptimizerSearchResponse,
@@ -4228,6 +4260,18 @@ fn finalize_optimizer_search_source(
     finalize_source_checked(expected, response, MediaLimits::default(), |error| {
         optimizer_search_pipeline_error(locale, warnings, error)
     })
+}
+
+fn finalize_optimizer_search_source_unless_published(
+    expected: &SourceIdentity,
+    response: OptimizerSearchResponse,
+    locale: UiLocale,
+) -> OptimizerSearchResponse {
+    if response.best_output_path.is_some() {
+        response
+    } else {
+        finalize_optimizer_search_source(expected, response, locale)
+    }
 }
 
 fn finalize_frame_preview_source(
@@ -5508,7 +5552,7 @@ async fn convert_static_image_to_png(
             locale,
             Some(&identity),
         );
-        finalize_static_conversion_source(&identity, response, locale)
+        finalize_static_conversion_source_unless_published(&identity, response, locale)
     })
     .await
     {
@@ -5820,15 +5864,17 @@ fn run_optimizer_search_internal(
         }
 
         let mut attempts = Vec::new();
-        let mut best_within_limit_output: Option<SelectedEncodeOutput> = None;
-        let mut smallest_oversize_output: Option<SelectedEncodeOutput> = None;
+        let mut best_within_limit_output: Option<PendingSelectedEncodeOutput> = None;
+        let mut smallest_oversize_output: Option<PendingSelectedEncodeOutput> = None;
         let mut stopped_after_best_within_limit = false;
         for candidate in &plan.candidates {
             if let Err(error) = ensure_source_unchanged(&source_identity, MediaLimits::default()) {
                 return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error);
             }
             if remaining_candidate_cannot_beat_within_limit(
-                best_within_limit_output.as_ref(),
+                best_within_limit_output
+                    .as_ref()
+                    .map(|output| &output.selected),
                 candidate,
             ) {
                 stopped_after_best_within_limit = true;
@@ -5881,8 +5927,15 @@ fn run_optimizer_search_internal(
 
             match encode_result {
                 Ok(result) => {
-                    let within_limit = result.size_bytes <= DISCORD_MAX_STICKER_BYTES;
-                    let output_path = result.output_path.to_string_lossy().into_owned();
+                    let EncodeResult {
+                        pending_output,
+                        size_bytes,
+                        elapsed_ms,
+                        tool_source,
+                        tool_command,
+                        tool_detail,
+                    } = result;
+                    let within_limit = size_bytes <= DISCORD_MAX_STICKER_BYTES;
                     let attempt = SearchAttemptResult {
                         candidate_id: candidate.id.clone(),
                         canonical_candidate_id: candidate.id.clone(),
@@ -5898,56 +5951,57 @@ fn run_optimizer_search_internal(
                         summary: candidate.summary.clone(),
                         skipped: false,
                         within_limit,
-                        output_path: Some(output_path.clone()),
-                        size_bytes: Some(result.size_bytes),
-                        elapsed_ms: Some(result.elapsed_ms),
-                        tool_source: Some(result.tool_source.clone()),
-                        tool_command: result.tool_command.clone(),
-                        tool_detail: result.tool_detail.clone(),
+                        output_path: None,
+                        size_bytes: Some(size_bytes),
+                        elapsed_ms: Some(elapsed_ms),
+                        tool_source: Some(tool_source),
+                        tool_command,
+                        tool_detail,
                         warnings: Vec::new(),
                         reason_code: None,
                         error_code: None,
                         error_message: None,
                     };
                     attempts.push(attempt);
-                    let contender = SelectedEncodeOutput {
-                        candidate_id: candidate.id.clone(),
-                        rank: candidate.rank,
-                        duration_seconds: candidate.duration_seconds,
-                        size_bytes: result.size_bytes,
-                        source_similarity_score: candidate.source_similarity_score,
-                        output_path: output_path.clone(),
+                    let contender = PendingSelectedEncodeOutput {
+                        selected: SelectedEncodeOutput {
+                            candidate_id: candidate.id.clone(),
+                            rank: candidate.rank,
+                            duration_seconds: candidate.duration_seconds,
+                            size_bytes,
+                            source_similarity_score: candidate.source_similarity_score,
+                        },
+                        pending_output,
                     };
 
                     if within_limit {
                         let replace_current = best_within_limit_output
                             .as_ref()
-                            .map(|current| is_better_within_limit_candidate(current, &contender))
+                            .map(|current| {
+                                is_better_within_limit_candidate(
+                                    &current.selected,
+                                    &contender.selected,
+                                )
+                            })
                             .unwrap_or(true);
 
                         if replace_current {
-                            if let Some(previous) = best_within_limit_output.replace(contender) {
-                                let _ = fs::remove_file(&previous.output_path);
-                                clear_attempt_output_path(&mut attempts, &previous.candidate_id);
-                            }
+                            drop(best_within_limit_output.replace(contender));
                         } else {
-                            let _ = fs::remove_file(&output_path);
-                            clear_attempt_output_path(&mut attempts, &candidate.id);
+                            drop(contender);
                         }
                     } else {
                         let replace_current = smallest_oversize_output
                             .as_ref()
-                            .map(|current| is_better_oversize_candidate(current, &contender))
+                            .map(|current| {
+                                is_better_oversize_candidate(&current.selected, &contender.selected)
+                            })
                             .unwrap_or(true);
 
                         if replace_current {
-                            if let Some(previous) = smallest_oversize_output.replace(contender) {
-                                let _ = fs::remove_file(&previous.output_path);
-                                clear_attempt_output_path(&mut attempts, &previous.candidate_id);
-                            }
+                            drop(smallest_oversize_output.replace(contender));
                         } else {
-                            let _ = fs::remove_file(&output_path);
-                            clear_attempt_output_path(&mut attempts, &candidate.id);
+                            drop(contender);
                         }
                     }
                 }
@@ -5957,16 +6011,12 @@ fn run_optimizer_search_internal(
             }
         }
 
-        if best_within_limit_output.is_some() {
-            if let Some(oversize_output) = smallest_oversize_output.take() {
-                let _ = fs::remove_file(&oversize_output.output_path);
-                clear_attempt_output_path(&mut attempts, &oversize_output.candidate_id);
-            }
-        }
-
         let stop_reason = if stopped_after_best_within_limit {
             "found-best-ranked-within-limit"
-        } else if attempts.iter().any(|attempt| attempt.output_path.is_some()) {
+        } else if attempts
+            .iter()
+            .any(|attempt| !attempt.skipped && attempt.size_bytes.is_some())
+        {
             "exhausted-ranked-candidates"
         } else {
             "no-successful-encodes"
@@ -5978,19 +6028,31 @@ fn run_optimizer_search_internal(
         } else {
             "no_fit_found"
         };
-        let selected_output = best_within_limit_output
-            .as_ref()
-            .or(smallest_oversize_output.as_ref());
-        let winning_candidate_id = best_within_limit_output
-            .as_ref()
-            .map(|output| output.candidate_id.clone());
-        let closest_candidate_id = selected_output.map(|output| output.candidate_id.clone());
-        let best_output_path = selected_output.map(|output| output.output_path.clone());
-        let best_size_bytes = selected_output.map(|output| output.size_bytes);
         let best_within_limit = best_within_limit_output.is_some();
+        let published_output = match publish_optimizer_selection(
+            &source_identity,
+            best_within_limit_output,
+            smallest_oversize_output,
+            &mut attempts,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                return optimizer_search_pipeline_error(locale, plan.warnings.clone(), error)
+            }
+        };
+        let selected_output = published_output.as_ref();
+        let closest_candidate_id =
+            selected_output.map(|output| output.selected.candidate_id.clone());
+        let winning_candidate_id = if best_within_limit {
+            closest_candidate_id.clone()
+        } else {
+            None
+        };
+        let best_output_path = selected_output.map(|output| output.output_path.clone());
+        let best_size_bytes = selected_output.map(|output| output.selected.size_bytes);
         let summary = locale::optimizer_search_summary(locale, selection_reason);
         let final_duration_seconds = selected_output
-            .map(|output| output.duration_seconds)
+            .map(|output| output.selected.duration_seconds)
             .or(plan.selected_duration_seconds);
 
         OptimizerSearchResponse {
@@ -6015,7 +6077,7 @@ fn run_optimizer_search_internal(
             error_message: None,
         }
     })();
-    finalize_optimizer_search_source(&source_identity, response, locale)
+    finalize_optimizer_search_source_unless_published(&source_identity, response, locale)
 }
 
 #[cfg(test)]
@@ -6026,6 +6088,7 @@ mod tests {
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -6102,6 +6165,22 @@ mod tests {
         }
     }
 
+    fn write_native_png_file(path: &Path, pixels: &RgbaImage) -> Result<(), PipelineError> {
+        let file = File::create(path)
+            .map_err(|error| pipeline_io_error("create test PNG output", error))?;
+        write_native_png(file, pixels)
+    }
+
+    fn write_native_apng_file(
+        path: &Path,
+        frames: &[StickerFrame],
+        preset: &str,
+    ) -> Result<(), PipelineError> {
+        let file = File::create(path)
+            .map_err(|error| pipeline_io_error("create test APNG output", error))?;
+        write_native_apng(file, frames, preset)
+    }
+
     fn revisioned_placeholder(prefix: &str) -> (TestDir, String, String) {
         let test_dir = TestDir::new(prefix);
         let input_path = test_dir.path.join("input.png");
@@ -6143,8 +6222,299 @@ mod tests {
             duration_seconds: 1.0,
             size_bytes,
             source_similarity_score,
-            output_path: format!("C:/tmp/{candidate_id}.png"),
         }
+    }
+
+    fn build_test_attempt(candidate_id: &str, within_limit: bool) -> SearchAttemptResult {
+        SearchAttemptResult {
+            candidate_id: candidate_id.into(),
+            canonical_candidate_id: candidate_id.into(),
+            equivalent_to_candidate_id: None,
+            rank: 1,
+            duration_seconds: 1.0,
+            fps: 12,
+            content_scale: 1.0,
+            preset: "standard".into(),
+            fit_mode: "contain".into(),
+            score: 1.0,
+            source_similarity_score: 1.0,
+            summary: "test candidate".into(),
+            skipped: false,
+            within_limit,
+            output_path: None,
+            size_bytes: Some(7),
+            elapsed_ms: Some(1),
+            tool_source: Some("native".into()),
+            tool_command: None,
+            tool_detail: None,
+            warnings: Vec::new(),
+            error_code: None,
+            reason_code: None,
+            error_message: None,
+        }
+    }
+
+    fn build_pending_selection(
+        directory: &Path,
+        source_path: &Path,
+        candidate_id: &str,
+        size_bytes: u64,
+    ) -> PendingSelectedEncodeOutput {
+        let mut pending_output = PendingOutput::new(directory, source_path, candidate_id, "png")
+            .expect("pending candidate must be created");
+        pending_output
+            .writer()
+            .write_all(b"encoded")
+            .expect("candidate bytes must be written");
+        PendingSelectedEncodeOutput {
+            selected: SelectedEncodeOutput {
+                candidate_id: candidate_id.into(),
+                rank: 1,
+                duration_seconds: 1.0,
+                size_bytes,
+                source_similarity_score: 1.0,
+            },
+            pending_output,
+        }
+    }
+
+    #[test]
+    fn native_png_and_apng_writers_accept_in_memory_targets() {
+        let pixels = RgbaImage::from_pixel(2, 2, Rgba([12, 34, 56, 255]));
+        let mut png_bytes = Vec::new();
+        write_native_png(&mut png_bytes, &pixels).expect("PNG must encode into memory");
+        assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let frames = vec![
+            StickerFrame {
+                pixels: pixels.clone(),
+                duration_us: 100_000,
+            },
+            StickerFrame {
+                pixels,
+                duration_us: 100_000,
+            },
+        ];
+        let mut apng_bytes = Vec::new();
+        write_native_apng(&mut apng_bytes, &frames, "standard")
+            .expect("APNG must encode into memory");
+        assert!(apng_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn native_png_writer_propagates_write_failures() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected write failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected flush failure"))
+            }
+        }
+
+        let pixels = RgbaImage::from_pixel(1, 1, Rgba([12, 34, 56, 255]));
+        let error = write_native_png(FailingWriter, &pixels)
+            .expect_err("writer failure must abort native PNG encoding");
+
+        assert!(matches!(error, PipelineError::Io { .. }));
+    }
+
+    #[test]
+    fn static_publication_source_change_before_commit_leaves_no_output_or_temp_file() {
+        let directory = tempfile::tempdir().expect("temp directory must be created");
+        let source_path = directory.path().join("source.png");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let source_identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let mut output = PendingOutput::new(directory.path(), &source_path, "candidate", "png")
+            .expect("pending output must be created");
+        output
+            .writer()
+            .write_all(b"encoded")
+            .expect("candidate bytes must be written");
+        fs::remove_file(&source_path).expect("source fixture must be removed");
+
+        let error = commit_output_after_source_validation(output, Some(&source_identity))
+            .expect_err("source change must prevent publication");
+
+        assert_eq!(error, PipelineError::SourceChanged);
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("output directory must be readable")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn optimizer_publication_commits_only_winner_and_only_its_attempt_path() {
+        let directory = tempfile::tempdir().expect("temp directory must be created");
+        let source_path = directory.path().join("source.png");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let source_identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let winner = build_pending_selection(directory.path(), &source_path, "winner", 7);
+        let oversize = build_pending_selection(directory.path(), &source_path, "oversize", 999_999);
+        let mut attempts = vec![
+            build_test_attempt("winner", true),
+            build_test_attempt("oversize", false),
+        ];
+
+        let published = publish_optimizer_selection(
+            &source_identity,
+            Some(winner),
+            Some(oversize),
+            &mut attempts,
+        )
+        .expect("winner must publish")
+        .expect("winner must be selected");
+
+        assert_eq!(published.selected.candidate_id, "winner");
+        assert_eq!(
+            attempts[0].output_path.as_deref(),
+            Some(published.output_path.as_str())
+        );
+        assert_eq!(attempts[1].output_path, None);
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("output directory must be readable")
+                .count(),
+            2,
+            "only the source and selected final output may remain"
+        );
+    }
+
+    #[test]
+    fn optimizer_publication_commits_smallest_oversize_when_no_winner_exists() {
+        let directory = tempfile::tempdir().expect("temp directory must be created");
+        let source_path = directory.path().join("source.png");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let source_identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let oversize = build_pending_selection(directory.path(), &source_path, "oversize", 999_999);
+        let mut attempts = vec![build_test_attempt("oversize", false)];
+
+        let published =
+            publish_optimizer_selection(&source_identity, None, Some(oversize), &mut attempts)
+                .expect("oversize selection must publish")
+                .expect("oversize candidate must be selected");
+
+        assert_eq!(published.selected.candidate_id, "oversize");
+        assert_eq!(
+            attempts[0].output_path.as_deref(),
+            Some(published.output_path.as_str())
+        );
+    }
+
+    #[test]
+    fn optimizer_source_change_before_selected_commit_leaves_no_output_or_temp_file() {
+        let directory = tempfile::tempdir().expect("temp directory must be created");
+        let source_path = directory.path().join("source.png");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let source_identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let winner = build_pending_selection(directory.path(), &source_path, "winner", 7);
+        let mut attempts = vec![build_test_attempt("winner", true)];
+        fs::remove_file(&source_path).expect("source fixture must be removed");
+
+        let error =
+            publish_optimizer_selection(&source_identity, Some(winner), None, &mut attempts)
+                .expect_err("source change must prevent selected publication");
+
+        assert_eq!(error, PipelineError::SourceChanged);
+        assert_eq!(attempts[0].output_path, None);
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("output directory must be readable")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn later_candidate_error_drops_all_retained_optimizer_outputs_without_artifacts() {
+        fn retain_candidates_then_fail(
+            directory: &Path,
+            source_path: &Path,
+        ) -> Result<(), PipelineError> {
+            let _best_within_limit =
+                Some(build_pending_selection(directory, source_path, "winner", 7));
+            let _smallest_oversize = Some(build_pending_selection(
+                directory,
+                source_path,
+                "oversize",
+                999_999,
+            ));
+            Err(PipelineError::InvalidRequest {
+                reason: "encode-failed",
+            })
+        }
+
+        let directory = tempfile::tempdir().expect("temp directory must be created");
+        let source_path = directory.path().join("source.png");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+
+        let error = retain_candidates_then_fail(directory.path(), &source_path)
+            .expect_err("later candidate error must abort the optimizer scope");
+
+        assert_eq!(
+            error,
+            PipelineError::InvalidRequest {
+                reason: "encode-failed"
+            }
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("output directory must be readable")
+                .count(),
+            1,
+            "only the untouched source may remain after retained guards drop"
+        );
+    }
+
+    #[test]
+    fn postcheck_does_not_override_a_precommit_validated_publication() {
+        let directory = tempfile::tempdir().expect("temp directory must be created");
+        let source_path = directory.path().join("source.png");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let source_identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        fs::remove_file(&source_path).expect("source fixture must be removed");
+
+        let mut conversion = static_conversion_pipeline_error(
+            &PipelineError::InvalidRequest {
+                reason: "encode-failed",
+            },
+            UiLocale::En,
+        );
+        conversion.ok = true;
+        conversion.output_path = Some("published.png".into());
+        let conversion = finalize_static_conversion_source_unless_published(
+            &source_identity,
+            conversion,
+            UiLocale::En,
+        );
+        assert!(conversion.ok);
+        assert_eq!(conversion.output_path.as_deref(), Some("published.png"));
+
+        let mut search = optimizer_search_pipeline_error(
+            UiLocale::En,
+            Vec::new(),
+            PipelineError::InvalidRequest {
+                reason: "encode-failed",
+            },
+        );
+        search.best_output_path = Some("published.png".into());
+        let search = finalize_optimizer_search_source_unless_published(
+            &source_identity,
+            search,
+            UiLocale::En,
+        );
+        assert_eq!(search.best_output_path.as_deref(), Some("published.png"));
+        assert_ne!(search.error_code.as_deref(), Some("source-changed"));
     }
 
     #[test]
@@ -6364,7 +6734,8 @@ mod tests {
                 duration_us: 100_000,
             },
         ];
-        write_native_apng(&input_path, &frames, "standard").expect("APNG fixture must be encoded");
+        write_native_apng_file(&input_path, &frames, "standard")
+            .expect("APNG fixture must be encoded");
         let limits = MediaLimits {
             max_total_decoded_bytes: 7,
             ..MediaLimits::default()
@@ -6459,7 +6830,7 @@ mod tests {
     fn native_animation_crop_uses_decoded_dimensions_not_request_dimensions() {
         let test_dir = TestDir::new("native-decoded-crop-dimensions");
         let input_path = test_dir.path.join("input.apng");
-        write_native_apng(
+        write_native_apng_file(
             &input_path,
             &[StickerFrame {
                 pixels: RgbaImage::new(4, 2),
@@ -6489,8 +6860,12 @@ mod tests {
             None,
         )
         .expect("native crop encode must succeed");
+        let output_path = result
+            .pending_output
+            .commit()
+            .expect("native crop output must commit");
         let frames = decode_apng_animation_frames(
-            result.output_path.to_string_lossy().as_ref(),
+            output_path.to_string_lossy().as_ref(),
             MediaLimits::default(),
             || Ok(()),
         )
@@ -6972,7 +7347,7 @@ mod tests {
                 duration_us: 100_000,
             })
             .collect::<Vec<_>>();
-        write_native_apng(Path::new(&input_path), &frames, "standard")
+        write_native_apng_file(Path::new(&input_path), &frames, "standard")
             .expect("native APNG writer should create the animation source");
 
         input_path
@@ -7014,7 +7389,7 @@ mod tests {
                     .expect("native image encoder should create a jpg test source");
             }
             _ => {
-                write_native_png(Path::new(&output), &image)
+                write_native_png_file(Path::new(&output), &image)
                     .expect("native image encoder should create a png test source");
             }
         }
@@ -7044,7 +7419,7 @@ mod tests {
                 duration_us: 360_000,
             },
         ];
-        write_native_apng(Path::new(&output_path), &frames, "standard")
+        write_native_apng_file(Path::new(&output_path), &frames, "standard")
             .expect("native APNG writer should create a variable-duration animation");
 
         output_path
@@ -8142,7 +8517,7 @@ mod tests {
                 duration_us: 240_000,
             },
         ];
-        write_native_apng(&input_path, &frames, "standard")
+        write_native_apng_file(&input_path, &frames, "standard")
             .expect("native APNG fixture must be written");
 
         let metadata = read_png_animation_metadata(&input_path, MediaLimits::default(), || Ok(()))
@@ -8162,7 +8537,7 @@ mod tests {
             duration_us: 99,
         }];
 
-        let error = write_native_apng(&output_path, &frames, "standard")
+        let error = write_native_apng_file(&output_path, &frames, "standard")
             .expect_err("sub-tick authored duration must be rejected");
 
         assert_eq!(error.code(), "invalid-request");
@@ -8193,7 +8568,7 @@ mod tests {
             },
         ];
 
-        write_native_apng(&output_path, &expected_frames, "compact")
+        write_native_apng_file(&output_path, &expected_frames, "compact")
             .expect("sparse APNG should be written");
 
         let decoded_frames = decode_apng_animation_frames(
@@ -8256,7 +8631,12 @@ mod tests {
         assert_eq!(result.tool_source, "native");
         assert_eq!(result.tool_command, None);
 
-        let output_path = result.output_path.to_string_lossy().into_owned();
+        let output_path = result
+            .pending_output
+            .commit()
+            .expect("selected-frame output must commit")
+            .to_string_lossy()
+            .into_owned();
         let inspection = inspect_input_media_internal(&output_path, UiLocale::En);
 
         assert!(inspection.ok, "inspection should succeed");
@@ -8747,6 +9127,31 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn convert_static_image_to_png_internal_preserves_unicode_source_stem() {
+        let test_dir = TestDir::new("static-unicode-conversion");
+        let input_path = create_static_image(&test_dir, "고양이 스티커.png", "blue");
+
+        let result = convert_static_image_to_png_internal(
+            &input_path,
+            Some(test_dir.path.to_string_lossy().as_ref()),
+            None,
+            UiLocale::En,
+            None,
+        );
+
+        let output_path = result
+            .output_path
+            .expect("Unicode source conversion must publish an output");
+        let output_name = Path::new(&output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("output name must be valid Unicode");
+        assert!(result.ok);
+        assert!(output_name.starts_with("고양이 스티커-png-"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn encode_candidate_internal_respects_timeline_frame_order_and_durations() {
         let test_dir = TestDir::new("timeline-encode");
         let input_path = create_three_frame_animation(&test_dir);
@@ -8782,10 +9187,12 @@ mod tests {
         assert_eq!(result.tool_source, "native");
         assert_eq!(result.tool_command, None);
 
-        let inspection = inspect_input_media_internal(
-            result.output_path.to_string_lossy().as_ref(),
-            UiLocale::En,
-        );
+        let output_path = result
+            .pending_output
+            .commit()
+            .expect("timeline output must commit");
+        let inspection =
+            inspect_input_media_internal(output_path.to_string_lossy().as_ref(), UiLocale::En);
         let frame_durations = inspection
             .frame_durations_seconds
             .expect("encoded timeline should report frame durations");
