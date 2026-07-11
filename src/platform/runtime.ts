@@ -2,6 +2,7 @@ import type { Locale } from "../locales/messages";
 import mediaOperationCodes from "../types/media-operation-error-codes.json";
 import type {
   MediaInspection,
+  MediaInspectionFallbackReasonCode,
   MediaOperationErrorCode,
   MediaOperationErrorFields,
   MediaOperationReasonCode,
@@ -360,13 +361,41 @@ export function normalizeInspectionSourceRevision(input: {
   return input.sourceRevision;
 }
 
+type RawInspectionFallbackReasonFields = Readonly<{
+  fallbackReasonCode?: unknown;
+  fallbackReason?: unknown;
+  toolDetail?: unknown;
+}>;
+
+export function normalizeInspectionFallbackReasonCode(
+  input: RawInspectionFallbackReasonFields,
+): MediaInspectionFallbackReasonCode | null {
+  let fallbackReasonCode: unknown;
+  try {
+    fallbackReasonCode = input.fallbackReasonCode;
+  } catch {
+    return null;
+  }
+
+  return fallbackReasonCode === "media-foundation-failed"
+    ? fallbackReasonCode
+    : null;
+}
+
 type LegacyMediaResponse<T> = Omit<T, keyof MediaOperationErrorFields> &
   RawMediaErrorFields;
 
 type RuntimeInspectionPayload = Omit<
   LegacyMediaResponse<MediaInspection>,
-  "backendInputPath" | "previewSrc" | "inputSourceKind" | "sourceRevision"
-> & { sourceRevision: string | null };
+  | "backendInputPath"
+  | "previewSrc"
+  | "inputSourceKind"
+  | "sourceRevision"
+  | "fallbackReasonCode"
+> & {
+  sourceRevision: string | null;
+  fallbackReasonCode?: unknown;
+};
 
 type LegacyOptimizerSearchResponse = LegacyMediaResponse<
   Omit<OptimizerSearchResponse, "attempts">
@@ -509,6 +538,7 @@ function createMediaErrorInspection(
     toolSource: "browser",
     toolCommand: null,
     toolDetail: "Browser metadata inspection failed.",
+    fallbackReasonCode: null,
     formatName: null,
     durationSeconds: null,
     sizeBytes: null,
@@ -588,6 +618,7 @@ function createBrowserVideoInspection(file: File, previewSrc: string, metadata: 
     toolSource: "browser",
     toolCommand: null,
     toolDetail: `Browser preview mode uses estimated timeline data at ${DEFAULT_BROWSER_VIDEO_FPS} fps.`,
+    fallbackReasonCode: null,
     formatName: inferFormatName(file),
     durationSeconds: metadata.durationSeconds,
     sizeBytes: file.size,
@@ -622,6 +653,7 @@ function createBrowserImageInspection(file: File, previewSrc: string, metadata: 
     toolSource: "browser",
     toolCommand: null,
     toolDetail: "Browser preview mode supports crop and layout review for local image files.",
+    fallbackReasonCode: null,
     formatName: inferFormatName(file),
     durationSeconds: null,
     sizeBytes: file.size,
@@ -862,6 +894,7 @@ const tauriRuntime: AppRuntime = {
       ...normalized,
       inputPath: source.path,
       sourceRevision: normalizeInspectionSourceRevision(result),
+      fallbackReasonCode: normalizeInspectionFallbackReasonCode(result),
       backendInputPath: source.path,
       previewSrc: convertFileSrc(source.path),
       inputSourceKind: "path",

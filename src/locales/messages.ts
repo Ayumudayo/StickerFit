@@ -130,6 +130,7 @@ export type MessagesForLocale = {
   selectionReasonSmallestOversize: string;
   selectionReasonNoFitFound: string;
   inspectionFailed: string;
+  mediaFoundationFallbackWarning: string;
   statusFirstFit: string;
   statusExhausted: string;
   statusNoOutput: string;
@@ -268,6 +269,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     selectionReasonNoFitFound:
       "No successful output was produced, so there is no result to recommend.",
     inspectionFailed: "Inspection failed",
+    mediaFoundationFallbackWarning:
+      "Windows Media Foundation could not inspect this file, so StickerFit used the bundled FFmpeg decoder.",
     statusFirstFit: "Stopped at the first result that fit the Discord limit.",
     statusExhausted: "Checked all ranked candidates.",
     statusNoOutput: "No successful outputs were produced.",
@@ -405,6 +408,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     selectionReasonNoFitFound:
       "성공적으로 생성된 출력이 없어 추천 결과를 표시할 수 없습니다.",
     inspectionFailed: "입력 검사 실패",
+    mediaFoundationFallbackWarning:
+      "Windows Media Foundation에서 이 파일을 검사하지 못해 StickerFit이 번들 FFmpeg 디코더를 사용했습니다.",
     statusFirstFit: "디스코드 제한을 만족한 첫 결과에서 중단했습니다.",
     statusExhausted: "정렬된 후보를 끝까지 확인했습니다.",
     statusNoOutput: "성공적으로 만들어진 출력이 없습니다.",

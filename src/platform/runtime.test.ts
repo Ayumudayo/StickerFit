@@ -9,6 +9,7 @@ import type {
   OptimizerPlanRequest,
 } from "../types/workflow";
 import {
+  MESSAGES,
   MEDIA_OPERATION_MESSAGES,
   MEDIA_OPERATION_PROGRESS_MESSAGES,
   mediaOperationMessage,
@@ -20,6 +21,7 @@ import {
   normalizeLegacyMediaError,
   normalizeLegacyMediaResponse,
   normalizeLegacyOptimizerSearchResponse,
+  normalizeInspectionFallbackReasonCode,
   normalizeInspectionSourceRevision,
 } from "./runtime";
 
@@ -564,6 +566,45 @@ describe("inspection source revision contract", () => {
   });
 });
 
+describe("inspection fallback provenance contract", () => {
+  it("accepts only the exact Media Foundation fallback code", () => {
+    expect(
+      normalizeInspectionFallbackReasonCode({
+        fallbackReasonCode: "media-foundation-failed",
+      }),
+    ).toBe("media-foundation-failed");
+  });
+
+  it.each([
+    {},
+    { fallbackReasonCode: null },
+    { fallbackReasonCode: "media_foundation_failed" },
+    { fallbackReasonCode: "future-fallback" },
+    { fallbackReasonCode: { value: "media-foundation-failed" } },
+    { fallbackReason: "media-foundation-failed" },
+    { toolDetail: "media-foundation-failed" },
+  ])("normalizes missing, legacy, malformed, and unknown provenance to null", (raw) => {
+    expect(normalizeInspectionFallbackReasonCode(raw)).toBeNull();
+  });
+
+  it("never coerces hostile fallback values", () => {
+    expect(
+      normalizeInspectionFallbackReasonCode({
+        fallbackReasonCode: {
+          toString() {
+            throw new Error("must not coerce fallback provenance");
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("ships nonempty English and Korean fallback copy", () => {
+    expect(MESSAGES.en.mediaFoundationFallbackWarning.trim()).not.toBe("");
+    expect(MESSAGES.ko.mediaFoundationFallbackWarning.trim()).not.toBe("");
+  });
+});
+
 const EXPECTED_PROGRESS_MESSAGE_CODES = [
   "media-operation-queued",
   "media-operation-inspecting",
@@ -968,6 +1009,85 @@ describe("web media operation adapter contract", () => {
       width: 64,
       height: 32,
       inputSourceKind: "file",
+      fallbackReasonCode: null,
+    });
+  });
+
+  it("keeps browser video fallback provenance null", async () => {
+    class FakeVideo {
+      preload = "";
+      muted = false;
+      playsInline = false;
+      duration = 1;
+      videoWidth = 320;
+      videoHeight = 240;
+      onloadedmetadata: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+
+      set src(value: string) {
+        if (value) {
+          queueMicrotask(() => this.onloadedmetadata?.());
+        }
+      }
+    }
+    const createElement = document.createElement.bind(document);
+    vi.spyOn(document, "createElement").mockImplementation((tagName) =>
+      tagName === "video"
+        ? (new FakeVideo() as unknown as HTMLVideoElement)
+        : createElement(tagName),
+    );
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:operation-web-video");
+    const runtime = getAppRuntime();
+    const file = {
+      name: "clip.mp4",
+      size: 2_048,
+      lastModified: 1_700_000_000_001,
+      type: "video/mp4",
+    } as unknown as File;
+
+    const inspection = await runtime.inspectInput(
+      { kind: "web-file", file },
+      "en",
+      { operationId: "web-video-inspection" },
+    );
+
+    expect(inspection).toMatchObject({
+      ok: true,
+      toolSource: "browser",
+      fallbackReasonCode: null,
+    });
+  });
+
+  it("keeps browser inspection errors fallback provenance null", async () => {
+    class FailingImage {
+      decoding = "";
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+
+      set src(_value: string) {
+        queueMicrotask(() => this.onerror?.());
+      }
+    }
+    vi.stubGlobal("Image", FailingImage);
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:operation-web-error");
+    const runtime = getAppRuntime();
+    const file = {
+      name: "broken.png",
+      size: 128,
+      lastModified: 1_700_000_000_002,
+      type: "image/png",
+    } as unknown as File;
+
+    const inspection = await runtime.inspectInput(
+      { kind: "web-file", file },
+      "en",
+      { operationId: "web-error-inspection" },
+    );
+
+    expect(inspection).toMatchObject({
+      ok: false,
+      toolSource: "browser",
+      fallbackReasonCode: null,
     });
   });
 

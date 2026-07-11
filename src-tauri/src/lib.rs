@@ -65,6 +65,7 @@ use crate::process_runner::{
 
 const CANONICAL_FIT_MODE: &str = "contain";
 const MAX_MEDIA_FRAME_COUNT: usize = 300;
+const MEDIA_FOUNDATION_FAILED_REASON_CODE: &str = "media-foundation-failed";
 
 struct BoundedVecVisitor<T>(PhantomData<T>);
 
@@ -215,6 +216,7 @@ struct MediaInspection {
     tool_source: Option<String>,
     tool_command: Option<String>,
     tool_detail: Option<String>,
+    fallback_reason_code: Option<String>,
     format_name: Option<String>,
     duration_seconds: Option<f64>,
     size_bytes: Option<u64>,
@@ -4360,11 +4362,48 @@ fn inspection_pipeline_error(
     )
 }
 
+fn inspection_pipeline_error_with_provenance(
+    input_path: &str,
+    inspection: &MediaInspection,
+    error: &PipelineError,
+    locale: UiLocale,
+) -> MediaInspection {
+    inspection_error_with_fallback_reason(
+        input_path,
+        inspection.tool_source.clone(),
+        inspection.tool_command.clone(),
+        inspection.tool_detail.clone(),
+        inspection.fallback_reason_code.clone(),
+        error.code(),
+        pipeline_error_diagnostic(error, locale),
+    )
+}
+
 fn inspection_error(
     input_path: &str,
     tool_source: Option<String>,
     tool_command: Option<String>,
     tool_detail: Option<String>,
+    error_code: &str,
+    error_message: String,
+) -> MediaInspection {
+    inspection_error_with_fallback_reason(
+        input_path,
+        tool_source,
+        tool_command,
+        tool_detail,
+        None,
+        error_code,
+        error_message,
+    )
+}
+
+fn inspection_error_with_fallback_reason(
+    input_path: &str,
+    tool_source: Option<String>,
+    tool_command: Option<String>,
+    tool_detail: Option<String>,
+    fallback_reason_code: Option<String>,
     error_code: &str,
     error_message: String,
 ) -> MediaInspection {
@@ -4376,6 +4415,7 @@ fn inspection_error(
         tool_source,
         tool_command,
         tool_detail,
+        fallback_reason_code,
         format_name: None,
         duration_seconds: None,
         size_bytes: None,
@@ -4394,6 +4434,21 @@ fn inspection_error(
         error_code: Some(error_code.into()),
         error_message: Some(error_message),
     }
+}
+
+fn annotate_media_foundation_fallback(
+    mut inspection: MediaInspection,
+    locale: UiLocale,
+) -> MediaInspection {
+    inspection.fallback_reason_code = Some(MEDIA_FOUNDATION_FAILED_REASON_CODE.into());
+    if inspection.tool_source.as_deref() == Some("sidecar") {
+        inspection.tool_detail = Some(if inspection.ok {
+            locale::media_foundation_fallback_warning(locale)
+        } else {
+            locale::media_foundation_fallback_attempt_detail(locale)
+        });
+    }
+    inspection
 }
 
 fn apply_inspection_source_revision(
@@ -4424,14 +4479,16 @@ fn enforce_desktop_inspection_frame_limit(
         tool_source,
         tool_command,
         tool_detail,
+        fallback_reason_code,
         ..
     } = inspection;
 
-    inspection_error(
+    inspection_error_with_fallback_reason(
         &input_path,
         tool_source,
         tool_command,
         tool_detail,
+        fallback_reason_code,
         error.code(),
         pipeline_error_diagnostic(&error, locale),
     )
@@ -5227,6 +5284,7 @@ fn inspect_still_image_metadata_with_checkpoint(
         tool_source: Some("native".into()),
         tool_command: None,
         tool_detail: Some(locale::native_image_detail(locale)),
+        fallback_reason_code: None,
         format_name,
         duration_seconds: None,
         size_bytes: Some(metadata.len()),
@@ -5329,6 +5387,7 @@ fn inspect_gif_metadata_with_checkpoint(
         tool_source: Some("native".into()),
         tool_command: None,
         tool_detail: Some(locale::native_animation_detail(locale, "gif")),
+        fallback_reason_code: None,
         format_name: Some("gif".into()),
         duration_seconds: Some(duration_seconds),
         size_bytes: Some(metadata.len()),
@@ -5473,6 +5532,7 @@ fn inspect_apng_metadata_with_checkpoint(
         tool_source: Some("native".into()),
         tool_command: None,
         tool_detail: Some(tool_detail),
+        fallback_reason_code: None,
         format_name: Some("apng".into()),
         duration_seconds: Some(duration_seconds),
         size_bytes: Some(metadata.len()),
@@ -5501,47 +5561,46 @@ fn parse_duration_hms_to_seconds(value: &str) -> Option<f64> {
     Some((hours * 3600.0) + (minutes * 60.0) + seconds)
 }
 
-#[cfg(target_os = "windows")]
-fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_mp4_family_with_media_foundation_and_checkpoint(
-        input_path,
-        locale,
-        None,
-        &mut || Ok(()),
-    )
+fn should_try_media_foundation(extension: &str, is_windows: bool) -> bool {
+    is_windows && matches!(extension, "mp4" | "m4v" | "mov")
+}
+
+fn inspect_mp4_family_with_fallback<N, F>(
+    native: N,
+    ffmpeg: F,
+) -> Result<MediaInspection, PipelineError>
+where
+    N: FnOnce() -> Result<MediaInspection, PipelineError>,
+    F: FnOnce(PipelineError) -> Result<MediaInspection, PipelineError>,
+{
+    match native() {
+        Ok(inspection) => Ok(inspection),
+        Err(native_error) => ffmpeg(native_error),
+    }
 }
 
 #[cfg(target_os = "windows")]
-fn inspect_mp4_family_with_media_foundation_and_checkpoint(
+fn try_inspect_mp4_family_with_media_foundation(
     input_path: &str,
     locale: UiLocale,
-    _context: Option<&OperationContext>,
-    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
-) -> MediaInspection {
-    if let Err(error) = checkpoint() {
-        return inspection_pipeline_error(input_path, &error, locale);
-    }
+) -> Result<MediaInspection, PipelineError> {
     let format_name = lowercase_source_extension(input_path).unwrap_or_else(|| "video".into());
-    let detail = locale::native_video_detail(locale, &format_name);
-    let result = unsafe {
+    unsafe {
         let mut should_uninitialize_com = false;
         let com_result = CoInitializeEx(None, COINIT_MULTITHREADED);
         if com_result.is_ok() {
             should_uninitialize_com = true;
         } else if com_result != RPC_E_CHANGED_MODE {
-            return inspection_error(
-                input_path,
-                Some("native".into()),
-                None,
-                Some(detail),
-                "inspect-failed",
-                locale::media_pipeline_diagnostic(locale, "malformed-media"),
-            );
+            return Err(pipeline_io_error(
+                "initialize Media Foundation COM",
+                com_result,
+            ));
         }
 
         let mut media_foundation_started = false;
-        let inspection = (|| -> Result<MediaInspection, String> {
-            MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(|error| error.to_string())?;
+        let inspection = (|| -> Result<MediaInspection, PipelineError> {
+            MFStartup(MF_VERSION, MFSTARTUP_FULL)
+                .map_err(|error| pipeline_io_error("start Media Foundation", error))?;
             media_foundation_started = true;
 
             let wide_path: Vec<u16> = Path::new(input_path)
@@ -5550,14 +5609,14 @@ fn inspect_mp4_family_with_media_foundation_and_checkpoint(
                 .chain(std::iter::once(0))
                 .collect();
             let reader = MFCreateSourceReaderFromURL(PCWSTR(wide_path.as_ptr()), None)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| pipeline_io_error("open Media Foundation source", error))?;
             let media_type = reader
                 .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| pipeline_io_error("read Media Foundation video type", error))?;
 
             let frame_size = media_type
                 .GetUINT64(&MF_MT_FRAME_SIZE)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| pipeline_io_error("read Media Foundation frame size", error))?;
             let (width, height) = unpack_media_foundation_pair(frame_size);
 
             let avg_fps = media_type
@@ -5574,9 +5633,9 @@ fn inspect_mp4_family_with_media_foundation_and_checkpoint(
 
             let duration_value = reader
                 .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
-                .map_err(|error| error.to_string())?;
-            let duration_100ns =
-                u64::try_from(&duration_value).map_err(|error| error.to_string())?;
+                .map_err(|error| pipeline_io_error("read Media Foundation duration", error))?;
+            let duration_100ns = u64::try_from(&duration_value)
+                .map_err(|error| pipeline_io_error("decode Media Foundation duration", error))?;
             let duration_seconds =
                 (duration_100ns > 0).then_some(duration_100ns as f64 / 10_000_000.0);
             let estimated_frames = duration_seconds
@@ -5591,6 +5650,7 @@ fn inspect_mp4_family_with_media_foundation_and_checkpoint(
                 tool_source: Some("native".into()),
                 tool_command: None,
                 tool_detail: Some(locale::native_video_detail(locale, &format_name)),
+                fallback_reason_code: None,
                 format_name: Some(format_name.clone()),
                 duration_seconds,
                 size_bytes,
@@ -5619,50 +5679,11 @@ fn inspect_mp4_family_with_media_foundation_and_checkpoint(
         }
 
         inspection
-    };
-
-    if let Err(error) = checkpoint() {
-        return inspection_pipeline_error(input_path, &error, locale);
-    }
-
-    match result {
-        Ok(inspection) => inspection,
-        Err(_) => inspection_error(
-            input_path,
-            Some("native".into()),
-            None,
-            Some(locale::native_video_detail(locale, &format_name)),
-            "inspect-failed",
-            locale::media_pipeline_diagnostic(locale, "malformed-media"),
-        ),
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn inspect_mp4_family_with_media_foundation(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_mp4_family_with_media_foundation_and_checkpoint(
-        input_path,
-        locale,
-        None,
-        &mut || Ok(()),
-    )
-}
-
-#[cfg(not(target_os = "windows"))]
-fn inspect_mp4_family_with_media_foundation_and_checkpoint(
-    input_path: &str,
-    locale: UiLocale,
-    context: Option<&OperationContext>,
-    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
-) -> MediaInspection {
-    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, context, checkpoint)
-}
-
-fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspection {
-    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, None, &mut || Ok(()))
-}
-
-fn inspect_video_with_ffmpeg_and_checkpoint(
+#[cfg(target_os = "windows")]
+fn inspect_mp4_family_with_fallback_and_checkpoint(
     input_path: &str,
     locale: UiLocale,
     context: Option<&OperationContext>,
@@ -5671,59 +5692,39 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
     if let Err(error) = checkpoint() {
         return inspection_pipeline_error(input_path, &error, locale);
     }
-    let tool = match resolve_tool("ffmpeg", locale) {
-        Ok(tool) => tool,
-        Err(_) => {
-            return inspection_error(
-                input_path,
-                Some("missing".into()),
-                None,
-                None,
-                "tool-unavailable",
-                locale::media_pipeline_diagnostic(locale, "tool-missing"),
-            );
-        }
-    };
 
-    let args = [
-        OsString::from("-hide_banner"),
-        OsString::from("-i"),
-        OsString::from(input_path),
-        OsString::from("-map"),
-        OsString::from("0:v:0"),
-        OsString::from("-frames:v"),
-        OsString::from("1"),
-        OsString::from("-f"),
-        OsString::from("null"),
-        OsString::from("-"),
-    ];
-    let detached = context
-        .is_none()
-        .then(|| OperationContext::detached(TOOL_PROCESS_TIMEOUT));
-    let process_context =
-        context.unwrap_or_else(|| detached.as_ref().expect("detached inspection context"));
-    if let Err(error) = checkpoint() {
-        return inspection_pipeline_error(input_path, &error, locale);
-    }
-    let output_result = run_captured(
-        &tool.command,
-        &args,
-        ProcessLimits {
-            timeout: TOOL_PROCESS_TIMEOUT,
-            max_stdout_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
-            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+    let inspection = match inspect_mp4_family_with_fallback(
+        || try_inspect_mp4_family_with_media_foundation(input_path, locale),
+        |_native_error| {
+            checkpoint()?;
+            let fallback = try_inspect_video_with_ffmpeg_and_checkpoint(
+                input_path, locale, context, checkpoint,
+            )?;
+            Ok(annotate_media_foundation_fallback(fallback, locale))
         },
-        process_context,
-    );
+    ) {
+        Ok(inspection) => inspection,
+        Err(error) => return inspection_pipeline_error(input_path, &error, locale),
+    };
+
     if let Err(error) = checkpoint() {
-        return inspection_pipeline_error(input_path, &error, locale);
+        return inspection_pipeline_error_with_provenance(input_path, &inspection, &error, locale);
     }
+    inspection
+}
+
+fn finish_ffmpeg_inspection_result(
+    input_path: &str,
+    locale: UiLocale,
+    tool: ToolResolution,
+    output_result: Result<CapturedProcess, PipelineError>,
+) -> MediaInspection {
     let output = match output_result {
         Ok(output) => output,
         Err(error) => {
             return inspection_error(
                 input_path,
-                Some("sidecar".into()),
+                Some(tool.source.into()),
                 Some(tool.command_display.clone()),
                 tool.fallback_reason.clone(),
                 error.code(),
@@ -5762,7 +5763,7 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
 
             return inspection_error(
                 input_path,
-                Some("sidecar".into()),
+                Some(tool.source.into()),
                 Some(tool.command_display.clone()),
                 tool.fallback_reason.clone(),
                 "inspect-failed",
@@ -5795,9 +5796,10 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
         ok: true,
         input_path: input_path.to_string(),
         source_revision: None,
-        tool_source: Some("sidecar".into()),
+        tool_source: Some(tool.source.into()),
         tool_command: Some(tool.command_display),
         tool_detail: tool.fallback_reason,
+        fallback_reason_code: None,
         format_name,
         duration_seconds,
         size_bytes,
@@ -5815,6 +5817,80 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
         reason_code: None,
         error_code: None,
         error_message: None,
+    }
+}
+
+fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspection {
+    inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, None, &mut || Ok(()))
+}
+
+fn try_inspect_video_with_ffmpeg_and_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    context: Option<&OperationContext>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> Result<MediaInspection, PipelineError> {
+    checkpoint()?;
+    let tool = match resolve_tool("ffmpeg", locale) {
+        Ok(tool) => tool,
+        Err(_) => {
+            return Ok(inspection_error(
+                input_path,
+                Some("missing".into()),
+                None,
+                None,
+                "tool-unavailable",
+                locale::media_pipeline_diagnostic(locale, "tool-missing"),
+            ));
+        }
+    };
+
+    let args = [
+        OsString::from("-hide_banner"),
+        OsString::from("-i"),
+        OsString::from(input_path),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-frames:v"),
+        OsString::from("1"),
+        OsString::from("-f"),
+        OsString::from("null"),
+        OsString::from("-"),
+    ];
+    let detached = context
+        .is_none()
+        .then(|| OperationContext::detached(TOOL_PROCESS_TIMEOUT));
+    let process_context =
+        context.unwrap_or_else(|| detached.as_ref().expect("detached inspection context"));
+    checkpoint()?;
+    let output_result = run_captured(
+        &tool.command,
+        &args,
+        ProcessLimits {
+            timeout: TOOL_PROCESS_TIMEOUT,
+            max_stdout_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+            max_stderr_bytes: PROCESS_CAPTURE_LIMIT_BYTES,
+        },
+        process_context,
+    );
+    checkpoint()?;
+    Ok(finish_ffmpeg_inspection_result(
+        input_path,
+        locale,
+        tool,
+        output_result,
+    ))
+}
+
+fn inspect_video_with_ffmpeg_and_checkpoint(
+    input_path: &str,
+    locale: UiLocale,
+    context: Option<&OperationContext>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    match try_inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, context, checkpoint) {
+        Ok(inspection) => inspection,
+        Err(error) => inspection_pipeline_error(input_path, &error, locale),
     }
 }
 
@@ -5885,8 +5961,9 @@ fn inspect_input_media_canonical_with_checkpoint(
         return inspect_apng_metadata_with_checkpoint(input_path, locale, None, checkpoint);
     }
 
-    if matches!(extension.as_str(), "mp4" | "m4v" | "mov") {
-        return inspect_mp4_family_with_media_foundation_and_checkpoint(
+    #[cfg(target_os = "windows")]
+    if should_try_media_foundation(&extension, true) {
+        return inspect_mp4_family_with_fallback_and_checkpoint(
             input_path, locale, context, checkpoint,
         );
     }
@@ -5959,17 +6036,21 @@ fn inspect_input_media_with_callbacks(
     );
     let inspection = apply_inspection_source_revision(&identity, input_path, inspection);
     let inspection = enforce_desktop_inspection_frame_limit(inspection, locale);
+    let tool_source = inspection.tool_source.clone();
+    let tool_command = inspection.tool_command.clone();
     let tool_detail = inspection.tool_detail.clone();
+    let fallback_reason_code = inspection.fallback_reason_code.clone();
     progress(ProgressStage::Finalizing, 1, Some(1));
     if let Err(error) = checkpoint() {
-        return inspection_pipeline_error(input_path, &error, locale);
+        return inspection_pipeline_error_with_provenance(input_path, &inspection, &error, locale);
     }
     finalize_source_checked(&identity, inspection, limits, |error| {
-        inspection_error(
+        inspection_error_with_fallback_reason(
             input_path,
-            Some("native".into()),
-            None,
+            tool_source,
+            tool_command,
             tool_detail,
+            fallback_reason_code,
             error.code(),
             pipeline_error_diagnostic(&error, locale),
         )
@@ -6727,6 +6808,266 @@ mod tests {
         &tail[..end_offset]
     }
 
+    fn ffmpeg_inspection_resolution() -> ToolResolution {
+        ToolResolution {
+            source: "sidecar",
+            command: OsString::from("ffmpeg.exe"),
+            command_display: "ffmpeg.exe".into(),
+            attempted_sidecar_paths: vec!["ffmpeg.exe".into()],
+            fallback_reason: None,
+        }
+    }
+
+    #[test]
+    fn media_foundation_success_never_invokes_ffmpeg_fallback() {
+        let native_calls = Cell::new(0);
+        let ffmpeg_calls = Cell::new(0);
+        let mut native = video_inspection_fixture(30);
+        native.tool_source = Some("native".into());
+        native.tool_command = None;
+        native.tool_detail = Some(locale::native_video_detail(UiLocale::En, "mp4"));
+
+        let inspection = inspect_mp4_family_with_fallback(
+            || {
+                native_calls.set(native_calls.get() + 1);
+                Ok(native)
+            },
+            |_| {
+                ffmpeg_calls.set(ffmpeg_calls.get() + 1);
+                panic!("native success must not invoke ffmpeg")
+            },
+        )
+        .expect("native success");
+
+        assert_eq!(native_calls.get(), 1);
+        assert_eq!(ffmpeg_calls.get(), 0);
+        assert_eq!(inspection.tool_source.as_deref(), Some("native"));
+        assert_eq!(inspection.fallback_reason_code, None);
+    }
+
+    #[test]
+    fn media_foundation_failure_invokes_ffmpeg_once_with_the_exact_error() {
+        let native_error = PipelineError::Io {
+            operation: "read Media Foundation metadata",
+            message: "native fixture failure".into(),
+        };
+        let ffmpeg_calls = Cell::new(0);
+        let mut received_native_error = None;
+
+        let inspection = inspect_mp4_family_with_fallback(
+            || Err(native_error.clone()),
+            |error| {
+                ffmpeg_calls.set(ffmpeg_calls.get() + 1);
+                received_native_error = Some(error);
+                Ok(video_inspection_fixture(30))
+            },
+        )
+        .expect("ffmpeg fallback success");
+
+        assert!(inspection.ok);
+        assert_eq!(ffmpeg_calls.get(), 1);
+        assert_eq!(received_native_error, Some(native_error));
+    }
+
+    #[test]
+    fn fallback_control_errors_propagate_without_inspection_annotation() {
+        for expected in [
+            PipelineError::Cancelled,
+            PipelineError::TimedOut {
+                stage: "child-process",
+            },
+        ] {
+            let result = inspect_mp4_family_with_fallback(
+                || {
+                    Err(PipelineError::Io {
+                        operation: "read Media Foundation metadata",
+                        message: "native fixture failure".into(),
+                    })
+                },
+                |_| Err(expected.clone()),
+            );
+
+            let Err(actual) = result else {
+                panic!("fallback control error must remain an Err")
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn missing_ffmpeg_fallback_records_reason_without_claiming_decoder_use() {
+        let missing = inspection_error(
+            "input.mp4",
+            Some("missing".into()),
+            None,
+            None,
+            "tool-unavailable",
+            locale::media_pipeline_diagnostic(UiLocale::En, "tool-missing"),
+        );
+
+        let missing = annotate_media_foundation_fallback(missing, UiLocale::En);
+
+        assert!(!missing.ok);
+        assert_eq!(missing.tool_source.as_deref(), Some("missing"));
+        assert_eq!(
+            missing.fallback_reason_code.as_deref(),
+            Some("media-foundation-failed")
+        );
+        assert_eq!(missing.tool_detail, None);
+    }
+
+    #[test]
+    fn fallback_source_propagates_attempt_errors_before_annotation() {
+        let source = include_str!("lib.rs");
+        let fallback = source_section(
+            source,
+            "fn inspect_mp4_family_with_fallback_and_checkpoint(",
+            "fn finish_ffmpeg_inspection_result(",
+        );
+        let attempt = fallback
+            .find("try_inspect_video_with_ffmpeg_and_checkpoint(")
+            .expect("Result-returning ffmpeg attempt");
+        let propagate = fallback[attempt..]
+            .find("?;")
+            .map(|offset| attempt + offset)
+            .expect("fallback attempt error propagation");
+        let annotate = fallback[propagate..]
+            .find("annotate_media_foundation_fallback(")
+            .map(|offset| propagate + offset)
+            .expect("fallback annotation after successful attempt");
+        assert!(attempt < propagate && propagate < annotate);
+
+        let direct = source_section(
+            source,
+            "fn inspect_video_with_ffmpeg_and_checkpoint(",
+            "fn inspect_input_media_canonical_internal(",
+        );
+        assert!(direct.contains("try_inspect_video_with_ffmpeg_and_checkpoint("));
+        assert!(direct.contains("inspection_pipeline_error("));
+    }
+
+    #[test]
+    fn media_foundation_fallback_preserves_sidecar_success_and_failure_provenance() {
+        let mut success = video_inspection_fixture(30);
+        success.tool_source = Some("sidecar".into());
+        success.tool_command = Some("ffmpeg.exe".into());
+        let success = annotate_media_foundation_fallback(success, UiLocale::En);
+
+        assert!(success.ok);
+        assert_eq!(success.tool_source.as_deref(), Some("sidecar"));
+        assert_eq!(success.tool_command.as_deref(), Some("ffmpeg.exe"));
+        assert_eq!(
+            success.fallback_reason_code.as_deref(),
+            Some("media-foundation-failed")
+        );
+        assert_eq!(
+            success.tool_detail,
+            Some(locale::media_foundation_fallback_warning(UiLocale::En))
+        );
+
+        let process_error = PipelineError::ProcessFailed {
+            command: "ffmpeg.exe".into(),
+            exit_code: Some(17),
+            stderr: "Video: h264, yuv420p, 320x240, 30 fps".into(),
+        };
+        let failure = finish_ffmpeg_inspection_result(
+            "input.mp4",
+            UiLocale::En,
+            ffmpeg_inspection_resolution(),
+            Err(process_error),
+        );
+        let failure = annotate_media_foundation_fallback(failure, UiLocale::En);
+
+        assert!(!failure.ok);
+        assert_eq!(failure.tool_source.as_deref(), Some("sidecar"));
+        assert_eq!(failure.tool_command.as_deref(), Some("ffmpeg.exe"));
+        assert_eq!(
+            failure.fallback_reason_code.as_deref(),
+            Some("media-foundation-failed")
+        );
+        assert_eq!(failure.error_code.as_deref(), Some("process-failed"));
+        assert_eq!(failure.reason_code, None);
+        assert_eq!(
+            failure.tool_detail,
+            Some(locale::media_foundation_fallback_attempt_detail(
+                UiLocale::En
+            ))
+        );
+        assert_ne!(
+            failure.tool_detail,
+            Some(locale::media_foundation_fallback_warning(UiLocale::En))
+        );
+        assert_eq!(failure.width, None);
+        assert_eq!(failure.height, None);
+        assert_eq!(failure.codec_name, None);
+    }
+
+    #[test]
+    fn only_windows_mp4_family_extensions_try_media_foundation_first() {
+        for extension in ["mp4", "m4v", "mov"] {
+            assert!(should_try_media_foundation(extension, true));
+            assert!(!should_try_media_foundation(extension, false));
+        }
+        assert!(!should_try_media_foundation("webm", true));
+        assert!(!should_try_media_foundation("webm", false));
+    }
+
+    #[test]
+    fn direct_inspection_sources_never_claim_media_foundation_fallback() {
+        let source = include_str!("lib.rs");
+        for section in [
+            source_section(
+                source,
+                "fn inspect_still_image_metadata_with_checkpoint(",
+                "fn inspect_gif_metadata_internal(",
+            ),
+            source_section(
+                source,
+                "fn inspect_gif_metadata_with_checkpoint(",
+                "fn inspect_apng_metadata_internal(",
+            ),
+            source_section(
+                source,
+                "fn inspect_apng_metadata_with_checkpoint(",
+                "fn parse_duration_hms_to_seconds(",
+            ),
+            source_section(
+                source,
+                "fn try_inspect_mp4_family_with_media_foundation(",
+                "fn inspect_mp4_family_with_fallback_and_checkpoint(",
+            ),
+            source_section(
+                source,
+                "fn finish_ffmpeg_inspection_result(",
+                "fn inspect_video_with_ffmpeg(",
+            ),
+        ] {
+            assert!(section.contains("fallback_reason_code: None"));
+        }
+    }
+
+    #[test]
+    fn nonzero_ffmpeg_result_is_not_parsed_even_when_stderr_looks_valid() {
+        let inspection = finish_ffmpeg_inspection_result(
+            "input.mp4",
+            UiLocale::En,
+            ffmpeg_inspection_resolution(),
+            Err(PipelineError::ProcessFailed {
+                command: "ffmpeg.exe".into(),
+                exit_code: Some(17),
+                stderr: "Duration: 00:00:01.00 Video: h264, yuv420p, 320x240, 30 fps".into(),
+            }),
+        );
+
+        assert!(!inspection.ok);
+        assert_eq!(inspection.error_code.as_deref(), Some("process-failed"));
+        assert_eq!(inspection.format_name, None);
+        assert_eq!(inspection.duration_seconds, None);
+        assert_eq!(inspection.width, None);
+        assert_eq!(inspection.height, None);
+        assert_eq!(inspection.avg_fps, None);
+    }
+
     #[test]
     fn successful_zero_frame_and_selected_underproduction_are_malformed() {
         assert!(matches!(
@@ -6758,7 +7099,7 @@ mod tests {
 
         let inspection = source_section(
             lib_source,
-            "fn inspect_video_with_ffmpeg_and_checkpoint(",
+            "fn try_inspect_video_with_ffmpeg_and_checkpoint(",
             "fn inspect_input_media_canonical_internal(",
         );
         assert!(inspection.contains("run_captured("));
@@ -7797,6 +8138,7 @@ mod tests {
             tool_source: Some("sidecar".into()),
             tool_command: Some("ffmpeg".into()),
             tool_detail: Some("fixture".into()),
+            fallback_reason_code: None,
             format_name: Some("mp4".into()),
             duration_seconds: Some(10.0),
             size_bytes: Some(10),

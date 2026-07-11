@@ -24,6 +24,7 @@ function successfulInspection(
     toolSource: "native",
     toolCommand: null,
     toolDetail: null,
+    fallbackReasonCode: null,
     formatName: "apng",
     durationSeconds: 1,
     sizeBytes: 1024,

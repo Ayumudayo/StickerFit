@@ -160,6 +160,8 @@ export type ToolHealthReport = {
   summary: string;
 };
 
+export type MediaInspectionFallbackReasonCode = "media-foundation-failed";
+
 export type MediaInspection = {
   ok: boolean;
   inputPath: string;
@@ -170,6 +172,7 @@ export type MediaInspection = {
   toolSource: string | null;
   toolCommand: string | null;
   toolDetail: string | null;
+  fallbackReasonCode: MediaInspectionFallbackReasonCode | null;
   formatName: string | null;
   durationSeconds: number | null;
   sizeBytes: number | null;

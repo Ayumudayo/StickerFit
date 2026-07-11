@@ -289,6 +289,22 @@ pub(crate) fn native_video_detail(locale: UiLocale, format_name: &str) -> String
     }
 }
 
+pub(crate) fn media_foundation_fallback_warning(locale: UiLocale) -> String {
+    tr(
+        locale,
+        "Windows Media Foundation could not inspect this file, so StickerFit used the bundled FFmpeg decoder.",
+        "Windows Media Foundation에서 이 파일을 검사하지 못해 StickerFit이 번들 FFmpeg 디코더를 사용했습니다.",
+    )
+}
+
+pub(crate) fn media_foundation_fallback_attempt_detail(locale: UiLocale) -> String {
+    tr(
+        locale,
+        "Windows Media Foundation could not inspect this file, so StickerFit attempted inspection with the bundled FFmpeg decoder.",
+        "Windows Media Foundation에서 이 파일을 검사하지 못해 StickerFit이 번들 FFmpeg 디코더로 검사를 시도했습니다.",
+    )
+}
+
 pub(crate) fn native_png_encode_detail(locale: UiLocale) -> String {
     tr(
         locale,
