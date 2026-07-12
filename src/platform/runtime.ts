@@ -1,5 +1,4 @@
 import type { Locale } from "../locales/messages";
-import mediaOperationCodes from "../types/media-operation-error-codes.json";
 import type {
   MediaInspection,
   MediaInspectionFallbackReasonCode,
@@ -33,12 +32,46 @@ type RawMediaErrorFields = {
   errorMessage?: unknown;
 };
 
-const MEDIA_OPERATION_ERROR_CODES = new Set<string>(
-  mediaOperationCodes.errorCodes,
-);
-const MEDIA_OPERATION_REASON_CODES = new Set<string>(
-  mediaOperationCodes.reasonCodes,
-);
+const MEDIA_OPERATION_ERROR_CODES = {
+  cancelled: true,
+  "timed-out": true,
+  "operation-conflict": true,
+  "invalid-request": true,
+  "source-changed": true,
+  "media-input-too-large": true,
+  "media-dimensions-too-large": true,
+  "media-frame-limit": true,
+  "decoded-byte-limit": true,
+  "png-chunk-limit": true,
+  "malformed-media": true,
+  "malformed-process-output": true,
+  "tool-missing": true,
+  "process-failed": true,
+  "output-conflict": true,
+  "internal-task-failed": true,
+} as const satisfies Record<MediaOperationErrorCode, true>;
+
+const MEDIA_OPERATION_REASON_CODES = {
+  "no-frames-selected": true,
+  "invalid-frame-selection": true,
+  "invalid-frame-duration": true,
+  "duration-too-long": true,
+  "invalid-crop": true,
+  "invalid-output-directory": true,
+  "unsupported-source-format": true,
+  "unsupported-frame-preview": true,
+  "frame-preview-decode-failed": true,
+  "frame-preview-encode-failed": true,
+  "decode-failed": true,
+  "encode-failed": true,
+  "missing-output": true,
+  "plan-invalid": true,
+  "invoke-failed": true,
+} as const satisfies Record<MediaOperationReasonCode, true>;
+
+function hasOwnCode(table: object, value: string) {
+  return Object.prototype.hasOwnProperty.call(table, value);
+}
 
 function isMediaOperationErrorCode(
   value: unknown,
@@ -46,7 +79,7 @@ function isMediaOperationErrorCode(
   return (
     typeof value === "string" &&
     value.length <= 64 &&
-    MEDIA_OPERATION_ERROR_CODES.has(value)
+    hasOwnCode(MEDIA_OPERATION_ERROR_CODES, value)
   );
 }
 
@@ -56,7 +89,7 @@ function isMediaOperationReasonCode(
   return (
     typeof value === "string" &&
     value.length <= 64 &&
-    MEDIA_OPERATION_REASON_CODES.has(value)
+    hasOwnCode(MEDIA_OPERATION_REASON_CODES, value)
   );
 }
 
@@ -182,25 +215,13 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
     rawCode === "tool-unavailable";
 
   if (rawCode !== null && rawCode !== undefined && !rawCodeIsKnown) {
-    let unknownDiagnostics = withLegacyCodeDiagnostic(
-      diagnostics,
-      boundedUnknownValue(rawCode),
-    );
-    if (
-      rawReasonCode !== null &&
-      rawReasonCode !== undefined &&
-      !isMediaOperationReasonCode(rawReasonCode)
-    ) {
-      unknownDiagnostics = withLegacyReasonDiagnostic(
-        unknownDiagnostics,
-        boundedUnknownValue(rawReasonCode),
-      );
-    }
-
     return {
       errorCode: "internal-task-failed",
       reasonCode: null,
-      diagnostics: unknownDiagnostics,
+      diagnostics: withLegacyCodeDiagnostic(
+        null,
+        boundedUnknownValue(rawCode),
+      ),
     };
   }
 
@@ -213,7 +234,7 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
       errorCode: "internal-task-failed",
       reasonCode: null,
       diagnostics: withLegacyReasonDiagnostic(
-        diagnostics,
+        null,
         boundedUnknownValue(rawReasonCode),
       ),
     };

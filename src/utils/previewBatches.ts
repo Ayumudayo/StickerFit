@@ -9,13 +9,10 @@ export type FramePreviewEntry = FramePreviewLoadState;
 
 export type PreviewEntryMap = Map<number, FramePreviewEntry>;
 
-type FramePreviewBatchResult = {
-  ok: boolean;
-  previews: FramePreviewsResult["previews"];
-  errorCode: string | null;
-  reasonCode: string | null;
-  errorMessage: string | null;
-};
+type FramePreviewBatchResult = Pick<
+  FramePreviewsResult,
+  "ok" | "previews" | "errorCode" | "reasonCode" | "errorMessage"
+>;
 
 export type PreviewBatchDescriptor = {
   fingerprint: string;
@@ -127,10 +124,10 @@ function previewErrorEntry(
   };
 
   if (result.errorCode) {
-    entry.errorCode = result.errorCode as NonNullable<typeof entry.errorCode>;
+    entry.errorCode = result.errorCode;
   }
   if (result.reasonCode) {
-    entry.reasonCode = result.reasonCode as NonNullable<typeof entry.reasonCode>;
+    entry.reasonCode = result.reasonCode;
   }
 
   return entry;

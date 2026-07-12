@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { FramePreviewsResult } from "../types/workflow";
+import previewBatchesSource from "./previewBatches.ts?raw";
 import {
   applyFramePreviewBatchResult,
   chunkFramePreviewIds,
@@ -120,27 +121,41 @@ describe("preview entry transitions", () => {
 
   it("preserves backend failure codes and returns a retried error to scheduler demand", () => {
     const loading = markFramePreviewBatchLoading(new Map(), [7], "batch-a");
+    const backendFailure = {
+      ok: false,
+      previews: [],
+      errorCode: "invalid-request",
+      reasonCode: "frame-preview-decode-failed",
+      errorMessage: "decoder failed",
+    } satisfies FramePreviewsResult;
     const failed = applyFramePreviewBatchResult(
       loading,
       [7],
-      {
-        ok: false,
-        previews: [],
-        errorCode: "process-failed",
-        reasonCode: "frame-preview-decode-failed",
-        errorMessage: "decoder failed",
-      },
+      backendFailure,
       "Preview unavailable",
     );
 
     expect(failed.get(7)).toEqual({
       status: "error",
-      errorCode: "process-failed",
+      errorCode: "invalid-request",
       reasonCode: "frame-preview-decode-failed",
       message: "decoder failed",
     });
     expect(filterFramePreviewDemand([7], failed)).toEqual([]);
     expect(filterFramePreviewDemand([7], retryFramePreviewEntry(failed, 7))).toEqual([7]);
+  });
+
+  it("derives preview errors from the closed workflow result without casts", () => {
+    expect(previewBatchesSource).toMatch(
+      /type FramePreviewBatchResult\s*=\s*Pick<\s*FramePreviewsResult,/,
+    );
+    expect(previewBatchesSource).not.toMatch(/errorCode:\s*string\s*\|\s*null/);
+    expect(previewBatchesSource).not.toMatch(/reasonCode:\s*string\s*\|\s*null/);
+    const previewErrorEntrySource = previewBatchesSource.match(
+      /function previewErrorEntry\([\s\S]*?\n\}/,
+    )?.[0];
+    expect(previewErrorEntrySource).toBeDefined();
+    expect(previewErrorEntrySource).not.toMatch(/\bas\b/);
   });
 
   it("excludes ready, loading, and unretried error IDs from active demand", () => {

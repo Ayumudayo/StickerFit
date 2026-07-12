@@ -33,5 +33,46 @@
     "missing-output",
     "plan-invalid",
     "invoke-failed"
+  ],
+  "wireCases": [
+    {
+      "name": "success-null",
+      "wire": {
+        "errorCode": null,
+        "reasonCode": null,
+        "errorMessage": null
+      },
+      "expected": {
+        "errorCode": null,
+        "reasonCode": null,
+        "errorMessage": null
+      }
+    },
+    {
+      "name": "cancelled",
+      "wire": {
+        "errorCode": "cancelled",
+        "reasonCode": null,
+        "errorMessage": "The media operation was cancelled."
+      },
+      "expected": {
+        "errorCode": "cancelled",
+        "reasonCode": null,
+        "errorMessage": "The media operation was cancelled."
+      }
+    },
+    {
+      "name": "invalid-request-invalid-crop",
+      "wire": {
+        "errorCode": "invalid-request",
+        "reasonCode": "invalid-crop",
+        "errorMessage": "Crop selection values must be valid numbers."
+      },
+      "expected": {
+        "errorCode": "invalid-request",
+        "reasonCode": "invalid-crop",
+        "errorMessage": "Crop selection values must be valid numbers."
+      }
+    }
   ]
 }

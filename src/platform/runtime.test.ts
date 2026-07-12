@@ -24,6 +24,7 @@ import {
   normalizeInspectionFallbackReasonCode,
   normalizeInspectionSourceRevision,
 } from "./runtime";
+import runtimeSource from "./runtime.ts?raw";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -84,6 +85,34 @@ function sorted(values: readonly string[]) {
   return [...values].sort();
 }
 
+function hasExhaustiveRuntimeMembershipTable(
+  source: string,
+  tableName: string,
+  codeType: string,
+) {
+  const closedRecord = new RegExp(
+    `const\\s+${tableName}\\s*=\\s*\\{[\\s\\S]*?\\}\\s*as\\s+const\\s+satisfies\\s+Record<\\s*${codeType}\\s*,\\s*true\\s*>`,
+  );
+  const closedTuple = new RegExp(
+    `const\\s+${tableName}\\s*=\\s*\\[[\\s\\S]*?\\]\\s*as\\s+const\\s+satisfies\\s+readonly\\s+${codeType}\\[\\]`,
+  );
+  const tupleCompleteness = new RegExp(
+    `Exclude<\\s*${codeType}\\s*,\\s*\\(typeof\\s+${tableName}\\)\\[number\\]\\s*>\\s+extends\\s+never`,
+  );
+  return (
+    closedRecord.test(source) ||
+    (closedTuple.test(source) && tupleCompleteness.test(source))
+  );
+}
+
+function ownMembershipHelperName(source: string) {
+  return (
+    source.match(
+      /function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{[\s\S]*?(?:Object\.prototype\.hasOwnProperty\.call|Object\.hasOwn)\([\s\S]*?\)[\s\S]*?\}/,
+    )?.[1] ?? null
+  );
+}
+
 describe("canonical media operation errors", () => {
   it("matches the shared JSON fixture in canonical order", () => {
     expect(ERROR_CODES_ARE_COMPLETE).toBe(true);
@@ -108,6 +137,43 @@ describe("canonical media operation errors", () => {
       "PNG 청크 하나가 너무 커서 안전하게 처리할 수 없습니다.",
     );
   });
+
+  it("uses compile-time closed runtime membership instead of trusting the JSON fixture", () => {
+    expect(runtimeSource).not.toContain("media-operation-error-codes.json");
+    expect(runtimeSource).not.toMatch(
+      /new\s+Set(?:<[^>]+>)?\s*\(\s*mediaOperationCodes\.(?:errorCodes|reasonCodes)/,
+    );
+    expect(
+      hasExhaustiveRuntimeMembershipTable(
+        runtimeSource,
+        "MEDIA_OPERATION_ERROR_CODES",
+        "MediaOperationErrorCode",
+      ),
+    ).toBe(true);
+    expect(
+      hasExhaustiveRuntimeMembershipTable(
+        runtimeSource,
+        "MEDIA_OPERATION_REASON_CODES",
+        "MediaOperationReasonCode",
+      ),
+    ).toBe(true);
+    const helperName = ownMembershipHelperName(runtimeSource);
+    expect(helperName).not.toBeNull();
+    const helperCall = helperName ?? "missingOwnMembershipHelper";
+    expect(runtimeSource).toMatch(
+      new RegExp(`${helperCall}\\(\\s*MEDIA_OPERATION_ERROR_CODES\\s*,`),
+    );
+    expect(runtimeSource).toMatch(
+      new RegExp(`${helperCall}\\(\\s*MEDIA_OPERATION_REASON_CODES\\s*,`),
+    );
+  });
+
+  it.each(mediaOperationCodes.wireCases)(
+    "round-trips the shared Rust wire case $name through the runtime decoder",
+    ({ wire, expected }) => {
+      expect(normalizeLegacyMediaResponse(wire)).toEqual(expected);
+    },
+  );
 
   it("passes every canonical category through unchanged", () => {
     for (const errorCode of mediaOperationCodes.errorCodes) {
@@ -158,7 +224,7 @@ describe("canonical media operation errors", () => {
     });
   });
 
-  it("keeps unknown raw values in diagnostics while using the internal category", () => {
+  it("keeps only the bounded raw code marker for an unknown error", () => {
     expect(
       normalizeLegacyMediaError({
         errorCode: "future-backend-code",
@@ -167,7 +233,7 @@ describe("canonical media operation errors", () => {
     ).toEqual({
       errorCode: "internal-task-failed",
       reasonCode: null,
-      diagnostics: "backend diagnostic (legacy code: future-backend-code)",
+      diagnostics: "(legacy code: future-backend-code)",
     });
   });
 
@@ -181,11 +247,11 @@ describe("canonical media operation errors", () => {
     ).toEqual({
       errorCode: "internal-task-failed",
       reasonCode: null,
-      diagnostics: "detail (legacy code: future-backend-code)",
+      diagnostics: "(legacy code: future-backend-code)",
     });
   });
 
-  it("preserves an unknown non-null error code when the reason is also unknown", () => {
+  it("drops an unknown companion reason when the error code is already unknown", () => {
     expect(
       normalizeLegacyMediaError({
         errorCode: "future-backend-code",
@@ -195,8 +261,7 @@ describe("canonical media operation errors", () => {
     ).toEqual({
       errorCode: "internal-task-failed",
       reasonCode: null,
-      diagnostics:
-        "detail (legacy code: future-backend-code) (legacy reason code: future-reason)",
+      diagnostics: "(legacy code: future-backend-code)",
     });
   });
 
@@ -205,7 +270,7 @@ describe("canonical media operation errors", () => {
       normalizeLegacyMediaError({
         errorCode: null,
         reasonCode: "future-reason",
-        errorMessage: null,
+        errorMessage: "untrusted backend diagnostic",
       }),
     ).toEqual({
       errorCode: "internal-task-failed",
@@ -224,7 +289,7 @@ describe("canonical media operation errors", () => {
     ).toEqual({
       errorCode: "internal-task-failed",
       reasonCode: null,
-      diagnostics: "backend diagnostic (legacy reason code: future-reason)",
+      diagnostics: "(legacy reason code: future-reason)",
     });
   });
 
@@ -253,7 +318,7 @@ describe("canonical media operation errors", () => {
     });
   });
 
-  it("bounds and safely escapes hostile diagnostics while preserving legacy evidence", () => {
+  it("bounds and redacts raw unknown markers without retaining companion diagnostics", () => {
     const normalized = normalizeLegacyMediaError({
       errorCode: "future\ncode/C:\\Users\\Alice\\secret-input.mp4",
       reasonCode: "future\u001b\u009b-reason",
@@ -262,17 +327,15 @@ describe("canonical media operation errors", () => {
 
     expect(normalized.errorCode).toBe("internal-task-failed");
     expect(normalized.reasonCode).toBeNull();
-    expect(normalized.diagnostics).toContain("[path redacted]");
-    expect(normalized.diagnostics).toContain("legacy code: [path-redacted]");
-    expect(normalized.diagnostics).toContain(
-      "legacy reason code: future\\u{001b}\\u{009b}-reason",
-    );
+    expect(normalized.diagnostics).toBe("(legacy code: [path-redacted])");
+    expect(normalized.diagnostics).not.toContain("legacy reason code:");
+    expect(normalized.diagnostics).not.toContain("failed at");
     expect(normalized.diagnostics).not.toContain("Users");
     expect(normalized.diagnostics).not.toContain("Alice");
     expect(normalized.diagnostics).not.toContain("secret-input.mp4");
     expect(normalized.diagnostics).not.toContain("\u001b");
     expect(normalized.diagnostics).not.toContain("\u009b");
-    expect(normalized.diagnostics!.length).toBeLessThan(900);
+    expect(normalized.diagnostics!.length).toBeLessThan(300);
 
     const pathReason = normalizeLegacyMediaError({
       errorCode: "invalid-request",
@@ -401,7 +464,7 @@ describe("canonical media operation errors", () => {
     expect(normalizeLegacyMediaError(nullPrototypeFields)).toEqual({
       errorCode: "internal-task-failed",
       reasonCode: null,
-      diagnostics: "safe detail (legacy code: future-code)",
+      diagnostics: "(legacy code: future-code)",
     });
 
     const hostileCoercion = {
@@ -447,7 +510,7 @@ describe("canonical media operation errors", () => {
     });
     expect(largeStringResult.errorCode).toBe("internal-task-failed");
     expect(largeStringResult.reasonCode).toBeNull();
-    expect(largeStringResult.diagnostics!.length).toBeLessThan(700);
+    expect(largeStringResult.diagnostics!.length).toBeLessThan(300);
     expect(largeStringResult.diagnostics).not.toContain(
       veryLargeString.slice(-1_000),
     );

@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -13,7 +13,6 @@ use crate::media_error::PipelineError;
 use crate::operation::OperationContext;
 
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const CALLER_CLEANUP_GRACE: Duration = Duration::from_millis(500);
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -115,6 +114,7 @@ enum FrameEvent {
     Frame(Vec<u8>),
     Eof(Vec<u8>),
     ReadError(String),
+    PipelineError(PipelineError),
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -125,11 +125,6 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn as_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn frame_buffer_count(frame_size: usize, max_frames: usize, decoded_limit: usize) -> usize {
-    let cap_limited_frames = decoded_limit.checked_div(frame_size).unwrap_or(0).max(1);
-    3.min(max_frames).min(cap_limited_frames)
 }
 
 fn io_pipeline_error(operation: &'static str, error: impl ToString) -> PipelineError {
@@ -249,12 +244,20 @@ where
     })
 }
 
+fn allocate_frame_buffer(frame_size: usize) -> Result<Vec<u8>, PipelineError> {
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(frame_size)
+        .map_err(|error| io_pipeline_error("allocate child stdout frame", error))?;
+    Ok(frame)
+}
+
 fn spawn_frame_reader<R>(
     mut reader: R,
     frame_size: usize,
     mut frame: Vec<u8>,
     frame_sender: SyncSender<FrameEvent>,
-    recycle_receiver: Receiver<Vec<u8>>,
+    acknowledgement_receiver: Receiver<()>,
 ) -> io::Result<JoinHandle<()>>
 where
     R: Read + Send + 'static,
@@ -283,9 +286,15 @@ where
                 if frame_sender.send(FrameEvent::Frame(frame)).is_err() {
                     return;
                 }
-                frame = match recycle_receiver.recv() {
+                if acknowledgement_receiver.recv().is_err() {
+                    return;
+                }
+                frame = match allocate_frame_buffer(frame_size) {
                     Ok(frame) => frame,
-                    Err(_) => return,
+                    Err(error) => {
+                        let _ = frame_sender.send(FrameEvent::PipelineError(error));
+                        return;
+                    }
                 };
             }
         })
@@ -296,106 +305,79 @@ fn poll_child_status<C: ChildLifecycle>(
     status: &mut Option<ObservedExit>,
 ) -> Result<(), PipelineError> {
     if status.is_none() {
-        *status = child
-            .try_wait_exit()
-            .map_err(|error| io_pipeline_error("poll child process", error))?;
+        match child.try_wait_exit() {
+            Ok(observed) => *status = observed,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(io_pipeline_error("poll child process", error)),
+        }
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminationPoll {
-    Reaped(ObservedExit),
-    Pending,
-}
-
-fn poll_termination<C: ChildLifecycle>(
-    child: &mut C,
-    status: &mut Option<ObservedExit>,
-    kill_requested: &mut bool,
-    last_error: &mut Option<String>,
-) -> TerminationPoll {
-    match child.try_wait_exit() {
-        Ok(Some(observed)) => {
-            *status = Some(observed);
-            return TerminationPoll::Reaped(observed);
-        }
-        Ok(None) => {}
-        Err(error) => *last_error = Some(error.to_string()),
-    }
-
-    if !*kill_requested {
-        match child.kill_child() {
-            Ok(()) => *kill_requested = true,
-            Err(error) => *last_error = Some(error.to_string()),
-        }
-    }
-    TerminationPoll::Pending
 }
 
 fn join_reader(
     handle: JoinHandle<()>,
     operation: &'static str,
-    primary: &mut Option<PipelineError>,
+    cleanup_error: &mut Option<PipelineError>,
 ) {
-    if handle.join().is_err() && primary.is_none() {
-        *primary = Some(io_pipeline_error(operation, "reader thread panicked"));
+    if handle.join().is_err() && cleanup_error.is_none() {
+        *cleanup_error = Some(io_pipeline_error(operation, "reader thread panicked"));
     }
 }
 
-struct DeferredCleanup<C: ChildLifecycle> {
-    child: Option<C>,
-    stdout_reader: Option<JoinHandle<()>>,
-    stderr_reader: Option<JoinHandle<()>>,
+fn retain_cleanup_error(
+    cleanup_error: &mut Option<PipelineError>,
+    operation: &'static str,
+    error: impl ToString,
+) {
+    if cleanup_error.is_none() {
+        *cleanup_error = Some(io_pipeline_error(operation, error));
+    }
 }
 
-fn run_deferred_cleanup<C: ChildLifecycle>(mut cleanup: DeferredCleanup<C>) {
-    if let Some(mut child) = cleanup.child.take() {
-        loop {
-            match child.try_wait_exit() {
-                Ok(Some(_)) => break,
-                Ok(None) | Err(_) => match child.kill_child() {
-                    Ok(()) => match child.wait_exit() {
-                        Ok(_) => break,
-                        Err(_) => thread::sleep(CONTROL_POLL_INTERVAL),
-                    },
-                    Err(_) => thread::sleep(CONTROL_POLL_INTERVAL),
-                },
+fn reap_child_synchronously<C: ChildLifecycle>(child: &mut C, status: &mut Option<ObservedExit>) {
+    while status.is_none() {
+        match child.try_wait_exit() {
+            Ok(Some(observed)) => {
+                *status = Some(observed);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                thread::sleep(CONTROL_POLL_INTERVAL);
+                continue;
+            }
+        }
+
+        match child.kill_child() {
+            Ok(()) => loop {
+                match child.wait_exit() {
+                    Ok(observed) => {
+                        *status = Some(observed);
+                        break;
+                    }
+                    Err(_) => {
+                        thread::sleep(CONTROL_POLL_INTERVAL);
+                    }
+                }
+            },
+            Err(_) => {
+                thread::sleep(CONTROL_POLL_INTERVAL);
             }
         }
     }
-
-    if let Some(handle) = cleanup.stdout_reader.take() {
-        let _ = handle.join();
-    }
-    if let Some(handle) = cleanup.stderr_reader.take() {
-        let _ = handle.join();
-    }
-}
-
-fn spawn_deferred_cleanup<C: ChildLifecycle>(cleanup: DeferredCleanup<C>) -> io::Result<()> {
-    thread::Builder::new()
-        .name("stickerfit-deferred-process-cleanup".into())
-        .spawn(move || run_deferred_cleanup(cleanup))
-        .map(|handle| drop(handle))
 }
 
 struct CleanupResult {
     status: Option<ObservedExit>,
-    primary: Option<PipelineError>,
+    cleanup_error: Option<PipelineError>,
 }
 
-fn finish_reader_cleanup(
-    primary: Option<PipelineError>,
-    readers_deferred: bool,
+fn select_process_primary(
+    existing: Option<PipelineError>,
+    observed_nonzero: Option<PipelineError>,
+    cleanup_error: Option<PipelineError>,
 ) -> Option<PipelineError> {
-    match (primary, readers_deferred) {
-        (None, true) => Some(io_pipeline_error(
-            "finish child process readers",
-            "reader threads exceeded the caller cleanup grace period",
-        )),
-        (primary, _) => primary,
-    }
+    existing.or(observed_nonzero).or(cleanup_error)
 }
 
 fn cleanup_child_and_readers<C: ChildLifecycle>(
@@ -403,72 +385,21 @@ fn cleanup_child_and_readers<C: ChildLifecycle>(
     mut status: Option<ObservedExit>,
     mut stdout_reader: Option<JoinHandle<()>>,
     mut stderr_reader: Option<JoinHandle<()>>,
-    mut primary: Option<PipelineError>,
 ) -> CleanupResult {
-    let started = Instant::now();
-    let deadline = started.checked_add(CALLER_CLEANUP_GRACE).unwrap_or(started);
-    let mut kill_requested = false;
-    let mut last_error = None;
+    let mut cleanup_error = None;
+    reap_child_synchronously(&mut child, &mut status);
 
-    loop {
-        if status.is_none() {
-            let _ = poll_termination(
-                &mut child,
-                &mut status,
-                &mut kill_requested,
-                &mut last_error,
-            );
-        }
-
-        if stdout_reader
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            join_reader(
-                stdout_reader.take().expect("finished stdout reader"),
-                "join child stdout reader",
-                &mut primary,
-            );
-        }
-        if stderr_reader
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            join_reader(
-                stderr_reader.take().expect("finished stderr reader"),
-                "join child stderr reader",
-                &mut primary,
-            );
-        }
-
-        if status.is_some() && stdout_reader.is_none() && stderr_reader.is_none() {
-            return CleanupResult { status, primary };
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        thread::sleep(CONTROL_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    if let Some(handle) = stdout_reader.take() {
+        join_reader(handle, "join child stdout reader", &mut cleanup_error);
+    }
+    if let Some(handle) = stderr_reader.take() {
+        join_reader(handle, "join child stderr reader", &mut cleanup_error);
     }
 
-    let readers_deferred = stdout_reader.is_some() || stderr_reader.is_some();
-    let cleanup = DeferredCleanup {
-        child: status.is_none().then_some(child),
-        stdout_reader,
-        stderr_reader,
-    };
-    if let Err(error) = spawn_deferred_cleanup(cleanup) {
-        if primary.is_none() {
-            let detail = last_error
-                .map(|last_error| format!("{error}; last cleanup error: {last_error}"))
-                .unwrap_or_else(|| error.to_string());
-            primary = Some(io_pipeline_error("start deferred process cleanup", detail));
-        }
+    CleanupResult {
+        status,
+        cleanup_error,
     }
-    primary = finish_reader_cleanup(primary, readers_deferred);
-
-    CleanupResult { status, primary }
 }
 
 fn latch_nonzero(status: Option<ObservedExit>, pending_nonzero: &mut Option<ObservedExit>) -> bool {
@@ -479,31 +410,6 @@ fn latch_nonzero(status: Option<ObservedExit>, pending_nonzero: &mut Option<Obse
         *pending_nonzero = Some(status);
     }
     true
-}
-
-fn recycle_frame(
-    sender: &SyncSender<Vec<u8>>,
-    mut frame: Vec<u8>,
-    started: Instant,
-    timeout: Duration,
-    context: &OperationContext,
-) -> Result<(), PipelineError> {
-    loop {
-        context.checkpoint()?;
-        if started.elapsed() >= timeout {
-            return Err(PipelineError::TimedOut {
-                stage: "child-process",
-            });
-        }
-        match sender.try_send(frame) {
-            Ok(()) => return Ok(()),
-            Err(TrySendError::Full(returned)) => {
-                frame = returned;
-                thread::sleep(CONTROL_POLL_INTERVAL);
-            }
-            Err(TrySendError::Disconnected(_)) => return Ok(()),
-        }
-    }
 }
 
 fn captured_guard(
@@ -557,8 +463,9 @@ pub(crate) fn run_captured(
                 "capture child stdout",
                 "child stdout pipe was unavailable",
             ));
-            let cleanup = cleanup_child_and_readers(child, None, None, None, primary);
-            return Err(cleanup.primary.expect("missing stdout primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, None, None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("missing stdout primary error"));
         }
     };
     let stderr = match child.stderr.take() {
@@ -569,8 +476,9 @@ pub(crate) fn run_captured(
                 "capture child stderr",
                 "child stderr pipe was unavailable",
             ));
-            let cleanup = cleanup_child_and_readers(child, None, None, None, primary);
-            return Err(cleanup.primary.expect("missing stderr primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, None, None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("missing stderr primary error"));
         }
     };
     let stdout_state = Arc::new(Mutex::new(BoundedReaderState::new(limits.max_stdout_bytes)));
@@ -585,8 +493,9 @@ pub(crate) fn run_captured(
         Err(error) => {
             drop(stderr);
             let primary = Some(io_pipeline_error("start child stdout reader", error));
-            let cleanup = cleanup_child_and_readers(child, None, None, None, primary);
-            return Err(cleanup.primary.expect("stdout reader primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, None, None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("stdout reader primary error"));
         }
     };
     let stderr_handle = match spawn_bounded_reader(
@@ -598,9 +507,9 @@ pub(crate) fn run_captured(
         Ok(handle) => handle,
         Err(error) => {
             let primary = Some(io_pipeline_error("start child stderr reader", error));
-            let cleanup =
-                cleanup_child_and_readers(child, None, Some(stdout_handle), None, primary);
-            return Err(cleanup.primary.expect("stderr reader primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, Some(stdout_handle), None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("stderr reader primary error"));
         }
     };
 
@@ -673,32 +582,40 @@ pub(crate) fn run_captured(
 
     let CleanupResult {
         status,
-        primary: cleanup_primary,
-    } = cleanup_child_and_readers(
-        child,
-        status,
-        Some(stdout_handle),
-        Some(stderr_handle),
-        primary,
-    );
-    primary = cleanup_primary;
+        mut cleanup_error,
+    } = cleanup_child_and_readers(child, status, Some(stdout_handle), Some(stderr_handle));
+    let nonzero_was_observed =
+        pending_nonzero.is_some() || status.is_some_and(|status| !status.success());
     if primary.is_none() {
-        primary = captured_guard(&stdout_state, &stderr_state, limits);
+        if let Some(reader_error) = captured_guard(&stdout_state, &stderr_state, limits) {
+            if nonzero_was_observed {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(reader_error);
+                }
+            } else {
+                primary = Some(reader_error);
+            }
+        }
     }
-    if let Some(error) = primary {
-        return Err(error);
-    }
-
-    let status = status.ok_or_else(|| {
-        io_pipeline_error(
-            "wait for child process",
-            "child status was unavailable after reader completion",
-        )
-    })?;
     let stdout = std::mem::take(&mut lock_unpoisoned(&stdout_state).bytes);
     let stderr = std::mem::take(&mut lock_unpoisoned(&stderr_state).bytes);
-    if let Some(nonzero) = pending_nonzero.or_else(|| (!status.success()).then_some(status)) {
-        return Err(process_failed(program, nonzero, &stderr));
+    let status = match status {
+        Some(status) => status,
+        None => {
+            retain_cleanup_error(
+                &mut cleanup_error,
+                "wait for child process",
+                "child status was unavailable after synchronous cleanup",
+            );
+            return Err(select_process_primary(primary, None, cleanup_error)
+                .expect("missing child status error"));
+        }
+    };
+    let observed_nonzero = pending_nonzero
+        .or_else(|| (!status.success()).then_some(status))
+        .map(|nonzero| process_failed(program, nonzero, &stderr));
+    if let Some(error) = select_process_primary(primary, observed_nonzero, cleanup_error) {
+        return Err(error);
     }
     Ok(CapturedProcess { stdout, stderr })
 }
@@ -770,6 +687,7 @@ fn prepare_stream_event(
             Ok(PreparedStreamEvent::Eof(partial))
         }
         Some(FrameEvent::ReadError(error)) => Err(io_pipeline_error("read child stdout", error)),
+        Some(FrameEvent::PipelineError(error)) => Err(error),
         None => Ok(PreparedStreamEvent::Idle),
     }
 }
@@ -784,7 +702,7 @@ pub(crate) fn stream_fixed_rgba_frames<F>(
     mut on_frame: F,
 ) -> Result<FrameStreamSummary, PipelineError>
 where
-    F: FnMut(&[u8]) -> Result<(), PipelineError>,
+    F: FnMut(Vec<u8>) -> Result<(), PipelineError>,
 {
     context.checkpoint()?;
     if frame_size == 0 || max_frames == 0 {
@@ -812,18 +730,7 @@ where
             stage: "child-process",
         });
     }
-    let buffer_count = frame_buffer_count(frame_size, max_frames, decoded_limit);
-    let mut frame_buffers = Vec::with_capacity(buffer_count);
-    for _ in 0..buffer_count {
-        let mut frame = Vec::new();
-        frame
-            .try_reserve_exact(frame_size)
-            .map_err(|error| io_pipeline_error("allocate child stdout frame", error))?;
-        frame_buffers.push(frame);
-    }
-    let initial_frame = frame_buffers
-        .pop()
-        .expect("validated frame buffer count is positive");
+    let initial_frame = allocate_frame_buffer(frame_size)?;
     let started = Instant::now();
     let mut child = spawn_managed_child(program, args)?;
     let stdout = match child.stdout.take() {
@@ -833,8 +740,9 @@ where
                 "stream child stdout",
                 "child stdout pipe was unavailable",
             ));
-            let cleanup = cleanup_child_and_readers(child, None, None, None, primary);
-            return Err(cleanup.primary.expect("missing stdout primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, None, None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("missing stdout primary error"));
         }
     };
     let stderr = match child.stderr.take() {
@@ -845,31 +753,30 @@ where
                 "capture child stderr",
                 "child stderr pipe was unavailable",
             ));
-            let cleanup = cleanup_child_and_readers(child, None, None, None, primary);
-            return Err(cleanup.primary.expect("missing stderr primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, None, None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("missing stderr primary error"));
         }
     };
 
-    let (frame_sender, frame_receiver) = mpsc::sync_channel::<FrameEvent>(2);
-    let (recycle_sender, recycle_receiver) = mpsc::sync_channel::<Vec<u8>>(2);
-    for frame in frame_buffers {
-        recycle_sender.send(frame).expect("empty recycle channel");
-    }
+    let (frame_sender, frame_receiver) = mpsc::sync_channel::<FrameEvent>(0);
+    let (acknowledgement_sender, acknowledgement_receiver) = mpsc::sync_channel::<()>(0);
     let stdout_handle = match spawn_frame_reader(
         stdout,
         frame_size,
         initial_frame,
         frame_sender,
-        recycle_receiver,
+        acknowledgement_receiver,
     ) {
         Ok(handle) => handle,
         Err(error) => {
             drop(frame_receiver);
-            drop(recycle_sender);
+            drop(acknowledgement_sender);
             drop(stderr);
             let primary = Some(io_pipeline_error("start child stdout reader", error));
-            let cleanup = cleanup_child_and_readers(child, None, None, None, primary);
-            return Err(cleanup.primary.expect("stdout reader primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, None, None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("stdout reader primary error"));
         }
     };
     let stderr_state = Arc::new(Mutex::new(PrefixReaderState::new(limits.max_stderr_bytes)));
@@ -882,11 +789,11 @@ where
         Ok(handle) => handle,
         Err(error) => {
             drop(frame_receiver);
-            drop(recycle_sender);
+            drop(acknowledgement_sender);
             let primary = Some(io_pipeline_error("start child stderr reader", error));
-            let cleanup =
-                cleanup_child_and_readers(child, None, Some(stdout_handle), None, primary);
-            return Err(cleanup.primary.expect("stderr reader primary error"));
+            let cleanup = cleanup_child_and_readers(child, None, Some(stdout_handle), None);
+            return Err(select_process_primary(primary, None, cleanup.cleanup_error)
+                .expect("stderr reader primary error"));
         }
     };
 
@@ -984,21 +891,38 @@ where
 
         match prepared_event {
             PreparedStreamEvent::Frame {
-                mut frame,
+                frame,
                 next_count,
                 next_bytes,
             } => {
-                if let Err(error) = on_frame(&frame) {
-                    primary = Some(error);
-                    break;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_frame(frame))) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        primary = Some(error);
+                        break;
+                    }
+                    Err(_) => {
+                        primary = Some(io_pipeline_error(
+                            "stream frame callback",
+                            "callback panicked",
+                        ));
+                        break;
+                    }
                 }
                 frame_count = next_count;
                 decoded_bytes = next_bytes;
-                frame.clear();
-                if let Err(error) =
-                    recycle_frame(&recycle_sender, frame, started, limits.timeout, context)
-                {
+                if let Err(error) = context.checkpoint() {
                     primary = Some(error);
+                    break;
+                }
+                if started.elapsed() >= limits.timeout {
+                    primary = Some(PipelineError::TimedOut {
+                        stage: "child-process",
+                    });
+                    break;
+                }
+                if let Err(error) = acknowledgement_sender.send(()) {
+                    primary = Some(io_pipeline_error("acknowledge child stdout frame", error));
                     break;
                 }
             }
@@ -1021,36 +945,43 @@ where
     }
 
     drop(frame_receiver);
-    drop(recycle_sender);
+    drop(acknowledgement_sender);
     let CleanupResult {
         status,
-        primary: cleanup_primary,
-    } = cleanup_child_and_readers(
-        child,
-        status,
-        Some(stdout_handle),
-        Some(stderr_handle),
-        primary,
-    );
-    primary = cleanup_primary;
+        mut cleanup_error,
+    } = cleanup_child_and_readers(child, status, Some(stdout_handle), Some(stderr_handle));
+    let nonzero_was_observed =
+        pending_nonzero.is_some() || status.is_some_and(|status| !status.success());
     if primary.is_none() {
         if let Some(error) = lock_unpoisoned(&stderr_state).error.clone() {
-            primary = Some(io_pipeline_error("read child stderr", error));
+            let reader_error = io_pipeline_error("read child stderr", error);
+            if nonzero_was_observed {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(reader_error);
+                }
+            } else {
+                primary = Some(reader_error);
+            }
         }
     }
-    if let Some(error) = primary {
-        return Err(error);
-    }
-
-    let status = status.ok_or_else(|| {
-        io_pipeline_error(
-            "wait for child process",
-            "child status was unavailable after reader completion",
-        )
-    })?;
     let stderr = std::mem::take(&mut lock_unpoisoned(&stderr_state).bytes);
-    if let Some(nonzero) = pending_nonzero.or_else(|| (!status.success()).then_some(status)) {
-        return Err(process_failed(program, nonzero, &stderr));
+    let status = match status {
+        Some(status) => status,
+        None => {
+            retain_cleanup_error(
+                &mut cleanup_error,
+                "wait for child process",
+                "child status was unavailable after synchronous cleanup",
+            );
+            return Err(select_process_primary(primary, None, cleanup_error)
+                .expect("missing child status error"));
+        }
+    };
+    let observed_nonzero = pending_nonzero
+        .or_else(|| (!status.success()).then_some(status))
+        .map(|nonzero| process_failed(program, nonzero, &stderr));
+    if let Some(error) = select_process_primary(primary, observed_nonzero, cleanup_error) {
+        return Err(error);
     }
     Ok(FrameStreamSummary { frame_count })
 }
@@ -1062,7 +993,7 @@ mod tests {
     use std::io::{self, Write};
     use std::path::PathBuf;
     use std::process;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1071,8 +1002,8 @@ mod tests {
     use crate::operation::OperationContext;
 
     use super::{
-        run_captured, stream_fixed_rgba_frames, ChildLifecycle, ObservedExit, ProcessLimits,
-        TerminationPoll,
+        lock_unpoisoned, run_captured, stream_fixed_rgba_frames, ChildLifecycle, ObservedExit,
+        ProcessLimits,
     };
 
     const FIXTURE_ENTRY: &str = "process_runner::tests::fixture_entry";
@@ -1088,27 +1019,82 @@ mod tests {
 
     static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
+    #[derive(Clone, Default)]
+    struct ChildAudit {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        reaped: Arc<AtomicBool>,
+        reader_releases: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
+    }
+
+    impl ChildAudit {
+        fn record(&self, event: &'static str) {
+            lock_unpoisoned(&self.events).push(event);
+        }
+
+        fn mark_reaped(&self) {
+            if self.reaped.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            self.record("reaped");
+            for sender in lock_unpoisoned(&self.reader_releases).drain(..) {
+                let _ = sender.send(());
+            }
+        }
+
+        fn spawn_reader(&self, event: &'static str) -> thread::JoinHandle<()> {
+            let (release_sender, release_receiver) = mpsc::channel();
+            lock_unpoisoned(&self.reader_releases).push(release_sender);
+            let audit = self.clone();
+            thread::spawn(
+                move || match release_receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) => audit.record(event),
+                    Err(_) => audit.record("reader-finished-before-reap"),
+                },
+            )
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            lock_unpoisoned(&self.events).clone()
+        }
+    }
+
     #[derive(Default)]
     struct ScriptedChild {
         polls: VecDeque<io::Result<Option<ObservedExit>>>,
         kills: VecDeque<io::Result<()>>,
+        waits: VecDeque<io::Result<ObservedExit>>,
         kill_calls: usize,
         wait_calls: usize,
+        audit: ChildAudit,
     }
 
     impl ChildLifecycle for ScriptedChild {
         fn try_wait_exit(&mut self) -> io::Result<Option<ObservedExit>> {
-            self.polls.pop_front().unwrap_or(Ok(None))
+            self.audit.record("try-wait");
+            let result = self.polls.pop_front().unwrap_or(Ok(None));
+            if let Ok(Some(_)) = result.as_ref() {
+                self.audit.mark_reaped();
+            }
+            result
         }
 
         fn kill_child(&mut self) -> io::Result<()> {
             self.kill_calls += 1;
+            self.audit.record("kill");
             self.kills.pop_front().unwrap_or(Ok(()))
         }
 
         fn wait_exit(&mut self) -> io::Result<ObservedExit> {
             self.wait_calls += 1;
-            panic!("caller-side cleanup must never use blocking wait")
+            self.audit.record("wait");
+            let result = self
+                .waits
+                .pop_front()
+                .unwrap_or_else(|| Ok(observed_exit(0)));
+            if result.is_ok() {
+                self.audit.mark_reaped();
+            }
+            result
         }
     }
 
@@ -1117,6 +1103,35 @@ mod tests {
             success: code == 0,
             exit_code: Some(code),
         }
+    }
+
+    fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("section start");
+        let end = source[start..]
+            .find(end)
+            .map(|offset| start + offset)
+            .expect("section end");
+        &source[start..end]
+    }
+
+    fn assert_reap_precedes_reader_completion(audit: &ChildAudit) {
+        let events = audit.events();
+        let reaped = events
+            .iter()
+            .position(|event| *event == "reaped")
+            .expect("child must be observed reaped");
+        let stdout = events
+            .iter()
+            .position(|event| *event == "stdout-reader-finished")
+            .expect("stdout reader must finish");
+        let stderr = events
+            .iter()
+            .position(|event| *event == "stderr-reader-finished")
+            .expect("stderr reader must finish");
+
+        assert!(reaped < stdout);
+        assert!(reaped < stderr);
+        assert!(!events.contains(&"reader-finished-before-reap"));
     }
 
     struct EnvironmentScope {
@@ -1643,6 +1658,40 @@ mod tests {
     }
 
     #[test]
+    fn callback_panic_becomes_a_typed_error_after_synchronous_cleanup() {
+        const FRAME_SIZE: usize = 64;
+        let mut session = FixtureSession::start();
+        session.configure_payload("frames-hang", FRAME_SIZE * 16);
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stream_fixed_rgba_frames(
+                session.program.as_os_str(),
+                &session.args,
+                FRAME_SIZE,
+                16,
+                capture_limits(Duration::from_secs(5), FRAME_SIZE * 16, ONE_MIB),
+                &session.context(Duration::from_secs(5)),
+                |_| -> Result<(), PipelineError> {
+                    panic!("secret callback panic payload must not escape")
+                },
+            )
+        }));
+
+        assert!(
+            outcome.is_ok(),
+            "callback panic must not unwind past the runner"
+        );
+        assert_eq!(
+            outcome.expect("panic boundary result"),
+            Err(PipelineError::Io {
+                operation: "stream frame callback",
+                message: "callback panicked".into(),
+            })
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn streaming_silent_child_uses_watchdog_timeout_and_reaps() {
         let mut session = FixtureSession::start();
         session.environment.set(FIXTURE_MODE, "silent-hang");
@@ -1709,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_two_stream_cancellation_joins_reader_after_blocked_callback() {
+    fn owned_handshake_blocks_frame_two_until_the_first_callback_returns() {
         const FRAME_SIZE: usize = 64;
         const FRAME_COUNT: usize = 4096;
         let mut session = FixtureSession::start();
@@ -1743,8 +1792,13 @@ mod tests {
         entered_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("first callback must start");
-        cancellation.cancel();
         thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            callback_count.load(Ordering::SeqCst),
+            1,
+            "the reader must not advance while the owned frame awaits acknowledgement"
+        );
+        cancellation.cancel();
         let released_at = Instant::now();
         release_tx.send(()).expect("release callback");
         let result = worker.join().expect("stream worker join");
@@ -1836,120 +1890,188 @@ mod tests {
     }
 
     #[test]
-    fn frame_buffer_pool_never_reserves_more_full_frames_than_the_work_can_use() {
-        assert_eq!(
-            super::frame_buffer_count(160 * ONE_MIB, 1, 160 * ONE_MIB),
-            1
-        );
-        assert_eq!(super::frame_buffer_count(64, 2, 128), 2);
-        assert_eq!(super::frame_buffer_count(64, 4096, 64 * 4096), 3);
-        assert_eq!(super::frame_buffer_count(64, 4096, 31), 1);
+    fn timeout_cancel_and_callback_error_return_only_after_reap_and_reader_joins() {
+        let primaries = [
+            PipelineError::TimedOut {
+                stage: "child-process",
+            },
+            PipelineError::Cancelled,
+            PipelineError::Io {
+                operation: "stream frame callback",
+                message: "callback rejected frame".into(),
+            },
+        ];
+
+        for expected in primaries {
+            let audit = ChildAudit::default();
+            let stdout_reader = audit.spawn_reader("stdout-reader-finished");
+            let stderr_reader = audit.spawn_reader("stderr-reader-finished");
+            let child = ScriptedChild {
+                polls: VecDeque::from([Ok(None)]),
+                kills: VecDeque::from([Ok(())]),
+                waits: VecDeque::from([Ok(observed_exit(0))]),
+                audit: audit.clone(),
+                ..ScriptedChild::default()
+            };
+
+            let cleanup = super::cleanup_child_and_readers(
+                child,
+                None,
+                Some(stdout_reader),
+                Some(stderr_reader),
+            );
+            let selected =
+                super::select_process_primary(Some(expected.clone()), None, cleanup.cleanup_error);
+
+            assert_eq!(cleanup.status, Some(observed_exit(0)));
+            assert_eq!(selected, Some(expected));
+            assert!(audit.reaped.load(Ordering::SeqCst));
+            assert_reap_precedes_reader_completion(&audit);
+        }
     }
 
     #[test]
-    fn kill_failure_policy_retries_without_caller_side_blocking_wait() {
-        let expected_exit = observed_exit(0);
-        let mut child = ScriptedChild {
-            polls: VecDeque::from([Ok(None), Ok(Some(expected_exit))]),
-            kills: VecDeque::from([Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "scripted kill failure",
-            ))]),
+    fn transient_try_wait_failure_retries_until_reaped() {
+        let audit = ChildAudit::default();
+        let stdout_reader = audit.spawn_reader("stdout-reader-finished");
+        let stderr_reader = audit.spawn_reader("stderr-reader-finished");
+        let child = ScriptedChild {
+            polls: VecDeque::from([
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "transient try-wait failure",
+                )),
+                Ok(None),
+            ]),
+            kills: VecDeque::from([Ok(())]),
+            waits: VecDeque::from([Ok(observed_exit(0))]),
+            audit: audit.clone(),
             ..ScriptedChild::default()
         };
-        let mut status = None;
-        let mut kill_requested = false;
-        let mut last_error = None;
 
-        assert_eq!(
-            super::poll_termination(
-                &mut child,
-                &mut status,
-                &mut kill_requested,
-                &mut last_error,
-            ),
-            TerminationPoll::Pending
-        );
-        assert!(!kill_requested);
-        assert_eq!(child.kill_calls, 1);
-        assert_eq!(child.wait_calls, 0);
-        assert!(last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("scripted kill failure")));
+        let cleanup =
+            super::cleanup_child_and_readers(child, None, Some(stdout_reader), Some(stderr_reader));
+        let events = audit.events();
 
-        assert_eq!(
-            super::poll_termination(
-                &mut child,
-                &mut status,
-                &mut kill_requested,
-                &mut last_error,
-            ),
-            TerminationPoll::Reaped(expected_exit)
-        );
-        assert_eq!(status, Some(expected_exit));
-        assert_eq!(child.wait_calls, 0);
+        assert_eq!(cleanup.status, Some(observed_exit(0)));
+        assert!(events.iter().filter(|event| **event == "try-wait").count() >= 2);
+        assert_reap_precedes_reader_completion(&audit);
     }
 
     #[test]
-    fn caller_cleanup_is_bounded_and_only_deferred_cleanup_may_block_waiting() {
-        let source = include_str!("process_runner.rs");
-        let caller_start = source
-            .find("fn cleanup_child_and_readers")
-            .expect("caller cleanup source");
-        let caller_end = source[caller_start..]
-            .find("fn captured_guard")
-            .map(|offset| caller_start + offset)
-            .expect("caller cleanup end");
-        let caller = &source[caller_start..caller_end];
-        let deferred_start = source
-            .find("fn run_deferred_cleanup")
-            .expect("deferred cleanup source");
-        let deferred_end = source[deferred_start..]
-            .find("fn cleanup_child_and_readers")
-            .map(|offset| deferred_start + offset)
-            .expect("deferred cleanup end");
-        let deferred = &source[deferred_start..deferred_end];
-        let blocking_wait = [".", "wait_exit("].concat();
+    fn transient_kill_failure_retries_until_reaped() {
+        let audit = ChildAudit::default();
+        let stdout_reader = audit.spawn_reader("stdout-reader-finished");
+        let stderr_reader = audit.spawn_reader("stderr-reader-finished");
+        let child = ScriptedChild {
+            polls: VecDeque::from([Ok(None), Ok(None)]),
+            kills: VecDeque::from([
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "transient kill failure",
+                )),
+                Ok(()),
+            ]),
+            waits: VecDeque::from([Ok(observed_exit(0))]),
+            audit: audit.clone(),
+            ..ScriptedChild::default()
+        };
 
-        assert_eq!(super::CALLER_CLEANUP_GRACE, Duration::from_millis(500));
-        assert!(!caller.contains(&blocking_wait));
-        assert_eq!(deferred.matches(&blocking_wait).count(), 1);
-        assert!(deferred.contains("stickerfit-deferred-process-cleanup"));
-        assert!(caller.contains("is_finished()"));
+        let cleanup =
+            super::cleanup_child_and_readers(child, None, Some(stdout_reader), Some(stderr_reader));
+        let events = audit.events();
+
+        assert_eq!(cleanup.status, Some(observed_exit(0)));
+        assert!(events.iter().filter(|event| **event == "kill").count() >= 2);
+        assert_reap_precedes_reader_completion(&audit);
     }
 
     #[test]
-    fn deferred_readers_become_an_io_primary_without_replacing_existing_errors() {
-        assert_eq!(
-            super::finish_reader_cleanup(None, true),
-            Some(PipelineError::Io {
-                operation: "finish child process readers",
-                message: "reader threads exceeded the caller cleanup grace period".into(),
-            })
-        );
-        assert_eq!(super::finish_reader_cleanup(None, false), None);
+    fn interrupted_wait_retries_without_requiring_another_kill() {
+        let audit = ChildAudit::default();
+        let stdout_reader = audit.spawn_reader("stdout-reader-finished");
+        let stderr_reader = audit.spawn_reader("stderr-reader-finished");
+        let child = ScriptedChild {
+            polls: VecDeque::from([Ok(None)]),
+            kills: VecDeque::from([Ok(())]),
+            waits: VecDeque::from([
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "transient wait failure",
+                )),
+                Ok(observed_exit(0)),
+            ]),
+            audit: audit.clone(),
+            ..ScriptedChild::default()
+        };
 
+        let cleanup =
+            super::cleanup_child_and_readers(child, None, Some(stdout_reader), Some(stderr_reader));
+        let events = audit.events();
+
+        assert_eq!(cleanup.status, Some(observed_exit(0)));
+        assert!(events.iter().filter(|event| **event == "wait").count() >= 2);
+        assert_reap_precedes_reader_completion(&audit);
+    }
+
+    #[test]
+    fn permanent_cleanup_failure_model_never_replaces_an_existing_primary() {
+        let observed_nonzero = PipelineError::ProcessFailed {
+            command: "ffmpeg".into(),
+            exit_code: Some(17),
+            stderr: "bounded stderr".into(),
+        };
+        let cleanup_error = PipelineError::Io {
+            operation: "reap child process",
+            message: "permanent OS cleanup failure".into(),
+        };
         let existing_primaries = [
             PipelineError::Cancelled,
             PipelineError::TimedOut {
                 stage: "child-process",
-            },
-            PipelineError::LimitExceeded {
-                resource: "decoded-bytes",
-                limit: 192,
-                actual: 256,
             },
             PipelineError::Io {
                 operation: "stream frame callback",
                 message: "callback rejected frame".into(),
             },
         ];
+
         for expected in existing_primaries {
             assert_eq!(
-                super::finish_reader_cleanup(Some(expected.clone()), true),
+                super::select_process_primary(
+                    Some(expected.clone()),
+                    Some(observed_nonzero.clone()),
+                    Some(cleanup_error.clone()),
+                ),
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn observed_nonzero_process_failure_outranks_later_cleanup_error() {
+        let process_error = PipelineError::ProcessFailed {
+            command: "ffmpeg".into(),
+            exit_code: Some(17),
+            stderr: "bounded stderr".into(),
+        };
+        let cleanup_error = PipelineError::Io {
+            operation: "join child stderr reader",
+            message: "reader thread panicked".into(),
+        };
+
+        assert_eq!(
+            super::select_process_primary(
+                None,
+                Some(process_error.clone()),
+                Some(cleanup_error.clone()),
+            ),
+            Some(process_error)
+        );
+        assert_eq!(
+            super::select_process_primary(None, None, Some(cleanup_error.clone())),
+            Some(cleanup_error)
+        );
     }
 
     #[test]
@@ -2054,21 +2176,185 @@ mod tests {
     }
 
     #[test]
-    fn recycling_after_normal_reader_terminal_is_a_no_op() {
-        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(2);
-        drop(receiver);
-        let context = OperationContext::detached(Duration::from_secs(1));
+    fn production_source_has_no_deferred_cleanup_grace_pool_or_recycle_path() {
+        let source = include_str!("process_runner.rs");
+        let test_module = source.find("#[cfg(test)]").expect("test module boundary");
+        let production = &source[..test_module];
 
+        for removed in [
+            "CALLER_CLEANUP_GRACE",
+            "DeferredCleanup",
+            "run_deferred_cleanup",
+            "spawn_deferred_cleanup",
+            "stickerfit-deferred-process-cleanup",
+            "frame_buffer_count",
+            "recycle_frame",
+            "recycle_sender",
+            "recycle_receiver",
+        ] {
+            assert!(
+                !production.contains(removed),
+                "obsolete production path remains: {removed}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_frame_handshake_orders_callback_checkpoint_ack_and_cleanup() {
+        let source = include_str!("process_runner.rs");
+        let test_module = source.find("#[cfg(test)]").expect("test module boundary");
+        let production = &source[..test_module];
+        let reader = source_section(production, "fn spawn_frame_reader", "fn poll_child_status");
+        let stream_start = production
+            .find("pub(crate) fn stream_fixed_rgba_frames")
+            .expect("streaming runner source");
+        let stream = &production[stream_start..];
+
+        assert!(stream.contains("F: FnMut(Vec<u8>) -> Result<(), PipelineError>"));
+        assert!(!stream.contains("FnMut(&[u8])"));
+        assert!(stream.contains("mpsc::sync_channel::<FrameEvent>(0)"));
         assert_eq!(
-            super::recycle_frame(
-                &sender,
-                Vec::with_capacity(64),
-                Instant::now(),
-                Duration::from_secs(1),
-                &context,
-            ),
-            Ok(())
+            production.matches("try_reserve_exact(frame_size)").count(),
+            1
         );
+        assert_eq!(reader.matches("reader.read(").count(), 1);
+
+        let sent = reader
+            .find("frame_sender.send(FrameEvent::Frame(frame))")
+            .expect("owned frame send");
+        let acknowledged = reader[sent..]
+            .find("acknowledgement_receiver.recv()")
+            .map(|offset| sent + offset)
+            .expect("reader acknowledgement wait");
+        let next_allocation = reader[acknowledged..]
+            .find("allocate_frame_buffer(frame_size)")
+            .map(|offset| acknowledged + offset)
+            .expect("next frame allocation after acknowledgement");
+        assert!(sent < acknowledged);
+        assert!(acknowledged < next_allocation);
+
+        let callback = stream.find("on_frame(frame)").expect("owned callback");
+        let checkpoint = stream[callback..]
+            .find("context.checkpoint()")
+            .map(|offset| callback + offset)
+            .expect("post-callback checkpoint");
+        let acknowledgement = stream[checkpoint..]
+            .find("acknowledgement_sender.send(())")
+            .map(|offset| checkpoint + offset)
+            .expect("caller acknowledgement");
+        assert!(callback < checkpoint);
+        assert!(checkpoint < acknowledgement);
+
+        let drop_frames = stream
+            .find("drop(frame_receiver)")
+            .expect("frame receiver drop");
+        let drop_acknowledgements = stream
+            .find("drop(acknowledgement_sender)")
+            .expect("acknowledgement sender drop");
+        let cleanup = stream[drop_acknowledgements..]
+            .find("cleanup_child_and_readers(")
+            .map(|offset| drop_acknowledgements + offset)
+            .expect("synchronous cleanup after endpoint drops");
+        assert!(drop_frames < cleanup);
+        assert!(drop_acknowledgements < cleanup);
+    }
+
+    #[test]
+    fn callback_panic_boundary_routes_to_endpoint_drop_and_synchronous_cleanup() {
+        let source = include_str!("process_runner.rs");
+        let test_module = source.find("#[cfg(test)]").expect("test module boundary");
+        let production = &source[..test_module];
+        let stream_start = production
+            .find("pub(crate) fn stream_fixed_rgba_frames")
+            .expect("streaming runner source");
+        let stream = &production[stream_start..];
+
+        let panic_boundary = stream
+            .find("std::panic::catch_unwind")
+            .expect("callback panic boundary");
+        let callback = stream[panic_boundary..]
+            .find("on_frame(frame)")
+            .map(|offset| panic_boundary + offset)
+            .expect("callback inside panic boundary");
+        let typed_error = stream[callback..]
+            .find("stream frame callback")
+            .map(|offset| callback + offset)
+            .expect("typed callback panic error");
+        let drop_frames = stream[typed_error..]
+            .find("drop(frame_receiver)")
+            .map(|offset| typed_error + offset)
+            .expect("frame receiver drop after callback boundary");
+        let drop_acknowledgements = stream[typed_error..]
+            .find("drop(acknowledgement_sender)")
+            .map(|offset| typed_error + offset)
+            .expect("acknowledgement sender drop after callback boundary");
+        let cleanup = stream[drop_acknowledgements..]
+            .find("cleanup_child_and_readers(")
+            .map(|offset| drop_acknowledgements + offset)
+            .expect("synchronous cleanup after panic boundary");
+
+        assert!(panic_boundary < callback);
+        assert!(callback < typed_error);
+        assert!(typed_error < drop_frames);
+        assert!(typed_error < drop_acknowledgements);
+        assert!(drop_frames < cleanup);
+        assert!(drop_acknowledgements < cleanup);
+        assert!(stream.contains("callback panicked"));
+        assert!(!production.contains("secret callback panic payload"));
+    }
+
+    #[test]
+    fn lib_consumers_take_exactly_three_owned_frames_without_full_frame_clones() {
+        let lib_source = include_str!("lib.rs");
+        let test_module = lib_source
+            .find("mod tests {")
+            .expect("lib test module boundary");
+        let production = &lib_source[..test_module];
+        let consumers = [
+            source_section(
+                production,
+                "fn prepare_video_search_source(",
+                "impl FrameSourceLoader for DefaultFrameSourceLoader",
+            ),
+            source_section(
+                production,
+                "fn extract_video_preview_batch(",
+                "fn cached_preview_items_for_requested_ids(",
+            ),
+            source_section(
+                production,
+                "fn extract_video_source_frames_rgba(",
+                "fn validate_resampled_frame_stream(",
+            ),
+        ];
+
+        assert_eq!(production.matches("stream_fixed_rgba_frames(").count(), 3);
+        for consumer in consumers {
+            assert_eq!(consumer.matches("stream_fixed_rgba_frames(").count(), 1);
+            assert_eq!(consumer.matches("rgba_frame_from_bytes(").count(), 1);
+            assert!(!consumer.contains("frame.to_vec()"));
+            let stream = consumer.find("stream_fixed_rgba_frames(").unwrap();
+            let exact = consumer[stream..]
+                .find("validate_exact_selected_frame_stream(")
+                .map(|offset| stream + offset)
+                .expect("consumer-level short-stream validation");
+            assert!(stream < exact);
+        }
+    }
+
+    #[test]
+    fn runner_and_consumers_keep_distinct_exact_frame_responsibilities() {
+        let source = include_str!("process_runner.rs");
+        let test_module = source.find("#[cfg(test)]").expect("test module boundary");
+        let production = &source[..test_module];
+        let stream_start = production
+            .find("pub(crate) fn stream_fixed_rgba_frames")
+            .expect("streaming runner source");
+        let stream = &production[stream_start..];
+
+        assert!(stream.contains("next_count > max_frames"));
+        assert!(stream.contains("raw RGBA output ended with a partial frame"));
+        assert!(!stream.contains("frame count did not match the request"));
     }
 
     #[test]

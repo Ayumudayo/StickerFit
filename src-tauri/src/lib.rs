@@ -58,13 +58,14 @@ use crate::frame_source::{
     MAX_PREPARED_SEARCH_BYTES, MAX_SEARCH_OUTPUT_FRAMES,
 };
 use crate::locale::{parse_ui_locale, UiLocale};
-use crate::media_error::PipelineError;
+use crate::media_error::{MediaOperationErrorCode, MediaOperationReasonCode, PipelineError};
 use crate::media_limits::{
     checked_rgba_bytes, image_decode_limits, validate_file_metadata, MediaLimits, SourceIdentity,
 };
 use crate::operation::{
     publish_progress, run_managed_blocking, ChannelProgressSink, MediaOperationKind,
     OperationContext, OperationProgress, PipelineState, ProgressSink, ProgressStage,
+    ValidatedProgressSink,
 };
 use crate::output_file::PendingOutput;
 use crate::preview_cache::{
@@ -245,8 +246,8 @@ struct MediaInspection {
     warnings: Vec<String>,
     is_static_image: bool,
     can_convert_to_png: bool,
-    error_code: Option<String>,
-    reason_code: Option<String>,
+    error_code: Option<MediaOperationErrorCode>,
+    reason_code: Option<MediaOperationReasonCode>,
     error_message: Option<String>,
 }
 
@@ -257,8 +258,8 @@ struct FramePreviewResponse {
     data_url: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
-    error_code: Option<String>,
-    reason_code: Option<String>,
+    error_code: Option<MediaOperationErrorCode>,
+    reason_code: Option<MediaOperationReasonCode>,
     error_message: Option<String>,
 }
 
@@ -276,8 +277,8 @@ struct FramePreviewItem {
 struct FramePreviewsResponse {
     ok: bool,
     previews: Vec<FramePreviewItem>,
-    error_code: Option<String>,
-    reason_code: Option<String>,
+    error_code: Option<MediaOperationErrorCode>,
+    reason_code: Option<MediaOperationReasonCode>,
     error_message: Option<String>,
 }
 
@@ -346,8 +347,8 @@ pub(crate) struct OptimizerPlanResponse {
     search_budget: usize,
     warnings: Vec<String>,
     candidates: Vec<CandidatePreview>,
-    error_code: Option<String>,
-    reason_code: Option<String>,
+    error_code: Option<MediaOperationErrorCode>,
+    reason_code: Option<MediaOperationReasonCode>,
     error_message: Option<String>,
 }
 
@@ -373,8 +374,8 @@ struct StaticImageConversionResult {
     tool_command: Option<String>,
     tool_detail: Option<String>,
     warnings: Vec<String>,
-    error_code: Option<String>,
-    reason_code: Option<String>,
+    error_code: Option<MediaOperationErrorCode>,
+    reason_code: Option<MediaOperationReasonCode>,
     error_message: Option<String>,
 }
 
@@ -428,8 +429,8 @@ struct SearchAttemptResult {
     tool_command: Option<String>,
     tool_detail: Option<String>,
     warnings: Vec<String>,
-    error_code: Option<String>,
-    reason_code: Option<String>,
+    error_code: Option<MediaOperationErrorCode>,
+    reason_code: Option<MediaOperationReasonCode>,
     error_message: Option<String>,
 }
 
@@ -452,8 +453,8 @@ struct OptimizerSearchResponse {
     best_output_path: Option<String>,
     best_size_bytes: Option<u64>,
     best_within_limit: bool,
-    error_code: Option<String>,
-    reason_code: Option<String>,
+    error_code: Option<MediaOperationErrorCode>,
+    reason_code: Option<MediaOperationReasonCode>,
     error_message: Option<String>,
 }
 
@@ -2954,7 +2955,7 @@ fn prepare_video_search_source(
                         reason: "raw RGBA output exceeded selected source indexes".into(),
                     })?;
             decoded_bytes = checked_prepared_bytes(decoded_bytes, frame.len())?;
-            let pixels = rgba_frame_from_bytes(target_width, target_height, frame.to_vec())?;
+            let pixels = rgba_frame_from_bytes(target_width, target_height, frame)?;
             let duration_us = base_sequence
                 .iter()
                 .find(|prepared| prepared.source_frame_index == source_frame_index)
@@ -3166,6 +3167,8 @@ fn ascending_video_preview_extraction(
 
 fn build_native_preview_group(
     input_path: &Path,
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
     expected_source: &SourceIdentity,
     context: &OperationContext,
     progress: &mut impl FnMut(ProgressStage, u32, Option<u32>),
@@ -3200,8 +3203,7 @@ fn build_native_preview_group(
             context.checkpoint()
         },
     )?;
-    context.checkpoint()?;
-    ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    finalize_preview_cache_publication(cache, key, expected_source, context, None)?;
     Ok(previews)
 }
 
@@ -3216,7 +3218,11 @@ fn build_video_preview_filter(extraction: &[(u32, u32)], width: u32, height: u32
 
 fn extract_video_preview_batch(
     input_path: &Path,
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
     extraction: &[(u32, u32)],
+    base_completed: u32,
+    requested_total: u32,
     width: u32,
     height: u32,
     locale: UiLocale,
@@ -3278,7 +3284,7 @@ fn extract_video_preview_batch(
                     .ok_or(PipelineError::MalformedProcessOutput {
                         reason: "video preview stream produced an unexpected frame".into(),
                     })?;
-            let pixels = rgba_frame_from_bytes(width, height, frame.to_vec())?;
+            let pixels = rgba_frame_from_bytes(width, height, frame)?;
             let png_bytes = encode_native_png_bytes(&pixels)?;
             previews.push(CachedPreview {
                 source_frame_id,
@@ -3288,15 +3294,14 @@ fn extract_video_preview_batch(
             });
             progress(
                 ProgressStage::Encoding,
-                u32::try_from(previews.len()).unwrap_or(u32::MAX),
-                Some(u32::try_from(extraction.len()).unwrap_or(u32::MAX)),
+                base_completed.saturating_add(u32::try_from(previews.len()).unwrap_or(u32::MAX)),
+                Some(requested_total),
             );
             context.checkpoint()
         },
     )?;
     validate_exact_selected_frame_stream(extraction.len(), summary.frame_count)?;
-    context.checkpoint()?;
-    ensure_source_unchanged(expected_source, MediaLimits::default())?;
+    finalize_preview_cache_publication(cache, key, expected_source, context, None)?;
     Ok(previews)
 }
 
@@ -3400,12 +3405,47 @@ fn finalize_preview_cache_publication(
     cache: &PreviewCache,
     key: &PreviewSourceKey,
     expected_source: &SourceIdentity,
+    context: &OperationContext,
+    publication: Option<&PreviewCachePublication>,
 ) -> Result<(), PipelineError> {
-    if let Err(error) = ensure_source_unchanged(expected_source, MediaLimits::default()) {
+    finalize_preview_cache_publication_with_check(cache, key, context, publication, || {
+        ensure_source_unchanged(expected_source, MediaLimits::default())
+    })
+}
+
+fn finalize_preview_cache_publication_with_check(
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
+    context: &OperationContext,
+    publication: Option<&PreviewCachePublication>,
+    source_check: impl FnOnce() -> Result<(), PipelineError>,
+) -> Result<(), PipelineError> {
+    context.checkpoint()?;
+    let source_check = source_check();
+    if matches!(&source_check, Err(PipelineError::SourceChanged)) {
         cache.invalidate(key);
+    }
+    if let Err(error) = context.checkpoint() {
+        if source_check.is_ok() {
+            if let Some(publication) = publication {
+                cache.invalidate_publication(key, publication);
+            }
+        }
         return Err(error);
     }
-    Ok(())
+    source_check
+}
+
+fn finalize_preview_source_publication<T>(
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
+    expected_source: &SourceIdentity,
+    context: &OperationContext,
+    publication: Option<&PreviewCachePublication>,
+    publisher: impl FnOnce() -> Result<T, PipelineError>,
+) -> Result<T, PipelineError> {
+    finalize_preview_cache_publication(cache, key, expected_source, context, publication)?;
+    context.finalize(publisher)
 }
 
 fn checkpoint_preview_cache_publication(
@@ -3421,6 +3461,37 @@ fn checkpoint_preview_cache_publication(
         return Err(error);
     }
     Ok(())
+}
+
+fn rollback_preview_finalization_error(
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
+    publication: Option<&PreviewCachePublication>,
+    error: &PipelineError,
+) {
+    if matches!(error, PipelineError::SourceChanged) {
+        cache.invalidate(key);
+    } else if let Some(publication) = publication {
+        cache.invalidate_publication(key, publication);
+    }
+}
+
+fn settle_preview_load_result<T>(
+    cache: &PreviewCache,
+    key: &PreviewSourceKey,
+    context: &OperationContext,
+    result: Result<T, PipelineError>,
+) -> Result<T, PipelineError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if matches!(&error, PipelineError::SourceChanged) {
+                cache.invalidate(key);
+            }
+            context.checkpoint()?;
+            Err(error)
+        }
+    }
 }
 
 struct LoadedCachedFramePreviews {
@@ -3440,46 +3511,62 @@ fn load_cached_frame_previews(
 ) -> Result<LoadedCachedFramePreviews, PipelineError> {
     context.checkpoint()?;
     let requested = normalize_preview_source_frame_ids(requested_source_frame_ids)?;
-    let (previews, publication) = match &key.variant {
-        PreviewVariant::Native => {
-            let lookup = cache.get_or_try_build_complete(key, &requested, || {
-                build_native_preview_group(input_path, expected_source, context, progress)
-            })?;
-            (lookup.previews, lookup.publication)
-        }
-        PreviewVariant::Video { width, height } => {
-            let mut available = Vec::new();
-            let mut missing = Vec::new();
-            let mut publication = None;
-            for source_frame_id in requested.iter().copied() {
-                match cache.get_requested(key, &[source_frame_id]) {
-                    Some(mut cached) => available.append(&mut cached),
-                    None => missing.push(source_frame_id),
+    let requested_total = u32::try_from(requested.len()).unwrap_or(u32::MAX);
+    let load_result = (|| -> Result<_, PipelineError> {
+        Ok(match &key.variant {
+            PreviewVariant::Native => {
+                let lookup = cache.get_or_try_build_complete(key, &requested, || {
+                    build_native_preview_group(
+                        input_path,
+                        cache,
+                        key,
+                        expected_source,
+                        context,
+                        progress,
+                    )
+                })?;
+                (lookup.previews, lookup.publication)
+            }
+            PreviewVariant::Video { width, height } => {
+                let mut available = Vec::new();
+                let mut missing = Vec::new();
+                let mut publication = None;
+                for source_frame_id in requested.iter().copied() {
+                    match cache.get_requested(key, &[source_frame_id]) {
+                        Some(mut cached) => available.append(&mut cached),
+                        None => missing.push(source_frame_id),
+                    }
                 }
+                if !missing.is_empty() {
+                    let extraction = ascending_video_preview_extraction(&missing)?;
+                    let base_completed = u32::try_from(available.len()).unwrap_or(u32::MAX);
+                    let extracted = extract_video_preview_batch(
+                        input_path,
+                        cache,
+                        key,
+                        &extraction,
+                        base_completed,
+                        requested_total,
+                        *width,
+                        *height,
+                        locale,
+                        expected_source,
+                        context,
+                        progress,
+                    )?;
+                    publication = cache.merge_partial(key.clone(), extracted.clone());
+                    available.extend(extracted);
+                }
+                (
+                    cached_previews_for_requested_ids(&requested, &available)?,
+                    publication,
+                )
             }
-            if !missing.is_empty() {
-                let extraction = ascending_video_preview_extraction(&missing)?;
-                let extracted = extract_video_preview_batch(
-                    input_path,
-                    &extraction,
-                    *width,
-                    *height,
-                    locale,
-                    expected_source,
-                    context,
-                    progress,
-                )?;
-                publication = cache.merge_partial(key.clone(), extracted.clone());
-                available.extend(extracted);
-            }
-            (
-                cached_previews_for_requested_ids(&requested, &available)?,
-                publication,
-            )
-        }
-    };
+        })
+    })();
+    let (previews, publication) = settle_preview_load_result(cache, key, context, load_result)?;
     checkpoint_preview_cache_publication(cache, key, context, publication.as_ref())?;
-    finalize_preview_cache_publication(cache, key, expected_source)?;
+    finalize_preview_cache_publication(cache, key, expected_source, context, publication.as_ref())?;
     Ok(LoadedCachedFramePreviews {
         previews,
         publication,
@@ -3520,10 +3607,9 @@ fn extract_frame_preview_internal(
 }
 
 fn extract_frame_preview_with_operation(
-    input_path: &Path,
+    preflight: &SourcePreflight,
     source_frame_id: u32,
     locale: UiLocale,
-    identity: &SourceIdentity,
     key: &PreviewSourceKey,
     cache: &PreviewCache,
     context: &OperationContext,
@@ -3532,14 +3618,18 @@ fn extract_frame_preview_with_operation(
     let mut publish = |stage, completed, total| {
         publish_progress(progress, context, stage, completed, total);
     };
-    publish(ProgressStage::Decoding, 0, Some(1));
+    let decoding_total = match &key.variant {
+        PreviewVariant::Native => None,
+        PreviewVariant::Video { .. } => Some(1),
+    };
+    publish(ProgressStage::Decoding, 0, decoding_total);
     let loaded = match load_cached_frame_previews(
         cache,
         key,
-        input_path,
+        preflight.canonical_path(),
         &[source_frame_id],
         locale,
-        identity,
+        preflight.identity(),
         context,
         &mut publish,
     ) {
@@ -3550,13 +3640,24 @@ fn extract_frame_preview_with_operation(
         Ok(response) => response,
         Err(error) => frame_preview_pipeline_error(&error, locale),
     };
-    if let Err(error) =
-        checkpoint_preview_cache_publication(cache, key, context, loaded.publication.as_ref())
-    {
-        return frame_preview_pipeline_error(&error, locale);
+    let publication = loaded.publication;
+    match finalize_preview_source_publication(
+        cache,
+        key,
+        preflight.identity(),
+        context,
+        publication.as_ref(),
+        || {
+            publish(ProgressStage::Finalizing, 1, Some(1));
+            Ok(response)
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            rollback_preview_finalization_error(cache, key, publication.as_ref(), &error);
+            frame_preview_pipeline_error(&error, locale)
+        }
     }
-    publish(ProgressStage::Finalizing, 1, Some(1));
-    response
 }
 
 fn extract_frame_preview_with_callbacks(
@@ -3618,8 +3719,8 @@ fn frame_preview_pipeline_error(error: &PipelineError, locale: UiLocale) -> Fram
         data_url: None,
         width: None,
         height: None,
-        reason_code: error.reason_code().map(str::to_string),
-        error_code: Some(error.code().into()),
+        reason_code: error.media_reason_code(),
+        error_code: Some(error.error_code()),
         error_message: Some(pipeline_error_diagnostic(error, locale)),
     }
 }
@@ -3628,8 +3729,8 @@ fn frame_previews_pipeline_error(error: &PipelineError, locale: UiLocale) -> Fra
     FramePreviewsResponse {
         ok: false,
         previews: Vec::new(),
-        reason_code: error.reason_code().map(str::to_string),
-        error_code: Some(error.code().into()),
+        reason_code: error.media_reason_code(),
+        error_code: Some(error.error_code()),
         error_message: Some(pipeline_error_diagnostic(error, locale)),
     }
 }
@@ -3649,10 +3750,9 @@ fn extract_frame_previews_internal(
 }
 
 fn extract_frame_previews_with_operation(
-    input_path: &Path,
+    preflight: &SourcePreflight,
     source_frame_ids: &[u32],
     locale: UiLocale,
-    identity: &SourceIdentity,
     key: &PreviewSourceKey,
     cache: &PreviewCache,
     context: &OperationContext,
@@ -3666,14 +3766,18 @@ fn extract_frame_previews_with_operation(
         Err(error) => return frame_previews_pipeline_error(&error, locale),
     };
     let total = u32::try_from(requested.len()).unwrap_or(u32::MAX);
-    publish(ProgressStage::Decoding, 0, Some(total));
+    let decoding_total = match &key.variant {
+        PreviewVariant::Native => None,
+        PreviewVariant::Video { .. } => Some(total),
+    };
+    publish(ProgressStage::Decoding, 0, decoding_total);
     let loaded = match load_cached_frame_previews(
         cache,
         key,
-        input_path,
+        preflight.canonical_path(),
         &requested,
         locale,
-        identity,
+        preflight.identity(),
         context,
         &mut publish,
     ) {
@@ -3690,13 +3794,24 @@ fn extract_frame_previews_with_operation(
         },
         Err(error) => frame_previews_pipeline_error(&error, locale),
     };
-    if let Err(error) =
-        checkpoint_preview_cache_publication(cache, key, context, loaded.publication.as_ref())
-    {
-        return frame_previews_pipeline_error(&error, locale);
+    let publication = loaded.publication;
+    match finalize_preview_source_publication(
+        cache,
+        key,
+        preflight.identity(),
+        context,
+        publication.as_ref(),
+        || {
+            publish(ProgressStage::Finalizing, total, Some(total));
+            Ok(response)
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            rollback_preview_finalization_error(cache, key, publication.as_ref(), &error);
+            frame_previews_pipeline_error(&error, locale)
+        }
     }
-    publish(ProgressStage::Finalizing, total, Some(total));
-    response
 }
 
 fn extract_frame_previews_with_callbacks(
@@ -3850,6 +3965,7 @@ fn commit_output_after_source_validation(
 
 fn publish_optimizer_selection(
     expected_source: &SourceIdentity,
+    source_already_validated: bool,
     best_within_limit: Option<PendingSelectedEncodeOutput>,
     smallest_oversize: Option<PendingSelectedEncodeOutput>,
     attempts: &mut [SearchAttemptResult],
@@ -3868,9 +3984,13 @@ fn publish_optimizer_selection(
         selected,
         pending_output,
     } = selected;
-    let output_path = commit_output_after_source_validation(pending_output, Some(expected_source))?
-        .to_string_lossy()
-        .into_owned();
+    let output_path = if source_already_validated {
+        pending_output.commit()?
+    } else {
+        commit_output_after_source_validation(pending_output, Some(expected_source))?
+    }
+    .to_string_lossy()
+    .into_owned();
     if let Some(attempt) = attempts
         .iter_mut()
         .find(|attempt| attempt.candidate_id == selected.candidate_id)
@@ -4172,7 +4292,7 @@ fn extract_video_source_frames_rgba(
                     .unwrap_or(u64::MAX)
                     .saturating_add(u64::try_from(frame_size).unwrap_or(u64::MAX)),
             })?;
-            let pixels = rgba_frame_from_bytes(frame_width, frame_height, frame.to_vec())?;
+            let pixels = rgba_frame_from_bytes(frame_width, frame_height, frame)?;
             frames.insert(frame_index, pixels);
             Ok(())
         },
@@ -4491,8 +4611,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                 search_budget,
                 warnings,
                 candidates: Vec::new(),
-                reason_code: Some("invalid-crop".into()),
-                error_code: Some("invalid-request".into()),
+                reason_code: Some(MediaOperationReasonCode::InvalidCrop),
+                error_code: Some(MediaOperationErrorCode::InvalidRequest),
                 error_message: Some(error),
             }
         }
@@ -4525,8 +4645,10 @@ fn prepare_optimizer_plan_with_checkpoint(
                                 search_budget,
                                 warnings,
                                 candidates: Vec::new(),
-                                reason_code: Some(error.into()),
-                                error_code: Some("invalid-request".into()),
+                                reason_code: MediaOperationReasonCode::from_code(error),
+                                error_code: Some(
+                                    MediaOperationErrorCode::for_invalid_request_reason(error),
+                                ),
                                 error_message: Some(locale::frame_selection_required_error(locale)),
                             }
                         }
@@ -4545,8 +4667,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    reason_code: Some("no-frames-selected".into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: Some(MediaOperationReasonCode::NoFramesSelected),
+                    error_code: Some(MediaOperationErrorCode::InvalidRequest),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 };
             }
@@ -4566,8 +4688,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    reason_code: Some(reason.into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: MediaOperationReasonCode::from_code(reason),
+                    error_code: Some(MediaOperationErrorCode::for_invalid_request_reason(reason)),
                     error_message: Some(error_message),
                 };
             }
@@ -4586,8 +4708,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    reason_code: Some(error.into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: MediaOperationReasonCode::from_code(error),
+                    error_code: Some(MediaOperationErrorCode::for_invalid_request_reason(error)),
                     error_message: Some(locale::invalid_frame_selection_error(locale)),
                 };
             }
@@ -4605,8 +4727,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                 search_budget,
                 warnings,
                 candidates: Vec::new(),
-                reason_code: Some("duration-too-long".into()),
-                error_code: Some("invalid-request".into()),
+                reason_code: Some(MediaOperationReasonCode::DurationTooLong),
+                error_code: Some(MediaOperationErrorCode::InvalidRequest),
                 error_message: Some(locale::selected_duration_limit_error(locale)),
             };
         }
@@ -4656,8 +4778,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    reason_code: Some("no-frames-selected".into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: Some(MediaOperationReasonCode::NoFramesSelected),
+                    error_code: Some(MediaOperationErrorCode::InvalidRequest),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 };
             }
@@ -4672,8 +4794,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    reason_code: Some("invalid-frame-selection".into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: Some(MediaOperationReasonCode::InvalidFrameSelection),
+                    error_code: Some(MediaOperationErrorCode::InvalidRequest),
                     error_message: Some(locale::invalid_frame_selection_error(locale)),
                 };
             }
@@ -4692,8 +4814,8 @@ fn prepare_optimizer_plan_with_checkpoint(
                     search_budget,
                     warnings,
                     candidates: Vec::new(),
-                    reason_code: Some(error.into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: MediaOperationReasonCode::from_code(error),
+                    error_code: Some(MediaOperationErrorCode::for_invalid_request_reason(error)),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 }
             }
@@ -4723,8 +4845,8 @@ fn prepare_optimizer_plan_with_checkpoint(
             search_budget,
             warnings,
             candidates: Vec::new(),
-            reason_code: Some("duration-too-long".into()),
-            error_code: Some("invalid-request".into()),
+            reason_code: Some(MediaOperationReasonCode::DurationTooLong),
+            error_code: Some(MediaOperationErrorCode::InvalidRequest),
             error_message: Some(locale::selected_duration_limit_error(locale)),
         };
     }
@@ -4772,13 +4894,13 @@ fn prepare_optimizer_plan_with_operation(
     publish_progress(progress, context, ProgressStage::Estimating, 0, None);
     let response =
         prepare_optimizer_plan_with_checkpoint(request, locale, &mut || context.checkpoint());
-    if response.error_code.is_some() {
-        return response;
-    }
-    publish_progress(progress, context, ProgressStage::Finalizing, 1, Some(1));
-    match context.checkpoint() {
-        Ok(()) => response,
-        Err(error) => optimizer_plan_pipeline_error(locale, response.warnings, &error),
+    let warnings = response.warnings.clone();
+    match context.finalize(|| {
+        publish_progress(progress, context, ProgressStage::Finalizing, 1, Some(1));
+        Ok(response)
+    }) {
+        Ok(response) => response,
+        Err(error) => optimizer_plan_pipeline_error(locale, warnings, &error),
     }
 }
 
@@ -4797,7 +4919,7 @@ fn encode_prepared_candidate_with_checkpoint(
             reason: "invalid-output-directory",
         })?;
     if let Some(expected_source) = expected_source {
-        ensure_source_unchanged(expected_source, MediaLimits::default())?;
+        checkpointed_source_check(context, expected_source, MediaLimits::default())?;
     }
 
     let durations_us = sequence
@@ -4924,6 +5046,7 @@ fn convert_static_image_to_png_internal(
         locale,
         expected_source,
         None,
+        None,
         || Ok(()),
         |_, _, _| {},
     )
@@ -4934,7 +5057,7 @@ fn convert_static_image_to_png_with_operation(
     output_directory: Option<&str>,
     crop_region: Option<&CropRegion>,
     locale: UiLocale,
-    expected_source: Option<&SourceIdentity>,
+    preflight: &SourcePreflight,
     context: &OperationContext,
     progress: &impl ProgressSink,
 ) -> StaticImageConversionResult {
@@ -4943,7 +5066,8 @@ fn convert_static_image_to_png_with_operation(
         output_directory,
         crop_region,
         locale,
-        expected_source,
+        Some(preflight.identity()),
+        Some(preflight),
         Some(context),
         || context.checkpoint(),
         |stage, completed, total| {
@@ -4958,18 +5082,33 @@ fn convert_static_image_to_png_with_callbacks(
     crop_region: Option<&CropRegion>,
     locale: UiLocale,
     expected_source: Option<&SourceIdentity>,
+    preflight: Option<&SourcePreflight>,
     context: Option<&OperationContext>,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> StaticImageConversionResult {
     progress(ProgressStage::Inspecting, 0, Some(1));
-    let inspection = inspect_input_media_with_callbacks(
-        input_path,
-        locale,
-        context,
-        || checkpoint(),
-        |_, _, _| {},
-    );
+    let inspection = match preflight {
+        Some(preflight) => {
+            if let Err(error) = checkpoint() {
+                return static_conversion_pipeline_error(&error, locale);
+            }
+            inspect_input_media_preflighted_with_callbacks(
+                input_path,
+                preflight,
+                locale,
+                context,
+                &mut checkpoint,
+            )
+        }
+        None => inspect_input_media_with_callbacks(
+            input_path,
+            locale,
+            context,
+            || checkpoint(),
+            |_, _, _| {},
+        ),
+    };
 
     if !inspection.ok {
         return StaticImageConversionResult {
@@ -4997,8 +5136,8 @@ fn convert_static_image_to_png_with_callbacks(
             tool_command: inspection.tool_command,
             tool_detail: inspection.tool_detail,
             warnings: Vec::new(),
-            reason_code: Some("unsupported-source-format".into()),
-            error_code: Some("invalid-request".into()),
+            reason_code: Some(MediaOperationReasonCode::UnsupportedSourceFormat),
+            error_code: Some(MediaOperationErrorCode::InvalidRequest),
             error_message: Some(locale::unsupported_still_image_error(locale)),
         };
     }
@@ -5028,8 +5167,8 @@ fn convert_static_image_to_png_with_callbacks(
                     tool_command: inspection.tool_command,
                     tool_detail: inspection.tool_detail,
                     warnings: Vec::new(),
-                    reason_code: Some("invalid-crop".into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: Some(MediaOperationReasonCode::InvalidCrop),
+                    error_code: Some(MediaOperationErrorCode::InvalidRequest),
                     error_message: Some(error),
                 }
             }
@@ -5050,8 +5189,8 @@ fn convert_static_image_to_png_with_callbacks(
                     tool_command: None,
                     tool_detail: Some(locale::native_image_detail(locale)),
                     warnings: Vec::new(),
-                    reason_code: error.reason_code().map(str::to_string),
-                    error_code: Some(error.code().into()),
+                    reason_code: error.media_reason_code(),
+                    error_code: Some(error.error_code()),
                     error_message: Some(pipeline_error_diagnostic(&error, locale)),
                 }
             }
@@ -5060,7 +5199,11 @@ fn convert_static_image_to_png_with_callbacks(
         if let Err(error) = checkpoint() {
             return static_conversion_pipeline_error(&error, locale);
         }
-        if let Err(error) = ensure_source_unchanged(expected_source, MediaLimits::default()) {
+        let source_check = ensure_source_unchanged(expected_source, MediaLimits::default());
+        if let Err(error) = checkpoint() {
+            return static_conversion_pipeline_error(&error, locale);
+        }
+        if let Err(error) = source_check {
             return StaticImageConversionResult {
                 ok: false,
                 output_path: None,
@@ -5070,8 +5213,8 @@ fn convert_static_image_to_png_with_callbacks(
                 tool_command: None,
                 tool_detail: Some(locale::native_image_detail(locale)),
                 warnings: Vec::new(),
-                reason_code: error.reason_code().map(str::to_string),
-                error_code: Some(error.code().into()),
+                reason_code: error.media_reason_code(),
+                error_code: Some(error.error_code()),
                 error_message: Some(pipeline_error_diagnostic(&error, locale)),
             };
         }
@@ -5092,9 +5235,19 @@ fn convert_static_image_to_png_with_callbacks(
         checkpoint()?;
         let size_bytes = pending_output_size(&mut pending_output)?;
         progress(ProgressStage::Encoding, 1, Some(1));
-        progress(ProgressStage::Finalizing, 1, Some(1));
-        checkpoint()?;
-        let output_path = commit_output_after_source_validation(pending_output, expected_source)?;
+        let output_path = match (context, expected_source) {
+            (Some(context), Some(expected_source)) => {
+                finalize_source_publication(context, expected_source, || {
+                    progress(ProgressStage::Finalizing, 1, Some(1));
+                    pending_output.commit()
+                })?
+            }
+            _ => {
+                progress(ProgressStage::Finalizing, 1, Some(1));
+                checkpoint()?;
+                commit_output_after_source_validation(pending_output, expected_source)?
+            }
+        };
         Ok((output_path, size_bytes))
     })();
 
@@ -5129,8 +5282,8 @@ fn static_conversion_pipeline_error(
         tool_command: None,
         tool_detail: None,
         warnings: Vec::new(),
-        reason_code: error.reason_code().map(str::to_string),
-        error_code: Some(error.code().into()),
+        reason_code: error.media_reason_code(),
+        error_code: Some(error.error_code()),
         error_message: Some(pipeline_error_diagnostic(error, locale)),
     }
 }
@@ -5148,8 +5301,8 @@ fn optimizer_plan_pipeline_error(
         search_budget: MAX_SEARCH_BUDGET,
         warnings,
         candidates: Vec::new(),
-        reason_code: error.reason_code().map(str::to_string),
-        error_code: Some(error.code().into()),
+        reason_code: error.media_reason_code(),
+        error_code: Some(error.error_code()),
         error_message: Some(pipeline_error_diagnostic(error, locale)),
     }
 }
@@ -5237,8 +5390,8 @@ fn inspection_error_with_fallback_reason(
         warnings: Vec::new(),
         is_static_image: false,
         can_convert_to_png: false,
-        reason_code: reason_code.map(str::to_string),
-        error_code: Some(error_code.into()),
+        reason_code,
+        error_code: Some(error_code),
         error_message: Some(error_message),
     }
 }
@@ -5301,42 +5454,22 @@ fn enforce_desktop_inspection_frame_limit(
     )
 }
 
-fn normalize_backend_error_code(error_code: &str) -> (&'static str, Option<&'static str>) {
+fn normalize_backend_error_code(
+    error_code: &str,
+) -> (MediaOperationErrorCode, Option<MediaOperationReasonCode>) {
+    if let Some(error_code) = MediaOperationErrorCode::from_code(error_code) {
+        return (error_code, None);
+    }
+    if let Some(reason_code) = MediaOperationReasonCode::from_code(error_code) {
+        return (MediaOperationErrorCode::InvalidRequest, Some(reason_code));
+    }
     match error_code {
-        "cancelled"
-        | "timed-out"
-        | "operation-conflict"
-        | "invalid-request"
-        | "source-changed"
-        | "media-input-too-large"
-        | "media-dimensions-too-large"
-        | "media-frame-limit"
-        | "decoded-byte-limit"
-        | "png-chunk-limit"
-        | "malformed-media"
-        | "malformed-process-output"
-        | "tool-missing"
-        | "process-failed"
-        | "output-conflict"
-        | "internal-task-failed" => (canonical_error_code(error_code), None),
-        "no-frames-selected"
-        | "invalid-frame-selection"
-        | "invalid-frame-duration"
-        | "duration-too-long"
-        | "invalid-crop"
-        | "invalid-output-directory"
-        | "unsupported-source-format"
-        | "unsupported-frame-preview"
-        | "frame-preview-decode-failed"
-        | "frame-preview-encode-failed"
-        | "decode-failed"
-        | "encode-failed"
-        | "missing-output"
-        | "plan-invalid"
-        | "invoke-failed" => ("invalid-request", canonical_reason_code(error_code)),
-        "inspect-failed" => ("malformed-media", Some("decode-failed")),
-        "tool-unavailable" => ("tool-missing", None),
-        _ => ("internal-task-failed", None),
+        "inspect-failed" => (
+            MediaOperationErrorCode::MalformedMedia,
+            Some(MediaOperationReasonCode::DecodeFailed),
+        ),
+        "tool-unavailable" => (MediaOperationErrorCode::ToolMissing, None),
+        _ => (MediaOperationErrorCode::InternalTaskFailed, None),
     }
 }
 
@@ -5390,46 +5523,50 @@ fn ffmpeg_inspection_failure_diagnostic(locale: UiLocale, process_succeeded: boo
     }
 }
 
-fn canonical_error_code(error_code: &str) -> &'static str {
-    match error_code {
-        "cancelled" => "cancelled",
-        "timed-out" => "timed-out",
-        "operation-conflict" => "operation-conflict",
-        "invalid-request" => "invalid-request",
-        "source-changed" => "source-changed",
-        "media-input-too-large" => "media-input-too-large",
-        "media-dimensions-too-large" => "media-dimensions-too-large",
-        "media-frame-limit" => "media-frame-limit",
-        "decoded-byte-limit" => "decoded-byte-limit",
-        "png-chunk-limit" => "png-chunk-limit",
-        "malformed-media" => "malformed-media",
-        "malformed-process-output" => "malformed-process-output",
-        "tool-missing" => "tool-missing",
-        "process-failed" => "process-failed",
-        "output-conflict" => "output-conflict",
-        _ => "internal-task-failed",
+#[derive(Clone)]
+struct SourcePreflight {
+    identity: SourceIdentity,
+    canonical_path: PathBuf,
+}
+
+impl SourcePreflight {
+    fn capture(input_path: &Path, limits: MediaLimits) -> Result<Self, PipelineError> {
+        let identity = SourceIdentity::from_path(input_path, limits)?;
+        Ok(Self {
+            canonical_path: identity.canonical_path.clone(),
+            identity,
+        })
+    }
+
+    fn validate_expected(
+        input_path: &Path,
+        source_revision: Option<&str>,
+        limits: MediaLimits,
+    ) -> Result<Self, PipelineError> {
+        let identity = validate_source_revision(input_path, source_revision, limits)?;
+        Ok(Self {
+            canonical_path: identity.canonical_path.clone(),
+            identity,
+        })
+    }
+
+    fn identity(&self) -> &SourceIdentity {
+        &self.identity
+    }
+
+    fn canonical_path(&self) -> &Path {
+        &self.canonical_path
     }
 }
 
-fn canonical_reason_code(reason_code: &str) -> Option<&'static str> {
-    match reason_code {
-        "no-frames-selected" => Some("no-frames-selected"),
-        "invalid-frame-selection" => Some("invalid-frame-selection"),
-        "invalid-frame-duration" => Some("invalid-frame-duration"),
-        "duration-too-long" => Some("duration-too-long"),
-        "invalid-crop" => Some("invalid-crop"),
-        "invalid-output-directory" => Some("invalid-output-directory"),
-        "unsupported-source-format" => Some("unsupported-source-format"),
-        "unsupported-frame-preview" => Some("unsupported-frame-preview"),
-        "frame-preview-decode-failed" => Some("frame-preview-decode-failed"),
-        "frame-preview-encode-failed" => Some("frame-preview-encode-failed"),
-        "decode-failed" => Some("decode-failed"),
-        "encode-failed" => Some("encode-failed"),
-        "missing-output" => Some("missing-output"),
-        "plan-invalid" => Some("plan-invalid"),
-        "invoke-failed" => Some("invoke-failed"),
-        _ => None,
-    }
+fn run_reserved_preflight<T>(
+    context: &OperationContext,
+    work: impl FnOnce() -> Result<T, PipelineError>,
+) -> Result<T, PipelineError> {
+    context.checkpoint()?;
+    let result = work();
+    context.checkpoint()?;
+    result
 }
 
 fn validate_source_revision(
@@ -5458,6 +5595,40 @@ fn ensure_source_unchanged(
         return Err(PipelineError::SourceChanged);
     }
     Ok(())
+}
+
+fn checkpointed_source_check(
+    context: &OperationContext,
+    expected: &SourceIdentity,
+    limits: MediaLimits,
+) -> Result<(), PipelineError> {
+    context.checkpoint()?;
+    let source_check = ensure_source_unchanged(expected, limits);
+    context.checkpoint()?;
+    source_check
+}
+
+fn finalize_managed_response<T>(
+    context: &OperationContext,
+    response: T,
+) -> Result<T, PipelineError> {
+    if context.is_completed() {
+        Ok(response)
+    } else {
+        context.finalize(|| Ok(response))
+    }
+}
+
+fn finalize_source_publication<T>(
+    context: &OperationContext,
+    expected: &SourceIdentity,
+    publisher: impl FnOnce() -> Result<T, PipelineError>,
+) -> Result<T, PipelineError> {
+    context.checkpoint()?;
+    let source_check = ensure_source_unchanged(expected, MediaLimits::default());
+    context.checkpoint()?;
+    source_check?;
+    context.finalize(publisher)
 }
 
 fn finalize_source_checked<T>(
@@ -6010,17 +6181,19 @@ fn read_png_metadata(
     limits: MediaLimits,
     checkpoint: impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<PngFileMetadata, PipelineError> {
-    let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
-        operation: "open PNG input",
-        message: error.to_string(),
-    })?;
-    let metadata = file.metadata().map_err(|error| PipelineError::Io {
-        operation: "read PNG input metadata",
-        message: error.to_string(),
-    })?;
-    let file_length = validate_file_metadata(metadata, limits)?.len();
-    let mut reader = BufReader::new(&mut file);
-    read_png_metadata_from_reader(&mut reader, file_length, limits, checkpoint)
+    run_decoder_boundary("png", || {
+        let mut file = File::open(input_path).map_err(|error| PipelineError::Io {
+            operation: "open PNG input",
+            message: error.to_string(),
+        })?;
+        let metadata = file.metadata().map_err(|error| PipelineError::Io {
+            operation: "read PNG input metadata",
+            message: error.to_string(),
+        })?;
+        let file_length = validate_file_metadata(metadata, limits)?.len();
+        let mut reader = BufReader::new(&mut file);
+        read_png_metadata_from_reader(&mut reader, file_length, limits, checkpoint)
+    })
 }
 
 fn read_png_animation_metadata(
@@ -6795,19 +6968,42 @@ fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInsp
 
 fn inspect_input_media_with_operation(
     input_path: &str,
+    preflight: &SourcePreflight,
     locale: UiLocale,
     context: &OperationContext,
     progress: &impl ProgressSink,
 ) -> MediaInspection {
-    inspect_input_media_with_callbacks(
+    if let Err(error) = context.checkpoint() {
+        return inspection_pipeline_error(input_path, &error, locale);
+    }
+    publish_progress(progress, context, ProgressStage::Inspecting, 0, Some(1));
+    let mut checkpoint = || context.checkpoint();
+    let inspection = inspect_input_media_preflighted_with_callbacks(
         input_path,
+        preflight,
         locale,
         Some(context),
-        || context.checkpoint(),
-        |stage, completed, total| {
-            publish_progress(progress, context, stage, completed, total);
-        },
-    )
+        &mut checkpoint,
+    );
+    let tool_source = inspection.tool_source.clone();
+    let tool_command = inspection.tool_command.clone();
+    let tool_detail = inspection.tool_detail.clone();
+    let fallback_reason_code = inspection.fallback_reason_code.clone();
+    match finalize_source_publication(context, preflight.identity(), || {
+        publish_progress(progress, context, ProgressStage::Finalizing, 1, Some(1));
+        Ok(inspection)
+    }) {
+        Ok(inspection) => inspection,
+        Err(error) => inspection_error_with_fallback_reason(
+            input_path,
+            tool_source,
+            tool_command,
+            tool_detail,
+            fallback_reason_code,
+            error.code(),
+            pipeline_error_diagnostic(&error, locale),
+        ),
+    }
 }
 
 fn inspect_input_media_with_callbacks(
@@ -6821,8 +7017,8 @@ fn inspect_input_media_with_callbacks(
         return inspection_pipeline_error(input_path, &error, locale);
     }
     let limits = MediaLimits::default();
-    let identity = match SourceIdentity::from_path(Path::new(input_path), limits) {
-        Ok(identity) => identity,
+    let preflight = match SourcePreflight::capture(Path::new(input_path), limits) {
+        Ok(preflight) => preflight,
         Err(error) => {
             return inspection_error(
                 input_path,
@@ -6834,15 +7030,13 @@ fn inspect_input_media_with_callbacks(
             );
         }
     };
-    let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
-    let inspection = inspect_input_media_canonical_with_checkpoint(
-        &canonical_path,
+    let inspection = inspect_input_media_preflighted_with_callbacks(
+        input_path,
+        &preflight,
         locale,
         context,
         &mut checkpoint,
     );
-    let inspection = apply_inspection_source_revision(&identity, input_path, inspection);
-    let inspection = enforce_desktop_inspection_frame_limit(inspection, locale);
     let tool_source = inspection.tool_source.clone();
     let tool_command = inspection.tool_command.clone();
     let tool_detail = inspection.tool_detail.clone();
@@ -6851,7 +7045,7 @@ fn inspect_input_media_with_callbacks(
     if let Err(error) = checkpoint() {
         return inspection_pipeline_error_with_provenance(input_path, &inspection, &error, locale);
     }
-    finalize_source_checked(&identity, inspection, limits, |error| {
+    finalize_source_checked(preflight.identity(), inspection, limits, |error| {
         inspection_error_with_fallback_reason(
             input_path,
             tool_source,
@@ -6862,6 +7056,20 @@ fn inspect_input_media_with_callbacks(
             pipeline_error_diagnostic(&error, locale),
         )
     })
+}
+
+fn inspect_input_media_preflighted_with_callbacks(
+    input_path: &str,
+    preflight: &SourcePreflight,
+    locale: UiLocale,
+    context: Option<&OperationContext>,
+    checkpoint: &mut impl FnMut() -> Result<(), PipelineError>,
+) -> MediaInspection {
+    let canonical_path = preflight.canonical_path().to_string_lossy().into_owned();
+    let inspection =
+        inspect_input_media_canonical_with_checkpoint(&canonical_path, locale, context, checkpoint);
+    let inspection = apply_inspection_source_revision(preflight.identity(), input_path, inspection);
+    enforce_desktop_inspection_frame_limit(inspection, locale)
 }
 
 fn check_media_tools_internal(locale: UiLocale) -> ToolHealthReport {
@@ -6902,23 +7110,61 @@ async fn inspect_input_media(
     pipeline_state: State<'_, PipelineState>,
 ) -> MediaInspection {
     let locale = parse_ui_locale(locale.as_deref());
+    if input_path.trim().is_empty() {
+        return inspection_pipeline_error(
+            &input_path,
+            &PipelineError::InvalidRequestWithoutReason,
+            locale,
+        );
+    }
+    let kind = MediaOperationKind::Inspect;
     let input_path_for_error = input_path.clone();
     let state = pipeline_state.inner().clone();
-    let progress = ChannelProgressSink::new(on_progress);
-    let registered = match state.register(&operation_id, MediaOperationKind::Inspect.timeout()) {
-        Ok(registered) => registered,
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = match state.reserve(&operation_id) {
+        Ok(reservation) => reservation,
         Err(error) => return inspection_pipeline_error(&input_path, &error, locale),
     };
-    let context = registered.context().clone();
-    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
-    let permit = match state.acquire_decode(&context).await {
-        Ok(permit) => permit,
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = input_path.clone();
+    let preflight = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            SourcePreflight::capture(Path::new(&preflight_input_path), MediaLimits::default())
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return inspection_pipeline_error(&input_path, &error, locale),
+        Err(message) => {
+            return inspection_pipeline_error(
+                &input_path,
+                &PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+                locale,
+            )
+        }
+    };
+    let managed = match reservation.promote(kind, &progress).await {
+        Ok(managed) => managed,
         Err(error) => return inspection_pipeline_error(&input_path, &error, locale),
     };
-    publish_progress(&progress, &context, ProgressStage::Inspecting, 0, Some(1));
+    let context = managed.context().clone();
 
-    match run_managed_blocking(registered, permit, move || {
-        inspect_input_media_with_operation(&input_path, locale, &context, &progress)
+    match run_managed_blocking(managed, move || {
+        let response = if let Err(error) =
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+        {
+            inspection_pipeline_error(&input_path, &error, locale)
+        } else {
+            inspect_input_media_with_operation(&input_path, &preflight, locale, &context, &progress)
+        };
+        match finalize_managed_response(&context, response) {
+            Ok(response) => response,
+            Err(error) => inspection_pipeline_error(&input_path, &error, locale),
+        }
     })
     .await
     {
@@ -6943,10 +7189,11 @@ async fn build_optimizer_plan(
 ) -> OptimizerPlanResponse {
     let locale = parse_ui_locale(request.locale.as_deref());
     let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
+    let kind = MediaOperationKind::BuildPlan;
     let state = pipeline_state.inner().clone();
-    let progress = ChannelProgressSink::new(on_progress);
-    let registered = match state.register(&operation_id, MediaOperationKind::BuildPlan.timeout()) {
-        Ok(registered) => registered,
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = match state.reserve(&operation_id) {
+        Ok(reservation) => reservation,
         Err(error) => {
             return optimizer_plan_pipeline_error(
                 locale,
@@ -6955,11 +7202,29 @@ async fn build_optimizer_plan(
             )
         }
     };
-    let context = registered.context().clone();
-    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
+    let managed = match reservation.promote(kind, &progress).await {
+        Ok(managed) => managed,
+        Err(error) => {
+            return optimizer_plan_pipeline_error(
+                locale,
+                fallback_fit_warning.into_iter().collect(),
+                &error,
+            )
+        }
+    };
+    let context = managed.context().clone();
+    let worker_fallback_fit_warning = fallback_fit_warning.clone();
 
-    match run_managed_blocking(registered, (), move || {
-        prepare_optimizer_plan_with_operation(&request, locale, &context, &progress)
+    match run_managed_blocking(managed, move || {
+        let response = prepare_optimizer_plan_with_operation(&request, locale, &context, &progress);
+        match finalize_managed_response(&context, response) {
+            Ok(response) => response,
+            Err(error) => optimizer_plan_pipeline_error(
+                locale,
+                worker_fallback_fit_warning.into_iter().collect(),
+                &error,
+            ),
+        }
     })
     .await
     {
@@ -6983,42 +7248,78 @@ async fn convert_static_image_to_png(
     pipeline_state: State<'_, PipelineState>,
 ) -> StaticImageConversionResult {
     let locale = parse_ui_locale(request.locale.as_deref());
-    let state = pipeline_state.inner().clone();
-    let progress = ChannelProgressSink::new(on_progress);
-    let registered = match state.register(
-        &operation_id,
-        MediaOperationKind::StaticConversion.timeout(),
-    ) {
-        Ok(registered) => registered,
-        Err(error) => return static_conversion_pipeline_error(&error, locale),
-    };
-    let context = registered.context().clone();
-    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
-    let permits = match state.acquire_output_then_decode(&context).await {
-        Ok(permits) => permits,
-        Err(error) => return static_conversion_pipeline_error(&error, locale),
-    };
-
-    match run_managed_blocking(registered, permits, move || {
-        let identity = match validate_source_revision(
-            Path::new(&request.input_path),
-            request.source_revision.as_deref(),
-            MediaLimits::default(),
-        ) {
-            Ok(identity) => identity,
-            Err(error) => return static_conversion_pipeline_error(&error, locale),
-        };
-        let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
-        let response = convert_static_image_to_png_with_operation(
-            &canonical_path,
-            request.output_directory.as_deref(),
-            request.crop_region.as_ref(),
+    if request.input_path.trim().is_empty()
+        || request
+            .source_revision
+            .as_deref()
+            .filter(|revision| !revision.trim().is_empty())
+            .is_none()
+    {
+        return static_conversion_pipeline_error(
+            &PipelineError::InvalidRequestWithoutReason,
             locale,
-            Some(&identity),
-            &context,
-            &progress,
         );
-        finalize_static_conversion_source_unless_published(&identity, response, locale)
+    }
+    let kind = MediaOperationKind::StaticConversion;
+    let state = pipeline_state.inner().clone();
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = match state.reserve(&operation_id) {
+        Ok(reservation) => reservation,
+        Err(error) => return static_conversion_pipeline_error(&error, locale),
+    };
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = request.input_path.clone();
+    let preflight_source_revision = request.source_revision.clone();
+    let preflight = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            SourcePreflight::validate_expected(
+                Path::new(&preflight_input_path),
+                preflight_source_revision.as_deref(),
+                MediaLimits::default(),
+            )
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return static_conversion_pipeline_error(&error, locale),
+        Err(message) => {
+            return static_conversion_pipeline_error(
+                &PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+                locale,
+            )
+        }
+    };
+    let managed = match reservation.promote(kind, &progress).await {
+        Ok(managed) => managed,
+        Err(error) => return static_conversion_pipeline_error(&error, locale),
+    };
+    let context = managed.context().clone();
+
+    match run_managed_blocking(managed, move || {
+        let response = if let Err(error) =
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+        {
+            static_conversion_pipeline_error(&error, locale)
+        } else {
+            let canonical_path = preflight.canonical_path().to_string_lossy().into_owned();
+            convert_static_image_to_png_with_operation(
+                &canonical_path,
+                request.output_directory.as_deref(),
+                request.crop_region.as_ref(),
+                locale,
+                &preflight,
+                &context,
+                &progress,
+            )
+        };
+        match finalize_managed_response(&context, response) {
+            Ok(response) => response,
+            Err(error) => static_conversion_pipeline_error(&error, locale),
+        }
     })
     .await
     {
@@ -7064,10 +7365,226 @@ fn optimizer_search_pipeline_error_with_duration(
         best_output_path: None,
         best_size_bytes: None,
         best_within_limit: false,
-        reason_code: error.reason_code().map(str::to_string),
-        error_code: Some(error.code().into()),
+        reason_code: error.media_reason_code(),
+        error_code: Some(error.error_code()),
         error_message: Some(pipeline_error_diagnostic(&error, locale)),
     }
+}
+
+#[derive(Clone, Copy)]
+enum OptimizerRequestDomainOrigin {
+    Direct,
+    Plan,
+}
+
+struct OptimizerRequestDomainError {
+    origin: OptimizerRequestDomainOrigin,
+    reason: &'static str,
+    message: String,
+    selected_duration_seconds: Option<f64>,
+    warnings: Vec<String>,
+}
+
+fn optimizer_request_domain_error(
+    locale: UiLocale,
+    origin: OptimizerRequestDomainOrigin,
+    reason: &'static str,
+    selected_duration_seconds: Option<f64>,
+) -> OptimizerRequestDomainError {
+    let message = match reason {
+        "no-frames-selected" => locale::frame_selection_required_error(locale),
+        "invalid-frame-duration" => locale::invalid_frame_duration_error(locale),
+        "duration-too-long" => locale::selected_duration_limit_error(locale),
+        _ => locale::invalid_frame_selection_error(locale),
+    };
+    OptimizerRequestDomainError {
+        origin,
+        reason,
+        message,
+        selected_duration_seconds,
+        warnings: Vec::new(),
+    }
+}
+
+fn with_optimizer_domain_warnings(
+    mut error: OptimizerRequestDomainError,
+    warnings: &[String],
+) -> OptimizerRequestDomainError {
+    error.warnings.extend_from_slice(warnings);
+    error
+}
+
+fn validate_optimizer_search_request_domain(
+    request: &OptimizerSearchRequest,
+    locale: UiLocale,
+) -> Result<(), OptimizerRequestDomainError> {
+    let optimizer_goal = normalized_optimizer_goal(
+        request.optimizer_goal.as_deref(),
+        request.preset_strategy.as_deref(),
+    );
+    let quality_frame_drop_interval =
+        normalized_quality_frame_drop_interval(request.quality_frame_drop_interval);
+    let timeline_frames =
+        resolve_timeline_frames(request.timeline_frames.as_ref(), request.base_frame_count)
+            .map_err(|reason| {
+                optimizer_request_domain_error(
+                    locale,
+                    OptimizerRequestDomainOrigin::Direct,
+                    reason,
+                    None,
+                )
+            })?;
+    let (timeline_frames, frame_selection) = match timeline_frames {
+        Some(timeline_frames) => {
+            let timeline_frames = if optimizer_goal == "quality" {
+                apply_quality_frame_drop_to_timeline_frames(
+                    timeline_frames,
+                    quality_frame_drop_interval,
+                )
+                .map_err(|reason| {
+                    optimizer_request_domain_error(
+                        locale,
+                        OptimizerRequestDomainOrigin::Direct,
+                        reason,
+                        None,
+                    )
+                })?
+            } else {
+                timeline_frames
+            };
+            (Some(timeline_frames), None)
+        }
+        None => {
+            let frame_selection =
+                resolve_frame_selection(request.selected_frames.as_ref(), request.base_frame_count)
+                    .map_err(|reason| {
+                        optimizer_request_domain_error(
+                            locale,
+                            OptimizerRequestDomainOrigin::Direct,
+                            reason,
+                            None,
+                        )
+                    })?;
+            let frame_selection = if optimizer_goal == "quality" {
+                apply_quality_frame_drop_to_selection(frame_selection, quality_frame_drop_interval)
+                    .map_err(|reason| {
+                        optimizer_request_domain_error(
+                            locale,
+                            OptimizerRequestDomainOrigin::Direct,
+                            reason,
+                            None,
+                        )
+                    })?
+            } else {
+                frame_selection
+            };
+            (None, Some(frame_selection))
+        }
+    };
+
+    let resolved_crop_region = resolve_crop_region(
+        request.crop_region.as_ref(),
+        request.input_width,
+        request.input_height,
+        locale,
+    )
+    .map_err(|message| OptimizerRequestDomainError {
+        origin: OptimizerRequestDomainOrigin::Plan,
+        reason: "invalid-crop",
+        message,
+        selected_duration_seconds: None,
+        warnings: Vec::new(),
+    })?;
+    let plan_warnings = resolved_crop_region
+        .is_some()
+        .then(|| locale::crop_applied_before_scale_warning(locale))
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if let Some(timeline_frames) = timeline_frames {
+        let duration_us = timeline_duration_us(&timeline_frames).map_err(|reason| {
+            with_optimizer_domain_warnings(
+                optimizer_request_domain_error(
+                    locale,
+                    OptimizerRequestDomainOrigin::Plan,
+                    reason,
+                    None,
+                ),
+                &plan_warnings,
+            )
+        })?;
+        if duration_us > DISCORD_MAX_DURATION_US {
+            let duration_seconds = duration_us_to_seconds(duration_us);
+            return Err(with_optimizer_domain_warnings(
+                optimizer_request_domain_error(
+                    locale,
+                    OptimizerRequestDomainOrigin::Plan,
+                    "duration-too-long",
+                    Some(duration_seconds),
+                ),
+                &plan_warnings,
+            ));
+        }
+        return Ok(());
+    }
+
+    let frame_selection = frame_selection.expect("selection exists when timeline is absent");
+    let source_fps = derive_source_fps(
+        request.avg_fps,
+        request.source_duration_seconds,
+        frame_selection.base_frame_count,
+    );
+    let duration_seconds = projected_selection_duration_seconds(
+        frame_selection.selected_frame_count,
+        frame_selection.base_frame_count,
+        request.source_duration_seconds,
+        source_fps,
+    );
+    if duration_seconds > duration_us_to_seconds(DISCORD_MAX_DURATION_US) {
+        return Err(with_optimizer_domain_warnings(
+            optimizer_request_domain_error(
+                locale,
+                OptimizerRequestDomainOrigin::Plan,
+                "duration-too-long",
+                Some(duration_seconds),
+            ),
+            &plan_warnings,
+        ));
+    }
+    Ok(())
+}
+
+fn optimizer_search_domain_error(
+    locale: UiLocale,
+    mut warnings: Vec<String>,
+    error: OptimizerRequestDomainError,
+) -> OptimizerSearchResponse {
+    let OptimizerRequestDomainError {
+        origin,
+        reason,
+        message,
+        selected_duration_seconds,
+        warnings: domain_warnings,
+    } = error;
+    warnings.extend(domain_warnings);
+    let mut response = optimizer_search_pipeline_error_with_duration(
+        locale,
+        warnings,
+        PipelineError::InvalidRequest { reason },
+        selected_duration_seconds,
+    );
+    match origin {
+        OptimizerRequestDomainOrigin::Direct => {
+            response.stop_reason = Some(reason.into());
+            response.summary = locale::plan_failed_message(locale);
+        }
+        OptimizerRequestDomainOrigin::Plan => {
+            response.stop_reason = Some("plan-invalid".into());
+            response.summary = message.clone();
+        }
+    }
+    response.error_message = Some(message);
+    response
 }
 
 fn run_optimizer_search_internal(
@@ -7080,13 +7597,17 @@ fn run_optimizer_search_internal(
 fn run_optimizer_search_with_operation(
     request: OptimizerSearchRequest,
     locale: UiLocale,
+    preflight: &SourcePreflight,
     context: &OperationContext,
     progress: &impl ProgressSink,
 ) -> OptimizerSearchResponse {
-    run_optimizer_search_with_callbacks(
+    let loader = DefaultFrameSourceLoader;
+    run_optimizer_search_with_loader_core(
         request,
         locale,
         Some(context),
+        &loader,
+        Some(preflight),
         || context.checkpoint(),
         |stage, completed, total| {
             publish_progress(progress, context, stage, completed, total);
@@ -7105,11 +7626,39 @@ fn run_optimizer_search_with_callbacks(
     run_optimizer_search_with_loader(request, locale, context, &loader, checkpoint, progress)
 }
 
+fn publish_optimizer_finalizing_progress(
+    progress: &mut impl FnMut(ProgressStage, u32, Option<u32>),
+    completed: u32,
+    total: u32,
+) {
+    progress(ProgressStage::Finalizing, completed, Some(total));
+}
+
 fn run_optimizer_search_with_loader(
     mut request: OptimizerSearchRequest,
     locale: UiLocale,
     context: Option<&OperationContext>,
     loader: &impl FrameSourceLoader,
+    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
+) -> OptimizerSearchResponse {
+    run_optimizer_search_with_loader_core(
+        request,
+        locale,
+        context,
+        loader,
+        None,
+        &mut checkpoint,
+        &mut progress,
+    )
+}
+
+fn run_optimizer_search_with_loader_core(
+    mut request: OptimizerSearchRequest,
+    locale: UiLocale,
+    context: Option<&OperationContext>,
+    loader: &impl FrameSourceLoader,
+    source_preflight: Option<&SourcePreflight>,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
     mut progress: impl FnMut(ProgressStage, u32, Option<u32>),
 ) -> OptimizerSearchResponse {
@@ -7123,15 +7672,18 @@ fn run_optimizer_search_with_loader(
     if let Err(error) = checkpoint() {
         return optimizer_search_pipeline_error(locale, legacy_fit_warnings, error);
     }
-    let source_identity = match validate_source_revision(
-        Path::new(&request.input_path),
-        request.source_revision.as_deref(),
-        MediaLimits::default(),
-    ) {
-        Ok(identity) => identity,
-        Err(error) => {
-            return optimizer_search_pipeline_error(locale, legacy_fit_warnings, error);
-        }
+    let source_identity = match source_preflight {
+        Some(preflight) => preflight.identity().clone(),
+        None => match validate_source_revision(
+            Path::new(&request.input_path),
+            request.source_revision.as_deref(),
+            MediaLimits::default(),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return optimizer_search_pipeline_error(locale, legacy_fit_warnings, error);
+            }
+        },
     };
     request.input_path = source_identity
         .canonical_path
@@ -7174,8 +7726,10 @@ fn run_optimizer_search_with_loader(
                                 best_output_path: None,
                                 best_size_bytes: None,
                                 best_within_limit: false,
-                                reason_code: Some(error.into()),
-                                error_code: Some("invalid-request".into()),
+                                reason_code: MediaOperationReasonCode::from_code(error),
+                                error_code: Some(
+                                    MediaOperationErrorCode::for_invalid_request_reason(error),
+                                ),
                                 error_message: Some(locale::frame_selection_required_error(locale)),
                             };
                         }
@@ -7201,8 +7755,8 @@ fn run_optimizer_search_with_loader(
                     best_output_path: None,
                     best_size_bytes: None,
                     best_within_limit: false,
-                    reason_code: Some("no-frames-selected".into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: Some(MediaOperationReasonCode::NoFramesSelected),
+                    error_code: Some(MediaOperationErrorCode::InvalidRequest),
                     error_message: Some(locale::frame_selection_required_error(locale)),
                 };
             }
@@ -7229,8 +7783,8 @@ fn run_optimizer_search_with_loader(
                     best_output_path: None,
                     best_size_bytes: None,
                     best_within_limit: false,
-                    reason_code: Some(reason.into()),
-                    error_code: Some("invalid-request".into()),
+                    reason_code: MediaOperationReasonCode::from_code(reason),
+                    error_code: Some(MediaOperationErrorCode::for_invalid_request_reason(reason)),
                     error_message: Some(error_message),
                 };
             }
@@ -7267,8 +7821,12 @@ fn run_optimizer_search_with_loader(
                                         best_output_path: None,
                                         best_size_bytes: None,
                                         best_within_limit: false,
-                                        reason_code: Some(error.into()),
-                                        error_code: Some("invalid-request".into()),
+                                        reason_code: MediaOperationReasonCode::from_code(error),
+                                        error_code: Some(
+                                            MediaOperationErrorCode::for_invalid_request_reason(
+                                                error,
+                                            ),
+                                        ),
                                         error_message: Some(
                                             locale::frame_selection_required_error(locale),
                                         ),
@@ -7299,8 +7857,8 @@ fn run_optimizer_search_with_loader(
                             best_output_path: None,
                             best_size_bytes: None,
                             best_within_limit: false,
-                            reason_code: Some("no-frames-selected".into()),
-                            error_code: Some("invalid-request".into()),
+                            reason_code: Some(MediaOperationReasonCode::NoFramesSelected),
+                            error_code: Some(MediaOperationErrorCode::InvalidRequest),
                             error_message: Some(locale::frame_selection_required_error(locale)),
                         };
                     }
@@ -7322,8 +7880,8 @@ fn run_optimizer_search_with_loader(
                             best_output_path: None,
                             best_size_bytes: None,
                             best_within_limit: false,
-                            reason_code: Some("invalid-frame-selection".into()),
-                            error_code: Some("invalid-request".into()),
+                            reason_code: Some(MediaOperationReasonCode::InvalidFrameSelection),
+                            error_code: Some(MediaOperationErrorCode::InvalidRequest),
                             error_message: Some(locale::invalid_frame_selection_error(locale)),
                         };
                     }
@@ -7416,10 +7974,9 @@ fn run_optimizer_search_with_loader(
                 )
             }
         };
-        if let Err(error) = checkpoint()
-            .and_then(|_| operation_context.checkpoint())
-            .and_then(|_| ensure_source_unchanged(&source_identity, MediaLimits::default()))
-        {
+        if let Err(error) = checkpoint().and_then(|_| {
+            checkpointed_source_check(operation_context, &source_identity, MediaLimits::default())
+        }) {
             return optimizer_search_pipeline_error_with_duration(
                 locale,
                 plan.warnings.clone(),
@@ -7462,7 +8019,11 @@ fn run_optimizer_search_with_loader(
                     plan.selected_duration_seconds,
                 );
             }
-            if let Err(error) = ensure_source_unchanged(&source_identity, MediaLimits::default()) {
+            if let Err(error) = checkpointed_source_check(
+                operation_context,
+                &source_identity,
+                MediaLimits::default(),
+            ) {
                 return optimizer_search_pipeline_error_with_duration(
                     locale,
                     plan.warnings.clone(),
@@ -7620,25 +8181,44 @@ fn run_optimizer_search_with_loader(
             "no_fit_found"
         };
         let best_within_limit = best_within_limit_output.is_some();
-        progress(
-            ProgressStage::Finalizing,
-            completed_candidates,
-            Some(total_candidates),
-        );
-        if let Err(error) = checkpoint() {
-            return optimizer_search_pipeline_error_with_duration(
-                locale,
-                plan.warnings.clone(),
-                error,
-                plan.selected_duration_seconds,
+        let published_output = if source_preflight.is_some() {
+            finalize_source_publication(operation_context, &source_identity, || {
+                progress(
+                    ProgressStage::Finalizing,
+                    completed_candidates,
+                    Some(total_candidates),
+                );
+                publish_optimizer_selection(
+                    &source_identity,
+                    true,
+                    best_within_limit_output,
+                    smallest_oversize_output,
+                    &mut attempts,
+                )
+            })
+        } else {
+            if let Err(error) = checkpoint() {
+                return optimizer_search_pipeline_error_with_duration(
+                    locale,
+                    plan.warnings.clone(),
+                    error,
+                    plan.selected_duration_seconds,
+                );
+            }
+            publish_optimizer_finalizing_progress(
+                &mut progress,
+                completed_candidates,
+                total_candidates,
             );
-        }
-        let published_output = match publish_optimizer_selection(
-            &source_identity,
-            best_within_limit_output,
-            smallest_oversize_output,
-            &mut attempts,
-        ) {
+            publish_optimizer_selection(
+                &source_identity,
+                false,
+                best_within_limit_output,
+                smallest_oversize_output,
+                &mut attempts,
+            )
+        };
+        let published_output = match published_output {
             Ok(output) => output,
             Err(error) => {
                 return optimizer_search_pipeline_error_with_duration(
@@ -7686,7 +8266,11 @@ fn run_optimizer_search_with_loader(
             error_message: None,
         }
     })();
-    finalize_optimizer_search_source_unless_published(&source_identity, response, locale)
+    if source_preflight.is_some() {
+        response
+    } else {
+        finalize_optimizer_search_source_unless_published(&source_identity, response, locale)
+    }
 }
 
 #[cfg(test)]
@@ -7697,7 +8281,7 @@ mod tests {
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -8190,7 +8774,7 @@ mod tests {
         assert_eq!(runner_source.matches(&wait).count(), 1);
         assert_eq!(runner_source.matches(&output).count(), 0);
         assert!(runner_source.contains("Stdio::null()"));
-        assert!(runner_source.contains("sync_channel::<FrameEvent>(2)"));
+        assert!(runner_source.contains("sync_channel::<FrameEvent>(0)"));
     }
 
     #[derive(Debug)]
@@ -8466,6 +9050,7 @@ mod tests {
 
         let published = publish_optimizer_selection(
             &source_identity,
+            false,
             Some(winner),
             Some(oversize),
             &mut attempts,
@@ -8498,10 +9083,15 @@ mod tests {
         let oversize = build_pending_selection(directory.path(), &source_path, "oversize", 999_999);
         let mut attempts = vec![build_test_attempt("oversize", false)];
 
-        let published =
-            publish_optimizer_selection(&source_identity, None, Some(oversize), &mut attempts)
-                .expect("oversize selection must publish")
-                .expect("oversize candidate must be selected");
+        let published = publish_optimizer_selection(
+            &source_identity,
+            false,
+            None,
+            Some(oversize),
+            &mut attempts,
+        )
+        .expect("oversize selection must publish")
+        .expect("oversize candidate must be selected");
 
         assert_eq!(published.selected.candidate_id, "oversize");
         assert_eq!(
@@ -8522,7 +9112,7 @@ mod tests {
         fs::remove_file(&source_path).expect("source fixture must be removed");
 
         let error =
-            publish_optimizer_selection(&source_identity, Some(winner), None, &mut attempts)
+            publish_optimizer_selection(&source_identity, false, Some(winner), None, &mut attempts)
                 .expect_err("source change must prevent selected publication");
 
         assert_eq!(error, PipelineError::SourceChanged);
@@ -12657,7 +13247,8 @@ mod tests {
             .len();
         assert_ne!(changed_len, identity.file_len);
 
-        let error = finalize_preview_cache_publication(&cache, &key, &identity)
+        let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
+        let error = finalize_preview_cache_publication(&cache, &key, &identity, &context, None)
             .expect_err("changed source must reject preview-cache publication");
 
         assert_eq!(error, PipelineError::SourceChanged);
@@ -12746,6 +13337,7 @@ mod tests {
         assert_eq!(native.matches("visit_native_animation_frames(").count(), 1);
         assert!(!native.contains("decode_native_animation_frames("));
         assert!(!native.contains("Vec<StickerFrame>"));
+        assert!(native.contains("finalize_preview_cache_publication("));
 
         let video = source_section(
             source,
@@ -12758,6 +13350,7 @@ mod tests {
         assert!(video.contains("\"0:v:0\""));
         assert!(video.contains("\"-fps_mode\""));
         assert!(video.contains("\"passthrough\""));
+        assert!(video.contains("finalize_preview_cache_publication("));
 
         let single = source_section(
             source,
@@ -12779,6 +13372,583 @@ mod tests {
         );
         assert!(finalization.contains("ensure_source_unchanged("));
         assert!(finalization.contains("invalidate("));
+        assert!(finalization.contains("fn finalize_preview_source_publication"));
+        assert!(finalization.contains("context.finalize("));
+    }
+
+    fn tauri_command_source_block<'a>(source: &'a str, command: &str) -> &'a str {
+        let marker = format!("fn {command}(");
+        let start = source.find(&marker).expect("command source marker");
+        let remainder = &source[start..];
+        let body_start = remainder.find('{').expect("command body marker");
+        let mut depth = 0usize;
+
+        for (offset, character) in remainder[body_start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1).expect("balanced command body");
+                    if depth == 0 {
+                        let end = body_start + offset + character.len_utf8();
+                        return &remainder[..end];
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        panic!("unterminated command body")
+    }
+
+    fn rust_function_source_block<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).expect("function source marker");
+        let remainder = &source[start..];
+        let tail = &remainder[marker.len()..];
+        let end = [
+            "\nfn ",
+            "\npub(crate) fn ",
+            "\n#[tauri::command]",
+            "\n#[cfg(test)]",
+        ]
+        .into_iter()
+        .filter_map(|next_marker| tail.find(next_marker))
+        .min()
+        .map(|offset| marker.len() + offset)
+        .unwrap_or(remainder.len());
+        &remainder[..end]
+    }
+
+    fn assert_source_order(block: &str, markers: &[&str]) {
+        let mut previous = 0;
+        for marker in markers {
+            let offset = block[previous..]
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing ordered marker {marker}"))
+                + previous;
+            previous = offset + marker.len();
+        }
+    }
+
+    #[test]
+    fn reserved_preflight_observes_cancellation_before_returning_a_work_error() {
+        let context = OperationContext::detached(MediaOperationKind::Inspect.timeout());
+
+        let result = run_reserved_preflight(&context, || {
+            assert!(context.cancel());
+            Err::<(), PipelineError>(PipelineError::SourceChanged)
+        });
+
+        assert_eq!(result, Err(PipelineError::Cancelled));
+    }
+
+    #[test]
+    fn managed_terminal_response_linearizes_late_cancellation() {
+        let context = OperationContext::detached(MediaOperationKind::Inspect.timeout());
+
+        assert_eq!(
+            finalize_managed_response(&context, "domain-error-response"),
+            Ok("domain-error-response")
+        );
+        assert!(context.is_completed());
+        assert!(!context.cancel());
+    }
+
+    #[test]
+    fn managed_terminal_response_observes_cancellation_before_completion() {
+        let context = OperationContext::detached(MediaOperationKind::Inspect.timeout());
+        assert!(context.cancel());
+
+        assert_eq!(
+            finalize_managed_response(&context, "stale-response"),
+            Err(PipelineError::Cancelled)
+        );
+        assert!(!context.is_completed());
+    }
+
+    #[test]
+    fn optimizer_search_domain_validation_rejects_invalid_selection_before_preflight() {
+        let request = serde_json::from_str::<OptimizerSearchRequest>(
+            r#"{
+                "inputPath": "input.gif",
+                "sourceRevision": "revision",
+                "selectedFrames": [],
+                "baseFrameCount": 1
+            }"#,
+        )
+        .expect("bounded request fixture");
+
+        let error = validate_optimizer_search_request_domain(&request, UiLocale::En)
+            .expect_err("empty selection must fail domain validation");
+
+        assert_eq!(error.reason, "no-frames-selected");
+        assert_eq!(error.selected_duration_seconds, None);
+    }
+
+    #[test]
+    fn optimizer_search_plan_origin_domain_error_preserves_plan_failure_metadata() {
+        let request = serde_json::from_str::<OptimizerSearchRequest>(
+            r#"{
+                "inputPath": "input.gif",
+                "sourceRevision": "revision",
+                "selectedFrames": [1],
+                "baseFrameCount": 1,
+                "sourceDurationSeconds": 6.0,
+                "inputWidth": 100,
+                "inputHeight": 100,
+                "cropRegion": { "x": 0.1, "y": 0.1, "width": 0.8, "height": 0.8 }
+            }"#,
+        )
+        .expect("duration request fixture");
+        let error = validate_optimizer_search_request_domain(&request, UiLocale::En)
+            .expect_err("long duration must fail plan-domain validation");
+        let expected_summary = error.message.clone();
+
+        let response = optimizer_search_domain_error(UiLocale::En, Vec::new(), error);
+
+        assert_eq!(response.stop_reason.as_deref(), Some("plan-invalid"));
+        assert_eq!(response.summary, expected_summary);
+        assert_eq!(
+            response.warnings,
+            vec![locale::crop_applied_before_scale_warning(UiLocale::En)]
+        );
+    }
+
+    #[test]
+    fn optimizer_search_domain_prevalidation_is_pure_and_bounded() {
+        let source = include_str!("lib.rs");
+        let validator =
+            rust_function_source_block(source, "fn validate_optimizer_search_request_domain(");
+
+        assert!(validator.contains("resolve_timeline_frames("));
+        assert!(validator.contains("resolve_frame_selection("));
+        assert!(validator.contains("resolve_crop_region("));
+        assert!(!validator.contains("SourcePreflight"));
+        assert!(!validator.contains("loader.prepare("));
+        assert!(!validator.contains("build_candidate_"));
+    }
+
+    #[test]
+    fn managed_commands_reserve_preflight_promote_and_run_one_managed_bundle() {
+        let source = include_str!("lib.rs");
+        let commands = [
+            (
+                "inspect_input_media",
+                "MediaOperationKind::Inspect",
+                Some("inspect_input_media_with_operation("),
+            ),
+            (
+                "build_optimizer_plan",
+                "MediaOperationKind::BuildPlan",
+                None,
+            ),
+            (
+                "convert_static_image_to_png",
+                "MediaOperationKind::StaticConversion",
+                Some("convert_static_image_to_png_with_operation("),
+            ),
+            (
+                "run_optimizer_search",
+                "MediaOperationKind::OptimizerSearch",
+                Some("run_optimizer_search_with_operation("),
+            ),
+            (
+                "extract_frame_preview",
+                "MediaOperationKind::Preview",
+                Some("extract_frame_preview_with_operation("),
+            ),
+            (
+                "extract_frame_previews",
+                "MediaOperationKind::Preview",
+                Some("extract_frame_previews_with_operation("),
+            ),
+        ];
+
+        for (command, kind, worker) in commands {
+            let block = tauri_command_source_block(source, command);
+            assert!(block.contains(kind), "{command} operation kind");
+            if let Some(worker) = worker {
+                assert_source_order(
+                    block,
+                    &[
+                        ".reserve(&operation_id)",
+                        "run_reserved_preflight(",
+                        "SourcePreflight",
+                        ".promote(",
+                        "run_managed_blocking(managed",
+                        "checkpointed_source_check(",
+                        worker,
+                    ],
+                );
+            } else {
+                assert_source_order(
+                    block,
+                    &[
+                        ".reserve(&operation_id)",
+                        ".promote(",
+                        "run_managed_blocking(managed",
+                    ],
+                );
+                assert!(!block.contains("SourcePreflight"), "{command}");
+            }
+            assert_eq!(
+                block.matches(".reserve(&operation_id)").count(),
+                1,
+                "{command}"
+            );
+            assert_eq!(block.matches(".promote(").count(), 1, "{command}");
+            assert_eq!(
+                block.matches("run_managed_blocking(managed").count(),
+                1,
+                "{command}"
+            );
+            assert_eq!(
+                block.matches("finalize_managed_response(").count(),
+                1,
+                "{command}"
+            );
+        }
+
+        let search = tauri_command_source_block(source, "run_optimizer_search");
+        assert_source_order(
+            search,
+            &[
+                "validate_optimizer_search_request_domain(",
+                ".reserve(&operation_id)",
+                "run_reserved_preflight(",
+                ".promote(",
+            ],
+        );
+    }
+
+    #[test]
+    fn command_business_logic_keeps_injectable_loader_checkpoint_and_progress_seams() {
+        let source = include_str!("lib.rs");
+        let search = source_section(
+            source,
+            "fn run_optimizer_search_with_loader(",
+            "#[cfg(test)]",
+        );
+
+        assert!(search.contains("loader: &impl FrameSourceLoader"));
+        assert!(search.contains("checkpoint: impl FnMut() -> Result<(), PipelineError>"));
+        assert!(search.contains("progress: impl FnMut(ProgressStage, u32, Option<u32>)"));
+        assert!(search.contains("loader.prepare("));
+    }
+
+    #[test]
+    fn output_commands_recheck_worker_source_and_finalize_publication_in_one_order() {
+        let source = include_str!("lib.rs");
+        for (command, worker) in [
+            (
+                "convert_static_image_to_png",
+                "convert_static_image_to_png_with_operation(",
+            ),
+            (
+                "run_optimizer_search",
+                "run_optimizer_search_with_operation(",
+            ),
+        ] {
+            let block = tauri_command_source_block(source, command);
+            assert_source_order(
+                block,
+                &[
+                    "run_managed_blocking(managed",
+                    "checkpointed_source_check(",
+                    worker,
+                ],
+            );
+        }
+
+        let finalizer = rust_function_source_block(source, "fn finalize_source_publication(");
+        assert_source_order(
+            finalizer,
+            &[
+                "context.checkpoint()",
+                "ensure_source_unchanged(",
+                "context.checkpoint()",
+                "context.finalize(",
+            ],
+        );
+
+        let static_conversion = source_section(
+            source,
+            "fn convert_static_image_to_png_with_callbacks(",
+            "fn static_conversion_pipeline_error(",
+        );
+        assert_source_order(
+            static_conversion,
+            &[
+                "finalize_source_publication(",
+                "ProgressStage::Finalizing",
+                ".commit(",
+            ],
+        );
+
+        let search = source_section(
+            source,
+            "fn run_optimizer_search_with_loader(",
+            "#[cfg(test)]",
+        );
+        assert_source_order(
+            search,
+            &[
+                "finalize_source_publication(",
+                "ProgressStage::Finalizing",
+                "publish_optimizer_selection(",
+            ],
+        );
+    }
+
+    #[test]
+    fn cancelled_finalize_drops_pending_output_without_final_or_temporary_file() {
+        for (kind, suffix) in [
+            (MediaOperationKind::StaticConversion, "static-cancelled"),
+            (MediaOperationKind::OptimizerSearch, "search-cancelled"),
+        ] {
+            let directory = tempfile::tempdir().expect("temp directory must be created");
+            let source_path = directory.path().join("source.png");
+            fs::write(&source_path, b"source").expect("source fixture must be written");
+            let mut pending = PendingOutput::new(directory.path(), &source_path, suffix, "png")
+                .expect("pending output must be created");
+            pending
+                .writer()
+                .write_all(b"encoded")
+                .expect("pending bytes must be written");
+            let identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+                .expect("source identity must be created");
+            let context = OperationContext::detached(kind.timeout());
+            let publisher_called = Arc::new(AtomicBool::new(false));
+            let publisher_called_in_closure = Arc::clone(&publisher_called);
+            assert!(context.cancel());
+
+            let result = finalize_source_publication(&context, &identity, move || {
+                publisher_called_in_closure.store(true, AtomicOrdering::SeqCst);
+                pending.commit()
+            });
+
+            assert!(matches!(result, Err(PipelineError::Cancelled)));
+            assert!(!publisher_called.load(AtomicOrdering::SeqCst));
+            let paths = fs::read_dir(directory.path())
+                .expect("output directory must be readable")
+                .map(|entry| entry.expect("directory entry").path())
+                .collect::<Vec<_>>();
+            assert_eq!(paths, vec![source_path]);
+        }
+    }
+
+    #[test]
+    fn source_mutation_before_finalize_drops_pending_output_without_publish() {
+        let directory = tempfile::tempdir().expect("temp directory must be created");
+        let source_path = directory.path().join("source.png");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let mut pending = PendingOutput::new(directory.path(), &source_path, "changed", "png")
+            .expect("pending output must be created");
+        pending
+            .writer()
+            .write_all(b"encoded")
+            .expect("pending bytes must be written");
+        fs::write(&source_path, b"source changed to another length")
+            .expect("source fixture must be changed");
+        let context = OperationContext::detached(MediaOperationKind::OptimizerSearch.timeout());
+        let publisher_called = Arc::new(AtomicBool::new(false));
+        let publisher_called_in_closure = Arc::clone(&publisher_called);
+
+        let result = finalize_source_publication(&context, &identity, move || {
+            publisher_called_in_closure.store(true, AtomicOrdering::SeqCst);
+            pending.commit()
+        });
+
+        assert_eq!(result, Err(PipelineError::SourceChanged));
+        assert!(!publisher_called.load(AtomicOrdering::SeqCst));
+        let paths = fs::read_dir(directory.path())
+            .expect("output directory must be readable")
+            .map(|entry| entry.expect("directory entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![source_path]);
+    }
+
+    #[test]
+    fn optimizer_search_progress_stages_are_monotonic_and_finalizing_is_last() {
+        let source = include_str!("lib.rs");
+        let search = source_section(
+            source,
+            "fn run_optimizer_search_with_loader(",
+            "#[cfg(test)]",
+        );
+        let estimating = search
+            .find("progress(ProgressStage::Estimating")
+            .expect("estimating progress");
+        let decoding = search[estimating..]
+            .find("progress(ProgressStage::Decoding")
+            .expect("decoding progress")
+            + estimating;
+        let encoding = search[decoding..]
+            .find("progress(ProgressStage::Encoding")
+            .expect("encoding progress")
+            + decoding;
+        let finalizing = search[encoding..]
+            .find("ProgressStage::Finalizing")
+            .expect("finalizing progress")
+            + encoding;
+
+        assert!(estimating < decoding && decoding < encoding && encoding < finalizing);
+        assert!(!search[finalizing + "ProgressStage::Finalizing".len()..]
+            .contains("progress(ProgressStage::"));
+    }
+
+    #[test]
+    fn preview_cancel_uses_matching_receipt_but_source_change_invalidates_full_key() {
+        let test_dir = TestDir::new("preview-finalize-ownership");
+        let source_path = test_dir.path.join("input.gif");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let key = PreviewSourceKey {
+            identity: identity.clone(),
+            source_revision: identity.revision(),
+            variant: PreviewVariant::Native,
+        };
+        let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+        let stale_publication = cache
+            .get_or_try_build_complete(&key, &[1], || {
+                Ok::<_, PipelineError>(vec![CachedPreview {
+                    source_frame_id: 1,
+                    png_bytes: Arc::from([1_u8].as_slice()),
+                    width: 1,
+                    height: 1,
+                }])
+            })
+            .expect("initial preview publication")
+            .publication
+            .expect("initial publication receipt");
+        let current_publication = cache
+            .merge_partial(
+                key.clone(),
+                vec![CachedPreview {
+                    source_frame_id: 2,
+                    png_bytes: Arc::from([2_u8].as_slice()),
+                    width: 1,
+                    height: 1,
+                }],
+            )
+            .expect("replacement publication receipt");
+        let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
+        assert!(context.cancel());
+
+        assert!(matches!(
+            checkpoint_preview_cache_publication(&cache, &key, &context, Some(&stale_publication),),
+            Err(PipelineError::Cancelled)
+        ));
+        assert!(cache.contains_key(&key));
+
+        fs::write(&source_path, b"source changed to a different length")
+            .expect("source fixture must be changed");
+        let source_change_context =
+            OperationContext::detached(MediaOperationKind::Preview.timeout());
+        assert_eq!(
+            finalize_preview_cache_publication(
+                &cache,
+                &key,
+                &identity,
+                &source_change_context,
+                Some(&current_publication),
+            ),
+            Err(PipelineError::SourceChanged)
+        );
+        assert!(!cache.contains_key(&key));
+    }
+
+    #[test]
+    fn preview_source_change_invalidates_the_full_key_when_cancellation_wins() {
+        let test_dir = TestDir::new("preview-source-change-cancel-race");
+        let source_path = test_dir.path.join("input.gif");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let key = PreviewSourceKey {
+            identity: identity.clone(),
+            source_revision: identity.revision(),
+            variant: PreviewVariant::Native,
+        };
+        let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+        let publication = cache
+            .get_or_try_build_complete(&key, &[1], || {
+                Ok::<_, PipelineError>(vec![CachedPreview {
+                    source_frame_id: 1,
+                    png_bytes: Arc::from([1_u8].as_slice()),
+                    width: 1,
+                    height: 1,
+                }])
+            })
+            .expect("preview publication")
+            .publication
+            .expect("publication receipt");
+        let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
+
+        let result = finalize_preview_cache_publication_with_check(
+            &cache,
+            &key,
+            &context,
+            Some(&publication),
+            || {
+                assert!(context.cancel());
+                Err(PipelineError::SourceChanged)
+            },
+        );
+
+        assert_eq!(result, Err(PipelineError::Cancelled));
+        assert!(!cache.contains_key(&key));
+    }
+
+    #[test]
+    fn preview_load_source_change_invalidates_the_full_key_before_returning_cancelled() {
+        let test_dir = TestDir::new("preview-load-source-change-cancel-race");
+        let source_path = test_dir.path.join("input.gif");
+        fs::write(&source_path, b"source").expect("source fixture must be written");
+        let identity = SourceIdentity::from_path(&source_path, MediaLimits::default())
+            .expect("source identity must be created");
+        let key = PreviewSourceKey {
+            identity: identity.clone(),
+            source_revision: identity.revision(),
+            variant: PreviewVariant::Native,
+        };
+        let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+        assert!(cache.publish_complete(
+            key.clone(),
+            vec![CachedPreview {
+                source_frame_id: 1,
+                png_bytes: Arc::from([1_u8].as_slice()),
+                width: 1,
+                height: 1,
+            }],
+        ));
+        let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
+        assert!(context.cancel());
+
+        let result = settle_preview_load_result::<()>(
+            &cache,
+            &key,
+            &context,
+            Err(PipelineError::SourceChanged),
+        );
+
+        assert_eq!(result, Err(PipelineError::Cancelled));
+        assert!(!cache.contains_key(&key));
+    }
+
+    #[test]
+    fn custom_png_metadata_parser_runs_inside_the_decoder_panic_boundary() {
+        let source = include_str!("lib.rs");
+        let parser = source_section(
+            source,
+            "fn read_png_metadata(",
+            "fn read_png_animation_metadata(",
+        );
+
+        assert!(parser.contains("run_decoder_boundary(\"png\""));
+        assert!(parser.contains("read_png_metadata_from_reader("));
     }
 }
 
@@ -12791,23 +13961,31 @@ async fn run_optimizer_search(
 ) -> OptimizerSearchResponse {
     let locale = parse_ui_locale(request.locale.as_deref());
     let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
+    if request.input_path.trim().is_empty()
+        || request
+            .source_revision
+            .as_deref()
+            .filter(|revision| !revision.trim().is_empty())
+            .is_none()
+    {
+        return optimizer_search_pipeline_error(
+            locale,
+            fallback_fit_warning.into_iter().collect(),
+            PipelineError::InvalidRequestWithoutReason,
+        );
+    }
+    if let Err(error) = validate_optimizer_search_request_domain(&request, locale) {
+        return optimizer_search_domain_error(
+            locale,
+            fallback_fit_warning.into_iter().collect(),
+            error,
+        );
+    }
+    let kind = MediaOperationKind::OptimizerSearch;
     let state = pipeline_state.inner().clone();
-    let progress = ChannelProgressSink::new(on_progress);
-    let registered =
-        match state.register(&operation_id, MediaOperationKind::OptimizerSearch.timeout()) {
-            Ok(registered) => registered,
-            Err(error) => {
-                return optimizer_search_pipeline_error(
-                    locale,
-                    fallback_fit_warning.into_iter().collect(),
-                    error,
-                )
-            }
-        };
-    let context = registered.context().clone();
-    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
-    let permits = match state.acquire_output_then_decode(&context).await {
-        Ok(permits) => permits,
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = match state.reserve(&operation_id) {
+        Ok(reservation) => reservation,
         Err(error) => {
             return optimizer_search_pipeline_error(
                 locale,
@@ -12816,9 +13994,72 @@ async fn run_optimizer_search(
             )
         }
     };
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = request.input_path.clone();
+    let preflight_source_revision = request.source_revision.clone();
+    let preflight = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            SourcePreflight::validate_expected(
+                Path::new(&preflight_input_path),
+                preflight_source_revision.as_deref(),
+                MediaLimits::default(),
+            )
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => {
+            return optimizer_search_pipeline_error(
+                locale,
+                fallback_fit_warning.into_iter().collect(),
+                error,
+            )
+        }
+        Err(message) => {
+            return optimizer_search_pipeline_error(
+                locale,
+                fallback_fit_warning.into_iter().collect(),
+                PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+            )
+        }
+    };
+    let managed = match reservation.promote(kind, &progress).await {
+        Ok(managed) => managed,
+        Err(error) => {
+            return optimizer_search_pipeline_error(
+                locale,
+                fallback_fit_warning.into_iter().collect(),
+                error,
+            )
+        }
+    };
+    let context = managed.context().clone();
+    let worker_fallback_fit_warning = fallback_fit_warning.clone();
 
-    match run_managed_blocking(registered, permits, move || {
-        run_optimizer_search_with_operation(request, locale, &context, &progress)
+    match run_managed_blocking(managed, move || {
+        let response = if let Err(error) =
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+        {
+            optimizer_search_pipeline_error(
+                locale,
+                worker_fallback_fit_warning.clone().into_iter().collect(),
+                error,
+            )
+        } else {
+            run_optimizer_search_with_operation(request, locale, &preflight, &context, &progress)
+        };
+        match finalize_managed_response(&context, response) {
+            Ok(response) => response,
+            Err(error) => optimizer_search_pipeline_error(
+                locale,
+                worker_fallback_fit_warning.into_iter().collect(),
+                error,
+            ),
+        }
     })
     .await
     {
@@ -12847,52 +14088,84 @@ async fn extract_frame_preview(
     pipeline_state: State<'_, PipelineState>,
 ) -> FramePreviewResponse {
     let locale = parse_ui_locale(locale.as_deref());
+    if input_path.trim().is_empty()
+        || source_revision
+            .as_deref()
+            .filter(|revision| !revision.trim().is_empty())
+            .is_none()
+    {
+        return frame_preview_pipeline_error(&PipelineError::InvalidRequestWithoutReason, locale);
+    }
+    if let Err(error) = normalize_preview_source_frame_ids(&[source_frame_id]) {
+        return frame_preview_pipeline_error(&error, locale);
+    }
+    let kind = MediaOperationKind::Preview;
     let state = pipeline_state.inner().clone();
     let preview_cache = state.preview_cache();
-    let progress = ChannelProgressSink::new(on_progress);
-    let registered = match state.register(&operation_id, MediaOperationKind::Preview.timeout()) {
-        Ok(registered) => registered,
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = match state.reserve(&operation_id) {
+        Ok(reservation) => reservation,
         Err(error) => return frame_preview_pipeline_error(&error, locale),
     };
-    let context = registered.context().clone();
-    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
-    let permit = match state.acquire_decode(&context).await {
-        Ok(permit) => permit,
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = input_path.clone();
+    let preflight_source_revision = source_revision.clone();
+    let (preflight, key) = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            let preflight = SourcePreflight::validate_expected(
+                Path::new(&preflight_input_path),
+                preflight_source_revision.as_deref(),
+                MediaLimits::default(),
+            )?;
+            let revision = preflight.identity().revision();
+            let key = preview_source_key(
+                preflight.canonical_path(),
+                preflight.identity(),
+                &revision,
+                source_width,
+                source_height,
+            )?;
+            Ok((preflight, key))
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return frame_preview_pipeline_error(&error, locale),
+        Err(message) => {
+            return frame_preview_pipeline_error(
+                &PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+                locale,
+            )
+        }
+    };
+    let managed = match reservation.promote(kind, &progress).await {
+        Ok(managed) => managed,
         Err(error) => return frame_preview_pipeline_error(&error, locale),
     };
+    let context = managed.context().clone();
 
-    match run_managed_blocking(registered, permit, move || {
-        let identity = match validate_source_revision(
-            Path::new(&input_path),
-            source_revision.as_deref(),
-            MediaLimits::default(),
-        ) {
-            Ok(identity) => identity,
-            Err(error) => return frame_preview_pipeline_error(&error, locale),
+    match run_managed_blocking(managed, move || {
+        let response = if let Err(error) =
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+        {
+            frame_preview_pipeline_error(&error, locale)
+        } else {
+            extract_frame_preview_with_operation(
+                &preflight,
+                source_frame_id,
+                locale,
+                &key,
+                &preview_cache,
+                &context,
+                &progress,
+            )
         };
-        let validated_revision = identity.revision();
-        let key = match preview_source_key(
-            &identity.canonical_path,
-            &identity,
-            &validated_revision,
-            source_width,
-            source_height,
-        ) {
-            Ok(key) => key,
-            Err(error) => return frame_preview_pipeline_error(&error, locale),
-        };
-        let response = extract_frame_preview_with_operation(
-            &identity.canonical_path,
-            source_frame_id,
-            locale,
-            &identity,
-            &key,
-            &preview_cache,
-            &context,
-            &progress,
-        );
-        match finalize_preview_cache_publication(&preview_cache, &key, &identity) {
-            Ok(()) => response,
+        match finalize_managed_response(&context, response) {
+            Ok(response) => response,
             Err(error) => frame_preview_pipeline_error(&error, locale),
         }
     })
@@ -12922,53 +14195,85 @@ async fn extract_frame_previews(
     pipeline_state: State<'_, PipelineState>,
 ) -> FramePreviewsResponse {
     let locale = parse_ui_locale(locale.as_deref());
-    let source_frame_ids = source_frame_ids.0;
+    if input_path.trim().is_empty()
+        || source_revision
+            .as_deref()
+            .filter(|revision| !revision.trim().is_empty())
+            .is_none()
+    {
+        return frame_previews_pipeline_error(&PipelineError::InvalidRequestWithoutReason, locale);
+    }
+    let source_frame_ids = match normalize_preview_source_frame_ids(&source_frame_ids.0) {
+        Ok(source_frame_ids) => source_frame_ids,
+        Err(error) => return frame_previews_pipeline_error(&error, locale),
+    };
+    let kind = MediaOperationKind::Preview;
     let state = pipeline_state.inner().clone();
     let preview_cache = state.preview_cache();
-    let progress = ChannelProgressSink::new(on_progress);
-    let registered = match state.register(&operation_id, MediaOperationKind::Preview.timeout()) {
-        Ok(registered) => registered,
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = match state.reserve(&operation_id) {
+        Ok(reservation) => reservation,
         Err(error) => return frame_previews_pipeline_error(&error, locale),
     };
-    let context = registered.context().clone();
-    publish_progress(&progress, &context, ProgressStage::Queued, 0, None);
-    let permit = match state.acquire_decode(&context).await {
-        Ok(permit) => permit,
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = input_path.clone();
+    let preflight_source_revision = source_revision.clone();
+    let (preflight, key) = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            let preflight = SourcePreflight::validate_expected(
+                Path::new(&preflight_input_path),
+                preflight_source_revision.as_deref(),
+                MediaLimits::default(),
+            )?;
+            let revision = preflight.identity().revision();
+            let key = preview_source_key(
+                preflight.canonical_path(),
+                preflight.identity(),
+                &revision,
+                source_width,
+                source_height,
+            )?;
+            Ok((preflight, key))
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return frame_previews_pipeline_error(&error, locale),
+        Err(message) => {
+            return frame_previews_pipeline_error(
+                &PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+                locale,
+            )
+        }
+    };
+    let managed = match reservation.promote(kind, &progress).await {
+        Ok(managed) => managed,
         Err(error) => return frame_previews_pipeline_error(&error, locale),
     };
+    let context = managed.context().clone();
 
-    match run_managed_blocking(registered, permit, move || {
-        let identity = match validate_source_revision(
-            Path::new(&input_path),
-            source_revision.as_deref(),
-            MediaLimits::default(),
-        ) {
-            Ok(identity) => identity,
-            Err(error) => return frame_previews_pipeline_error(&error, locale),
+    match run_managed_blocking(managed, move || {
+        let response = if let Err(error) =
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+        {
+            frame_previews_pipeline_error(&error, locale)
+        } else {
+            extract_frame_previews_with_operation(
+                &preflight,
+                &source_frame_ids,
+                locale,
+                &key,
+                &preview_cache,
+                &context,
+                &progress,
+            )
         };
-        let validated_revision = identity.revision();
-        let key = match preview_source_key(
-            &identity.canonical_path,
-            &identity,
-            &validated_revision,
-            source_width,
-            source_height,
-        ) {
-            Ok(key) => key,
-            Err(error) => return frame_previews_pipeline_error(&error, locale),
-        };
-        let response = extract_frame_previews_with_operation(
-            &identity.canonical_path,
-            &source_frame_ids,
-            locale,
-            &identity,
-            &key,
-            &preview_cache,
-            &context,
-            &progress,
-        );
-        match finalize_preview_cache_publication(&preview_cache, &key, &identity) {
-            Ok(()) => response,
+        match finalize_managed_response(&context, response) {
+            Ok(response) => response,
             Err(error) => frame_previews_pipeline_error(&error, locale),
         }
     })

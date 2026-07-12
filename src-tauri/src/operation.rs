@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,8 @@ use crate::preview_cache::{PreviewCache, MAX_PREVIEW_CACHE_BYTES};
 const MAX_OPERATION_ID_BYTES: usize = 128;
 const TOMBSTONE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PRE_CANCELLED: usize = 1024;
+const RECENT_FINISHED_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_RECENT_FINISHED: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PermitProfile {
@@ -49,35 +51,80 @@ impl MediaOperationKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationPhase {
+    Reserved,
+    Running,
+    Publishing,
+    Completed,
+}
+
+struct OperationLifecycle {
+    phase: OperationPhase,
+    cancelled: bool,
+    deadline: Option<Instant>,
+}
+
 #[derive(Clone)]
 pub(crate) struct OperationContext {
     operation_id: Arc<str>,
-    deadline: Instant,
+    lifecycle: Arc<Mutex<OperationLifecycle>>,
     cancellation: CancellationToken,
 }
 
 impl OperationContext {
     fn new(operation_id: String, deadline: Instant) -> Self {
+        Self::with_lifecycle(operation_id, OperationPhase::Running, Some(deadline))
+    }
+
+    fn reserved(operation_id: String) -> Self {
+        Self::with_lifecycle(operation_id, OperationPhase::Reserved, None)
+    }
+
+    fn with_lifecycle(
+        operation_id: String,
+        phase: OperationPhase,
+        deadline: Option<Instant>,
+    ) -> Self {
         Self {
             operation_id: operation_id.into(),
-            deadline,
+            lifecycle: Arc::new(Mutex::new(OperationLifecycle {
+                phase,
+                cancelled: false,
+                deadline,
+            })),
             cancellation: CancellationToken::new(),
         }
     }
 
+    fn lock_lifecycle(&self) -> MutexGuard<'_, OperationLifecycle> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn activate(&self, timeout: Duration) -> Result<(), PipelineError> {
+        let deadline = bounded_deadline(Instant::now(), timeout);
+        let mut lifecycle = self.lock_lifecycle();
+        if lifecycle.cancelled || self.cancellation.is_cancelled() {
+            return Err(PipelineError::Cancelled);
+        }
+        if lifecycle.phase != OperationPhase::Reserved {
+            return Err(PipelineError::Io {
+                operation: "activate operation",
+                message: "operation is not reserved".into(),
+            });
+        }
+        lifecycle.deadline = Some(deadline);
+        lifecycle.phase = OperationPhase::Running;
+        Ok(())
+    }
+
     pub(crate) fn detached(timeout: Duration) -> Self {
-        let now = Instant::now();
-        let mut bounded_timeout = timeout;
-        let deadline = loop {
-            if let Some(deadline) = now.checked_add(bounded_timeout) {
-                break deadline;
-            }
-            bounded_timeout = bounded_timeout.checked_div(2).unwrap_or(Duration::ZERO);
-            if bounded_timeout.is_zero() {
-                break now.checked_add(Duration::from_nanos(1)).unwrap_or(now);
-            }
-        };
-        Self::new("detached-process".into(), deadline)
+        Self::new(
+            "detached-process".into(),
+            bounded_deadline(Instant::now(), timeout),
+        )
     }
 
     pub(crate) fn operation_id(&self) -> &str {
@@ -85,7 +132,7 @@ impl OperationContext {
     }
 
     pub(crate) fn deadline(&self) -> Instant {
-        self.deadline
+        self.lock_lifecycle().deadline.unwrap_or_else(Instant::now)
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -93,21 +140,101 @@ impl OperationContext {
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
+        let lifecycle = self.lock_lifecycle();
+        lifecycle.cancelled || self.cancellation.is_cancelled()
     }
 
-    pub(crate) fn cancel(&self) {
+    pub(crate) fn cancel(&self) -> bool {
+        let mut lifecycle = self.lock_lifecycle();
+        if matches!(
+            lifecycle.phase,
+            OperationPhase::Publishing | OperationPhase::Completed
+        ) {
+            return false;
+        }
+        lifecycle.cancelled = true;
         self.cancellation.cancel();
+        true
     }
 
     pub(crate) fn checkpoint(&self) -> Result<(), PipelineError> {
-        if self.is_cancelled() {
+        let lifecycle = self.lock_lifecycle();
+        if lifecycle.cancelled || self.cancellation.is_cancelled() {
             return Err(PipelineError::Cancelled);
         }
-        if Instant::now() >= self.deadline {
+        if lifecycle.phase == OperationPhase::Running
+            && lifecycle
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return Err(PipelineError::TimedOut { stage: "operation" });
         }
         Ok(())
+    }
+
+    pub(crate) fn finalize<T>(
+        &self,
+        finalizer: impl FnOnce() -> Result<T, PipelineError>,
+    ) -> Result<T, PipelineError> {
+        {
+            let mut lifecycle = self.lock_lifecycle();
+            if lifecycle.cancelled || self.cancellation.is_cancelled() {
+                return Err(PipelineError::Cancelled);
+            }
+            if lifecycle.phase != OperationPhase::Running {
+                return Err(PipelineError::Io {
+                    operation: "finalize operation",
+                    message: "operation is not running".into(),
+                });
+            }
+            if lifecycle
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(PipelineError::TimedOut { stage: "operation" });
+            }
+            lifecycle.phase = OperationPhase::Publishing;
+        }
+
+        let _completion = CompletionGuard {
+            lifecycle: Arc::clone(&self.lifecycle),
+        };
+        finalizer()
+    }
+
+    pub(crate) fn is_publishing(&self) -> bool {
+        self.lock_lifecycle().phase == OperationPhase::Publishing
+    }
+
+    pub(crate) fn is_completed(&self) -> bool {
+        self.lock_lifecycle().phase == OperationPhase::Completed
+    }
+}
+
+struct CompletionGuard {
+    lifecycle: Arc<Mutex<OperationLifecycle>>,
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.phase = OperationPhase::Completed;
+    }
+}
+
+fn bounded_deadline(now: Instant, timeout: Duration) -> Instant {
+    let mut bounded_timeout = timeout;
+    loop {
+        if let Some(deadline) = now.checked_add(bounded_timeout) {
+            return deadline;
+        }
+        bounded_timeout = bounded_timeout.checked_div(2).unwrap_or(Duration::ZERO);
+        if bounded_timeout.is_zero() {
+            return now.checked_add(Duration::from_nanos(1)).unwrap_or(now);
+        }
     }
 }
 
@@ -119,6 +246,7 @@ struct ActiveOperation {
 struct RegistryState {
     active: HashMap<String, ActiveOperation>,
     pre_cancelled: HashMap<String, Instant>,
+    recent_finished: HashMap<String, Instant>,
     next_generation: u64,
 }
 
@@ -127,6 +255,7 @@ impl Default for RegistryState {
         Self {
             active: HashMap::new(),
             pre_cancelled: HashMap::new(),
+            recent_finished: HashMap::new(),
             next_generation: 1,
         }
     }
@@ -159,6 +288,41 @@ impl RegistryState {
             self.pre_cancelled.remove(&oldest);
         }
     }
+
+    fn prune_recent_finished(&mut self, now: Instant) {
+        self.recent_finished.retain(|_, finished_at| {
+            match now.checked_duration_since(*finished_at) {
+                Some(age) => age < RECENT_FINISHED_TTL,
+                None => true,
+            }
+        });
+    }
+
+    fn enforce_recent_finished_cap(&mut self) {
+        while self.recent_finished.len() > MAX_RECENT_FINISHED {
+            let oldest = self
+                .recent_finished
+                .iter()
+                .min_by(|(left_id, left_time), (right_id, right_time)| {
+                    left_time
+                        .cmp(right_time)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(operation_id, _)| operation_id.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.recent_finished.remove(&oldest);
+        }
+    }
+
+    fn record_finished_at(&mut self, operation_id: &str, finished_at: Instant) {
+        self.prune_recent_finished(finished_at);
+        self.pre_cancelled.remove(operation_id);
+        self.recent_finished
+            .insert(operation_id.into(), finished_at);
+        self.enforce_recent_finished_cap();
+    }
 }
 
 #[derive(Clone, Default)]
@@ -183,7 +347,7 @@ impl OperationRegistry {
         timeout: Duration,
     ) -> Result<RegisteredOperation, PipelineError> {
         let now = Instant::now();
-        self.register_at(operation_id, now, now + timeout)
+        self.register_at(operation_id, now, bounded_deadline(now, timeout))
     }
 
     fn register_at(
@@ -192,14 +356,38 @@ impl OperationRegistry {
         now: Instant,
         deadline: Instant,
     ) -> Result<RegisteredOperation, PipelineError> {
+        self.claim_at(operation_id, now, Some(deadline))
+    }
+
+    fn reserve(&self, operation_id: &str) -> Result<RegisteredOperation, PipelineError> {
+        self.reserve_at(operation_id, Instant::now())
+    }
+
+    fn reserve_at(
+        &self,
+        operation_id: &str,
+        now: Instant,
+    ) -> Result<RegisteredOperation, PipelineError> {
+        self.claim_at(operation_id, now, None)
+    }
+
+    fn claim_at(
+        &self,
+        operation_id: &str,
+        now: Instant,
+        deadline: Option<Instant>,
+    ) -> Result<RegisteredOperation, PipelineError> {
         validate_operation_id(operation_id)?;
 
         let mut state = self.lock_state();
         state.prune_tombstones(now);
+        state.prune_recent_finished(now);
         if state.pre_cancelled.remove(operation_id).is_some() {
             return Err(PipelineError::Cancelled);
         }
-        if state.active.contains_key(operation_id) {
+        if state.active.contains_key(operation_id)
+            || state.recent_finished.contains_key(operation_id)
+        {
             return Err(PipelineError::OperationConflict {
                 operation_id: operation_id.into(),
             });
@@ -214,7 +402,10 @@ impl OperationRegistry {
                     operation: "allocate operation generation",
                     message: "operation generation counter exhausted".into(),
                 })?;
-        let context = OperationContext::new(operation_id.into(), deadline);
+        let context = match deadline {
+            Some(deadline) => OperationContext::new(operation_id.into(), deadline),
+            None => OperationContext::reserved(operation_id.into()),
+        };
         state.active.insert(
             operation_id.into(),
             ActiveOperation {
@@ -231,6 +422,11 @@ impl OperationRegistry {
         })
     }
 
+    fn record_finished_at(&self, operation_id: &str, finished_at: Instant) {
+        self.lock_state()
+            .record_finished_at(operation_id, finished_at);
+    }
+
     fn cancel(&self, operation_id: &str) -> bool {
         self.cancel_at(operation_id, Instant::now())
     }
@@ -242,9 +438,12 @@ impl OperationRegistry {
 
         let mut state = self.lock_state();
         state.prune_tombstones(now);
+        state.prune_recent_finished(now);
         if let Some(active) = state.active.get(operation_id) {
-            active.context.cancel();
-            return true;
+            return active.context.cancel();
+        }
+        if state.recent_finished.contains_key(operation_id) {
+            return false;
         }
 
         state.pre_cancelled.insert(operation_id.into(), now);
@@ -283,6 +482,7 @@ impl Drop for RegisteredOperation {
             .get(&self.operation_id)
             .is_some_and(|active| active.generation == self.generation)
         {
+            state.record_finished_at(&self.operation_id, Instant::now());
             state.active.remove(&self.operation_id);
         }
     }
@@ -314,6 +514,32 @@ impl PipelineState {
         timeout: Duration,
     ) -> Result<RegisteredOperation, PipelineError> {
         self.registry.register(operation_id, timeout)
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        operation_id: &str,
+    ) -> Result<PreflightReservation, PipelineError> {
+        self.reservation_from(self.registry.reserve(operation_id)?)
+    }
+
+    fn reserve_at(
+        &self,
+        operation_id: &str,
+        now: Instant,
+    ) -> Result<PreflightReservation, PipelineError> {
+        self.reservation_from(self.registry.reserve_at(operation_id, now)?)
+    }
+
+    fn reservation_from(
+        &self,
+        registration: RegisteredOperation,
+    ) -> Result<PreflightReservation, PipelineError> {
+        Ok(PreflightReservation {
+            registration,
+            output: Arc::clone(&self.output),
+            decode: Arc::clone(&self.decode),
+        })
     }
 
     pub(crate) fn cancel(&self, operation_id: &str) -> bool {
@@ -366,19 +592,94 @@ pub(crate) struct EstimateDecodePermits {
     _decode: OwnedSemaphorePermit,
 }
 
-pub(crate) async fn run_managed_blocking<T, P, F>(
+pub(crate) struct PreflightReservation {
     registration: RegisteredOperation,
-    permits: P,
+    output: Arc<Semaphore>,
+    decode: Arc<Semaphore>,
+}
+
+impl PreflightReservation {
+    pub(crate) fn context(&self) -> &OperationContext {
+        self.registration.context()
+    }
+
+    pub(crate) async fn promote<S: ProgressSink>(
+        self,
+        kind: MediaOperationKind,
+        progress: &ValidatedProgressSink<S>,
+    ) -> Result<ManagedOperation, PipelineError> {
+        if progress.kind != kind {
+            return Err(PipelineError::Io {
+                operation: "activate operation",
+                message: "progress sink operation kind mismatch".into(),
+            });
+        }
+
+        self.registration.context().activate(kind.timeout())?;
+        if !progress.try_send(OperationProgress {
+            operation_id: self.registration.context().operation_id().into(),
+            stage: ProgressStage::Queued,
+            completed: 0,
+            total: None,
+            message_code: ProgressStage::Queued.message_code(),
+        }) {
+            return Err(PipelineError::Io {
+                operation: "activate operation",
+                message: "queued progress was rejected".into(),
+            });
+        }
+
+        let permits = match kind.permit_profile() {
+            PermitProfile::None => ManagedPermits::None,
+            PermitProfile::Decode => ManagedPermits::Decode(
+                acquire_permit(Arc::clone(&self.decode), self.registration.context()).await?,
+            ),
+            PermitProfile::OutputDecode => {
+                let output =
+                    acquire_permit(Arc::clone(&self.output), self.registration.context()).await?;
+                let decode =
+                    acquire_permit(Arc::clone(&self.decode), self.registration.context()).await?;
+                ManagedPermits::OutputDecode(OutputDecodePermits {
+                    _output: output,
+                    _decode: decode,
+                })
+            }
+        };
+
+        Ok(ManagedOperation {
+            registration: self.registration,
+            _permits: permits,
+        })
+    }
+}
+
+enum ManagedPermits {
+    None,
+    Decode(OwnedSemaphorePermit),
+    OutputDecode(OutputDecodePermits),
+}
+
+pub(crate) struct ManagedOperation {
+    registration: RegisteredOperation,
+    _permits: ManagedPermits,
+}
+
+impl ManagedOperation {
+    pub(crate) fn context(&self) -> &OperationContext {
+        self.registration.context()
+    }
+}
+
+pub(crate) async fn run_managed_blocking<T, F>(
+    managed: ManagedOperation,
     job: F,
 ) -> Result<T, String>
 where
     T: Send + 'static,
-    P: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let _registration = registration;
-        let _permits = permits;
+        let _managed = managed;
         job()
     })
     .await
@@ -468,6 +769,201 @@ impl ProgressSink for ChannelProgressSink {
     }
 }
 
+struct ProgressCursor {
+    stage: Option<ProgressStage>,
+    completed: u32,
+    total: Option<u32>,
+    sealed: bool,
+}
+
+impl Default for ProgressCursor {
+    fn default() -> Self {
+        Self {
+            stage: None,
+            completed: 0,
+            total: None,
+            sealed: false,
+        }
+    }
+}
+
+impl ProgressCursor {
+    fn accept(&mut self, kind: MediaOperationKind, progress: &OperationProgress) -> bool {
+        if self.sealed
+            || progress
+                .total
+                .is_some_and(|total| progress.completed > total)
+        {
+            return false;
+        }
+
+        match self.stage {
+            None => {
+                if progress.stage != ProgressStage::Queued
+                    || progress.completed != 0
+                    || progress.total.is_some()
+                {
+                    return false;
+                }
+            }
+            Some(current) if current == progress.stage => {
+                if matches!(current, ProgressStage::Queued | ProgressStage::Finalizing)
+                    || progress.completed < self.completed
+                {
+                    return false;
+                }
+                match (self.total, progress.total) {
+                    (Some(expected), Some(actual)) if expected == actual => {}
+                    (Some(_), _) => return false,
+                    (None, _) => {}
+                }
+            }
+            Some(current) => {
+                if !progress_transition_allowed(kind, current, progress.stage) {
+                    return false;
+                }
+            }
+        }
+
+        self.stage = Some(progress.stage);
+        self.completed = progress.completed;
+        self.total = progress.total;
+        self.sealed = progress.stage == ProgressStage::Finalizing;
+        true
+    }
+}
+
+fn progress_transition_allowed(
+    kind: MediaOperationKind,
+    current: ProgressStage,
+    next: ProgressStage,
+) -> bool {
+    match kind {
+        MediaOperationKind::Inspect => matches!(
+            (current, next),
+            (ProgressStage::Queued, ProgressStage::Inspecting)
+                | (ProgressStage::Inspecting, ProgressStage::Decoding)
+                | (ProgressStage::Inspecting, ProgressStage::Finalizing)
+                | (ProgressStage::Decoding, ProgressStage::Finalizing)
+        ),
+        MediaOperationKind::BuildPlan => matches!(
+            (current, next),
+            (ProgressStage::Queued, ProgressStage::Estimating)
+                | (ProgressStage::Estimating, ProgressStage::Finalizing)
+        ),
+        MediaOperationKind::StaticConversion => matches!(
+            (current, next),
+            (ProgressStage::Queued, ProgressStage::Inspecting)
+                | (ProgressStage::Inspecting, ProgressStage::Decoding)
+                | (ProgressStage::Decoding, ProgressStage::Encoding)
+                | (ProgressStage::Encoding, ProgressStage::Finalizing)
+        ),
+        MediaOperationKind::OptimizerSearch => matches!(
+            (current, next),
+            (ProgressStage::Queued, ProgressStage::Estimating)
+                | (ProgressStage::Estimating, ProgressStage::Decoding)
+                | (ProgressStage::Decoding, ProgressStage::Encoding)
+                | (ProgressStage::Encoding, ProgressStage::Finalizing)
+        ),
+        MediaOperationKind::Preview => matches!(
+            (current, next),
+            (ProgressStage::Queued, ProgressStage::Decoding)
+                | (ProgressStage::Decoding, ProgressStage::Encoding)
+                | (ProgressStage::Decoding, ProgressStage::Finalizing)
+                | (ProgressStage::Encoding, ProgressStage::Finalizing)
+        ),
+    }
+}
+
+pub(crate) struct ValidatedProgressSink<S: ProgressSink> {
+    kind: MediaOperationKind,
+    sink: S,
+    state: Mutex<ValidatedProgressState>,
+}
+
+#[derive(Default)]
+struct ValidatedProgressState {
+    cursor: ProgressCursor,
+    pending: VecDeque<OperationProgress>,
+    draining: bool,
+}
+
+struct ProgressDrainGuard<'a> {
+    state: &'a Mutex<ValidatedProgressState>,
+    armed: bool,
+}
+
+impl Drop for ProgressDrainGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.pending.clear();
+            state.draining = false;
+        }
+    }
+}
+
+impl<S: ProgressSink> ValidatedProgressSink<S> {
+    pub(crate) fn new(kind: MediaOperationKind, sink: S) -> Self {
+        Self {
+            kind,
+            sink,
+            state: Mutex::new(ValidatedProgressState::default()),
+        }
+    }
+
+    pub(crate) fn try_send(&self, progress: OperationProgress) -> bool {
+        let should_drain = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.cursor.accept(self.kind, &progress) {
+                return false;
+            }
+            state.pending.push_back(progress);
+            if state.draining {
+                false
+            } else {
+                state.draining = true;
+                true
+            }
+        };
+        if !should_drain {
+            return true;
+        }
+
+        let mut drain_guard = ProgressDrainGuard {
+            state: &self.state,
+            armed: true,
+        };
+        loop {
+            let next = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(next) = state.pending.pop_front() else {
+                    state.draining = false;
+                    drain_guard.armed = false;
+                    return true;
+                };
+                next
+            };
+            self.sink.send(next);
+        }
+    }
+}
+
+impl<S: ProgressSink> ProgressSink for ValidatedProgressSink<S> {
+    fn send(&self, progress: OperationProgress) {
+        let _ = self.try_send(progress);
+    }
+}
+
 pub(crate) fn publish_progress(
     sink: &(impl ProgressSink + ?Sized),
     context: &OperationContext,
@@ -487,6 +983,7 @@ pub(crate) fn publish_progress(
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -510,9 +1007,9 @@ mod tests {
             .expect("test future must settle within one second")
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct RecordingProgressSink {
-        values: Mutex<Vec<OperationProgress>>,
+        values: Arc<Mutex<Vec<OperationProgress>>>,
     }
 
     impl ProgressSink for RecordingProgressSink {
@@ -521,6 +1018,53 @@ mod tests {
                 .lock()
                 .expect("recording sink lock")
                 .push(progress);
+        }
+    }
+
+    struct BlockingEncodingSink {
+        stages: Arc<Mutex<Vec<ProgressStage>>>,
+        encoding_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release_encoding: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ProgressSink for BlockingEncodingSink {
+        fn send(&self, progress: OperationProgress) {
+            if progress.stage == ProgressStage::Encoding {
+                if let Some(started) = self
+                    .encoding_started
+                    .lock()
+                    .expect("encoding-start lock")
+                    .take()
+                {
+                    started.send(()).expect("encoding-start signal");
+                    self.release_encoding
+                        .lock()
+                        .expect("encoding-release lock")
+                        .recv()
+                        .expect("encoding-release signal");
+                }
+            }
+            self.stages
+                .lock()
+                .expect("blocking sink stages lock")
+                .push(progress.stage);
+        }
+    }
+
+    struct PanicOnceProgressSink {
+        panic_next: AtomicBool,
+        stages: Arc<Mutex<Vec<ProgressStage>>>,
+    }
+
+    impl ProgressSink for PanicOnceProgressSink {
+        fn send(&self, progress: OperationProgress) {
+            if self.panic_next.swap(false, Ordering::SeqCst) {
+                panic!("injected progress sink panic");
+            }
+            self.stages
+                .lock()
+                .expect("panic sink stages lock")
+                .push(progress.stage);
         }
     }
 
@@ -812,39 +1356,21 @@ mod tests {
         assert!(source.contains("cancel_media_operation,"));
 
         let managed_commands = [
-            (
-                "inspect_input_media",
-                "MediaOperationKind::Inspect",
-                Some("acquire_decode"),
-            ),
-            (
-                "build_optimizer_plan",
-                "MediaOperationKind::BuildPlan",
-                None,
-            ),
+            ("inspect_input_media", "MediaOperationKind::Inspect"),
+            ("build_optimizer_plan", "MediaOperationKind::BuildPlan"),
             (
                 "convert_static_image_to_png",
                 "MediaOperationKind::StaticConversion",
-                Some("acquire_output_then_decode"),
             ),
             (
                 "run_optimizer_search",
                 "MediaOperationKind::OptimizerSearch",
-                Some("acquire_output_then_decode"),
             ),
-            (
-                "extract_frame_preview",
-                "MediaOperationKind::Preview",
-                Some("acquire_decode"),
-            ),
-            (
-                "extract_frame_previews",
-                "MediaOperationKind::Preview",
-                Some("acquire_decode"),
-            ),
+            ("extract_frame_preview", "MediaOperationKind::Preview"),
+            ("extract_frame_previews", "MediaOperationKind::Preview"),
         ];
 
-        for (command, operation_kind, permit_method) in managed_commands {
+        for (command, operation_kind) in managed_commands {
             let block = command_source_block(source, command);
             assert!(block.contains("operation_id: String"), "{command}");
             assert!(
@@ -858,15 +1384,19 @@ mod tests {
                 1,
                 "{command}"
             );
-            assert!(block.contains("run_managed_blocking("), "{command}");
-
-            match permit_method {
-                Some(permit_method) => {
-                    assert!(block.contains(permit_method), "{command}");
-                    assert_eq!(block.matches(".acquire_").count(), 1, "{command}");
-                }
-                None => assert!(!block.contains(".acquire_"), "{command}"),
-            }
+            assert_eq!(
+                block.matches(".reserve(&operation_id)").count(),
+                1,
+                "{command}"
+            );
+            assert_eq!(block.matches(".promote(").count(), 1, "{command}");
+            assert_eq!(
+                block.matches("run_managed_blocking(managed").count(),
+                1,
+                "{command}"
+            );
+            assert_eq!(block.matches(".register(").count(), 0, "{command}");
+            assert_eq!(block.matches(".acquire_").count(), 0, "{command}");
         }
 
         for command in ["check_media_tools", "open_folder_path"] {
@@ -875,32 +1405,46 @@ mod tests {
             assert!(!block.contains("on_progress"), "{command}");
             assert!(!block.contains("PipelineState"), "{command}");
             assert!(!block.contains("MediaOperationKind::"), "{command}");
+            assert!(!block.contains(".reserve("), "{command}");
+            assert!(!block.contains(".promote("), "{command}");
             assert!(!block.contains(".register("), "{command}");
             assert!(!block.contains(".acquire_"), "{command}");
-            assert!(!block.contains("run_managed_blocking("), "{command}");
+            assert!(!block.contains("run_managed_blocking"), "{command}");
         }
 
         let cancel_block = command_source_block(source, "cancel_media_operation");
         assert!(cancel_block.contains("pipeline_state.cancel(&operation_id)"));
         assert!(!cancel_block.contains("on_progress"));
         assert!(!cancel_block.contains("MediaOperationKind::"));
+        assert!(!cancel_block.contains(".reserve("));
+        assert!(!cancel_block.contains(".promote("));
         assert!(!cancel_block.contains(".register("));
         assert!(!cancel_block.contains(".acquire_"));
-        assert!(!cancel_block.contains("run_managed_blocking("));
+        assert!(!cancel_block.contains("run_managed_blocking"));
     }
 
     fn command_source_block<'a>(source: &'a str, command: &str) -> &'a str {
         let marker = format!("fn {command}(");
         let start = source.find(&marker).expect("command source marker");
         let remainder = &source[start..];
-        let tail = &remainder[marker.len()..];
-        let end = ["#[tauri::command]", "\npub fn run("]
-            .into_iter()
-            .filter_map(|next_marker| tail.find(next_marker))
-            .min()
-            .map(|offset| marker.len() + offset)
-            .unwrap_or(remainder.len());
-        &remainder[..end]
+        let body_start = remainder.find('{').expect("command body marker");
+        let mut depth = 0usize;
+
+        for (offset, character) in remainder[body_start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1).expect("balanced command body");
+                    if depth == 0 {
+                        let end = body_start + offset + character.len_utf8();
+                        return &remainder[..end];
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        panic!("unterminated command body")
     }
 
     #[test]
@@ -1116,18 +1660,21 @@ mod tests {
     fn managed_blocking_worker_keeps_registration_and_permit_after_async_waiter_is_aborted() {
         test_runtime().block_on(async {
             let state = PipelineState::new();
-            let registered = state
-                .register("managed-worker", Duration::from_secs(10))
-                .expect("operation registration");
-            let permit = state
-                .acquire_decode(registered.context())
+            let progress = ValidatedProgressSink::new(
+                MediaOperationKind::Inspect,
+                RecordingProgressSink::default(),
+            );
+            let managed = state
+                .reserve("managed-worker")
+                .expect("reservation must be created")
+                .promote(MediaOperationKind::Inspect, &progress)
                 .await
-                .expect("decode permit");
+                .expect("promotion must succeed");
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
 
-            let waiter = tokio::spawn(run_managed_blocking(registered, permit, move || {
+            let waiter = tokio::spawn(run_managed_blocking(managed, move || {
                 let _ = started_tx.send(());
                 release_rx.recv().expect("worker release signal");
                 let _ = finished_tx.send(());
@@ -1231,5 +1778,729 @@ mod tests {
                 "messageCode": "media-operation-queued",
             })
         );
+    }
+
+    fn progress_event(
+        context: &OperationContext,
+        stage: ProgressStage,
+        completed: u32,
+        total: Option<u32>,
+    ) -> OperationProgress {
+        OperationProgress {
+            operation_id: context.operation_id().into(),
+            stage,
+            completed,
+            total,
+            message_code: stage.message_code(),
+        }
+    }
+
+    #[test]
+    fn preflight_reservation_rejects_duplicate_and_consumes_pre_cancel() {
+        let state = PipelineState::new();
+        let _reservation = state
+            .reserve("reserved-duplicate")
+            .expect("first reservation must own the operation ID");
+        assert!(matches!(
+            state.reserve("reserved-duplicate"),
+            Err(PipelineError::OperationConflict { operation_id })
+                if operation_id == "reserved-duplicate"
+        ));
+
+        assert!(state.cancel("reserved-pre-cancel"));
+        assert!(matches!(
+            state.reserve("reserved-pre-cancel"),
+            Err(PipelineError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn reserved_cancellation_survives_tombstone_eviction_and_blocks_promotion() {
+        test_runtime().block_on(async {
+            let state = PipelineState::new();
+            let reservation = state
+                .reserve("reserved-through-eviction")
+                .expect("reservation must be created");
+            assert!(state.cancel("reserved-through-eviction"));
+
+            for index in 0..=MAX_PRE_CANCELLED {
+                assert!(state.cancel(&format!("unrelated-tombstone-{index}")));
+            }
+
+            let recording = RecordingProgressSink::default();
+            let progress =
+                ValidatedProgressSink::new(MediaOperationKind::OptimizerSearch, recording.clone());
+            let promoted = reservation
+                .promote(MediaOperationKind::OptimizerSearch, &progress)
+                .await;
+
+            assert!(matches!(promoted, Err(PipelineError::Cancelled)));
+            assert!(recording
+                .values
+                .lock()
+                .expect("recording sink lock")
+                .is_empty());
+            assert_eq!(state.output.available_permits(), 1);
+            assert_eq!(state.decode.available_permits(), 2);
+        });
+    }
+
+    #[test]
+    fn output_then_decode_promotion_cancellation_releases_partial_permits_and_registry() {
+        test_runtime().block_on(async {
+            let state = PipelineState::new();
+            let held_decode_a = state
+                .decode
+                .clone()
+                .try_acquire_owned()
+                .expect("first decode permit must be held");
+            let held_decode_b = state
+                .decode
+                .clone()
+                .try_acquire_owned()
+                .expect("second decode permit must be held");
+            let reservation = state
+                .reserve("promote-output-before-decode")
+                .expect("reservation must be created");
+            let recording = RecordingProgressSink::default();
+            let waiter_recording = recording.clone();
+            let waiter = tokio::spawn(async move {
+                let progress = ValidatedProgressSink::new(
+                    MediaOperationKind::StaticConversion,
+                    waiter_recording,
+                );
+                reservation
+                    .promote(MediaOperationKind::StaticConversion, &progress)
+                    .await
+            });
+
+            within_test_timeout(async {
+                loop {
+                    if state.output.available_permits() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert_eq!(state.output.available_permits(), 0);
+            assert_eq!(state.decode.available_permits(), 0);
+            assert_eq!(state.registry.lock_state().active.len(), 1);
+            let queued = recording.values.lock().expect("recording sink lock");
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].stage, ProgressStage::Queued);
+            drop(queued);
+
+            assert!(state.cancel("promote-output-before-decode"));
+            let result = within_test_timeout(waiter)
+                .await
+                .expect("promotion task must not panic");
+            assert!(matches!(result, Err(PipelineError::Cancelled)));
+            assert!(state.registry.lock_state().active.is_empty());
+            assert_eq!(state.output.available_permits(), 1);
+            assert_eq!(state.decode.available_permits(), 0);
+
+            drop(held_decode_a);
+            drop(held_decode_b);
+            assert_eq!(state.decode.available_permits(), 2);
+        });
+    }
+
+    #[test]
+    fn reservation_promotion_starts_deadline_and_emits_queued_once() {
+        test_runtime().block_on(async {
+            let state = PipelineState::new();
+            let reservation = state
+                .reserve("promotion-deadline")
+                .expect("reservation must be created");
+            let recording = RecordingProgressSink::default();
+            let progress =
+                ValidatedProgressSink::new(MediaOperationKind::BuildPlan, recording.clone());
+            let before = Instant::now();
+            let managed = reservation
+                .promote(MediaOperationKind::BuildPlan, &progress)
+                .await
+                .expect("promotion must succeed");
+            let after = Instant::now();
+            let deadline = managed.context().deadline();
+            let timeout = MediaOperationKind::BuildPlan.timeout();
+
+            assert!(deadline >= before + timeout);
+            assert!(deadline <= after + timeout);
+            let values = recording.values.lock().expect("recording sink lock");
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].stage, ProgressStage::Queued);
+            assert_eq!(values[0].completed, 0);
+            assert_eq!(values[0].total, None);
+        });
+    }
+
+    #[test]
+    fn finalize_cancellation_wins_without_running_the_closure() {
+        let context = OperationContext::new("finalize-cancelled".into(), future_deadline());
+        let called = AtomicBool::new(false);
+        assert!(context.cancel());
+
+        let result = context.finalize(|| {
+            called.store(true, Ordering::SeqCst);
+            Ok::<_, PipelineError>(())
+        });
+
+        assert_eq!(result, Err(PipelineError::Cancelled));
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn finalize_first_completes_and_rejects_later_cancellation() {
+        let context = OperationContext::new("finalize-wins".into(), future_deadline());
+
+        assert_eq!(context.finalize(|| Ok::<_, PipelineError>(42)), Ok(42));
+        assert!(context.is_completed());
+        assert!(!context.cancel());
+    }
+
+    #[test]
+    fn finalize_rejects_an_elapsed_deadline_before_running_the_closure() {
+        let context = OperationContext::new(
+            "finalize-expired".into(),
+            Instant::now() - Duration::from_millis(1),
+        );
+        let called = AtomicBool::new(false);
+
+        let result = context.finalize(|| {
+            called.store(true, Ordering::SeqCst);
+            Ok::<_, PipelineError>(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(PipelineError::TimedOut { stage: "operation" })
+        ));
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn finalize_panic_unwind_marks_the_phase_completed() {
+        let context = OperationContext::new("finalize-panic".into(), future_deadline());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), PipelineError> = context.finalize(|| panic!("publisher panic"));
+        }));
+
+        assert!(outcome.is_err());
+        assert!(context.is_completed());
+        assert!(!context.cancel());
+    }
+
+    #[test]
+    fn completed_registration_rejects_late_cancel_and_recent_id_reuse() {
+        test_runtime().block_on(async {
+            let state = PipelineState::new();
+            let recording = RecordingProgressSink::default();
+            let progress = ValidatedProgressSink::new(MediaOperationKind::BuildPlan, recording);
+            let managed = state
+                .reserve("recently-finished")
+                .expect("reservation must be created")
+                .promote(MediaOperationKind::BuildPlan, &progress)
+                .await
+                .expect("promotion must succeed");
+
+            assert_eq!(
+                managed.context().finalize(|| Ok::<_, PipelineError>(())),
+                Ok(())
+            );
+            drop(managed);
+
+            assert!(!state.cancel("recently-finished"));
+            assert!(matches!(
+                state.reserve("recently-finished"),
+                Err(PipelineError::OperationConflict { operation_id })
+                    if operation_id == "recently-finished"
+            ));
+        });
+    }
+
+    #[test]
+    fn managed_blocking_worker_owns_publishing_registration_and_permits_until_completion() {
+        test_runtime().block_on(async {
+            let state = PipelineState::new();
+            let recording = RecordingProgressSink::default();
+            let progress =
+                ValidatedProgressSink::new(MediaOperationKind::StaticConversion, recording);
+            let managed = state
+                .reserve("publishing-worker-ownership")
+                .expect("reservation must be created")
+                .promote(MediaOperationKind::StaticConversion, &progress)
+                .await
+                .expect("promotion must succeed");
+            let context = managed.context().clone();
+            let worker_context = context.clone();
+            let (publishing_tx, publishing_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let waiter = tokio::spawn(run_managed_blocking(managed, move || {
+                worker_context.finalize(|| {
+                    let _ = publishing_tx.send(());
+                    release_rx.recv().expect("publisher release signal");
+                    Ok::<_, PipelineError>(())
+                })
+            }));
+
+            within_test_timeout(publishing_rx)
+                .await
+                .expect("publisher must enter finalization");
+            assert!(context.is_publishing());
+            assert!(!state.cancel("publishing-worker-ownership"));
+            assert_eq!(state.registry.lock_state().active.len(), 1);
+            assert_eq!(state.output.available_permits(), 0);
+            assert_eq!(state.decode.available_permits(), 1);
+
+            release_tx.send(()).expect("release publisher");
+            let worker_result = within_test_timeout(waiter)
+                .await
+                .expect("managed worker task must not panic")
+                .expect("blocking worker must join");
+            assert_eq!(worker_result, Ok(()));
+            assert!(context.is_completed());
+            assert!(state.registry.lock_state().active.is_empty());
+            assert_eq!(state.output.available_permits(), 1);
+            assert_eq!(state.decode.available_permits(), 2);
+        });
+    }
+
+    #[test]
+    fn recent_finished_ttl_allows_reuse_and_cap_evicts_oldest_deterministically() {
+        let state = PipelineState::new();
+        let started = Instant::now();
+        state.registry.record_finished_at("finished-ttl", started);
+
+        assert!(!state
+            .registry
+            .cancel_at("finished-ttl", started + RECENT_FINISHED_TTL / 2));
+        assert!(matches!(
+            state.reserve_at("finished-ttl", started + RECENT_FINISHED_TTL / 2),
+            Err(PipelineError::OperationConflict { operation_id })
+                if operation_id == "finished-ttl"
+        ));
+        drop(
+            state
+                .reserve_at(
+                    "finished-ttl",
+                    started + RECENT_FINISHED_TTL + Duration::from_nanos(1),
+                )
+                .expect("expired finished ID must be reusable"),
+        );
+
+        for index in 0..=MAX_RECENT_FINISHED {
+            state.registry.record_finished_at(
+                &format!("finished-cap-{index}"),
+                started + Duration::from_millis(index as u64),
+            );
+        }
+        let registry = state.registry.lock_state();
+        assert_eq!(registry.recent_finished.len(), MAX_RECENT_FINISHED);
+        assert!(!registry.recent_finished.contains_key("finished-cap-0"));
+        assert!(registry
+            .recent_finished
+            .contains_key(&format!("finished-cap-{MAX_RECENT_FINISHED}")));
+    }
+
+    #[test]
+    fn validated_progress_accepts_each_command_kind_canonical_graph() {
+        let cases: &[(MediaOperationKind, &[ProgressStage])] = &[
+            (
+                MediaOperationKind::Inspect,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Inspecting,
+                    ProgressStage::Decoding,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
+                MediaOperationKind::BuildPlan,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Estimating,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
+                MediaOperationKind::StaticConversion,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Inspecting,
+                    ProgressStage::Decoding,
+                    ProgressStage::Encoding,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
+                MediaOperationKind::OptimizerSearch,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Estimating,
+                    ProgressStage::Decoding,
+                    ProgressStage::Encoding,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
+                MediaOperationKind::Preview,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Decoding,
+                    ProgressStage::Encoding,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+        ];
+
+        for (kind, stages) in cases {
+            let context = OperationContext::new(format!("progress-{kind:?}"), future_deadline());
+            let recording = RecordingProgressSink::default();
+            let progress = ValidatedProgressSink::new(*kind, recording.clone());
+            for stage in *stages {
+                assert!(progress.try_send(progress_event(&context, *stage, 0, None)));
+            }
+            let recorded = recording
+                .values
+                .lock()
+                .expect("recording sink lock")
+                .iter()
+                .map(|value| value.stage)
+                .collect::<Vec<_>>();
+            assert_eq!(recorded.as_slice(), *stages);
+        }
+    }
+
+    #[test]
+    fn validated_progress_accepts_optional_stages_and_rejects_kind_forbidden_stages() {
+        let optional_cases: &[(MediaOperationKind, &[ProgressStage])] = &[
+            (
+                MediaOperationKind::Inspect,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Inspecting,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
+                MediaOperationKind::Preview,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Decoding,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+        ];
+        for (kind, stages) in optional_cases {
+            let context = OperationContext::new(format!("optional-{kind:?}"), future_deadline());
+            let progress = ValidatedProgressSink::new(*kind, RecordingProgressSink::default());
+            for stage in *stages {
+                assert!(progress.try_send(progress_event(&context, *stage, 0, None)));
+            }
+        }
+
+        let forbidden_cases: &[(MediaOperationKind, &[ProgressStage], ProgressStage)] = &[
+            (
+                MediaOperationKind::Inspect,
+                &[ProgressStage::Queued, ProgressStage::Inspecting],
+                ProgressStage::Estimating,
+            ),
+            (
+                MediaOperationKind::BuildPlan,
+                &[ProgressStage::Queued],
+                ProgressStage::Decoding,
+            ),
+            (
+                MediaOperationKind::StaticConversion,
+                &[ProgressStage::Queued, ProgressStage::Inspecting],
+                ProgressStage::Estimating,
+            ),
+            (
+                MediaOperationKind::OptimizerSearch,
+                &[ProgressStage::Queued, ProgressStage::Estimating],
+                ProgressStage::Inspecting,
+            ),
+            (
+                MediaOperationKind::Preview,
+                &[ProgressStage::Queued, ProgressStage::Decoding],
+                ProgressStage::Inspecting,
+            ),
+        ];
+        for (kind, prefix, forbidden) in forbidden_cases {
+            let context = OperationContext::new(format!("forbidden-{kind:?}"), future_deadline());
+            let progress = ValidatedProgressSink::new(*kind, RecordingProgressSink::default());
+            for stage in *prefix {
+                assert!(progress.try_send(progress_event(&context, *stage, 0, None)));
+            }
+            assert!(!progress.try_send(progress_event(&context, *forbidden, 0, None)));
+        }
+    }
+
+    #[test]
+    fn validated_progress_enforces_counts_totals_and_final_seal() {
+        let context = OperationContext::new("validated-progress".into(), future_deadline());
+        let recording = RecordingProgressSink::default();
+        let progress =
+            ValidatedProgressSink::new(MediaOperationKind::OptimizerSearch, recording.clone());
+
+        assert!(!progress.try_send(progress_event(&context, ProgressStage::Estimating, 0, None,)));
+        assert!(progress.try_send(progress_event(&context, ProgressStage::Queued, 0, None,)));
+        assert!(progress.try_send(progress_event(&context, ProgressStage::Estimating, 0, None,)));
+        assert!(progress.try_send(progress_event(
+            &context,
+            ProgressStage::Decoding,
+            0,
+            Some(1),
+        )));
+        assert!(!progress.try_send(progress_event(&context, ProgressStage::Estimating, 1, None,)));
+        assert!(!progress.try_send(progress_event(&context, ProgressStage::Decoding, 0, None,)));
+        assert!(!progress.try_send(progress_event(
+            &context,
+            ProgressStage::Decoding,
+            0,
+            Some(2),
+        )));
+        assert!(progress.try_send(progress_event(
+            &context,
+            ProgressStage::Decoding,
+            1,
+            Some(1),
+        )));
+        assert!(!progress.try_send(progress_event(
+            &context,
+            ProgressStage::Decoding,
+            0,
+            Some(1),
+        )));
+        assert!(progress.try_send(progress_event(
+            &context,
+            ProgressStage::Encoding,
+            0,
+            Some(3),
+        )));
+        assert!(progress.try_send(progress_event(
+            &context,
+            ProgressStage::Encoding,
+            1,
+            Some(3),
+        )));
+        assert!(progress.try_send(progress_event(
+            &context,
+            ProgressStage::Finalizing,
+            1,
+            Some(3),
+        )));
+        assert!(!progress.try_send(progress_event(
+            &context,
+            ProgressStage::Finalizing,
+            2,
+            Some(3),
+        )));
+
+        assert_eq!(
+            recording
+                .values
+                .lock()
+                .expect("recording sink lock")
+                .iter()
+                .map(|value| value.stage)
+                .collect::<Vec<_>>(),
+            vec![
+                ProgressStage::Queued,
+                ProgressStage::Estimating,
+                ProgressStage::Decoding,
+                ProgressStage::Decoding,
+                ProgressStage::Encoding,
+                ProgressStage::Encoding,
+                ProgressStage::Finalizing,
+            ]
+        );
+    }
+
+    #[test]
+    fn validated_progress_delivers_concurrent_events_without_holding_cursor_lock() {
+        let context = OperationContext::new("concurrent-progress".into(), future_deadline());
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let (encoding_started_tx, encoding_started_rx) = std::sync::mpsc::channel();
+        let (release_encoding_tx, release_encoding_rx) = std::sync::mpsc::channel();
+        let progress = Arc::new(ValidatedProgressSink::new(
+            MediaOperationKind::OptimizerSearch,
+            BlockingEncodingSink {
+                stages: Arc::clone(&stages),
+                encoding_started: Mutex::new(Some(encoding_started_tx)),
+                release_encoding: Mutex::new(release_encoding_rx),
+            },
+        ));
+
+        for stage in [
+            ProgressStage::Queued,
+            ProgressStage::Estimating,
+            ProgressStage::Decoding,
+        ] {
+            assert!(progress.try_send(progress_event(&context, stage, 0, None)));
+        }
+
+        let encoding_progress = Arc::clone(&progress);
+        let encoding_context = context.clone();
+        let encoding_thread = thread::spawn(move || {
+            encoding_progress.try_send(progress_event(
+                &encoding_context,
+                ProgressStage::Encoding,
+                0,
+                Some(1),
+            ))
+        });
+        encoding_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("encoding delivery must start");
+
+        let finalizing_progress = Arc::clone(&progress);
+        let finalizing_context = context.clone();
+        let (finalizing_done_tx, finalizing_done_rx) = std::sync::mpsc::channel();
+        let finalizing_thread = thread::spawn(move || {
+            let accepted = finalizing_progress.try_send(progress_event(
+                &finalizing_context,
+                ProgressStage::Finalizing,
+                1,
+                Some(1),
+            ));
+            finalizing_done_tx
+                .send(accepted)
+                .expect("finalizing completion signal");
+        });
+        let finalizing_before_release = finalizing_done_rx.recv_timeout(Duration::from_millis(100));
+
+        release_encoding_tx
+            .send(())
+            .expect("release encoding delivery");
+        assert!(encoding_thread.join().expect("encoding progress thread"));
+        finalizing_thread
+            .join()
+            .expect("finalizing progress thread");
+        assert!(finalizing_before_release
+            .expect("finalizing acceptance must not wait for the generic sink callback"));
+        assert_eq!(
+            *stages.lock().expect("blocking sink stages lock"),
+            vec![
+                ProgressStage::Queued,
+                ProgressStage::Estimating,
+                ProgressStage::Decoding,
+                ProgressStage::Encoding,
+                ProgressStage::Finalizing,
+            ]
+        );
+    }
+
+    #[test]
+    fn validated_progress_sink_panic_clears_dispatch_state_without_poisoning_cursor() {
+        let context = OperationContext::new("panic-progress".into(), future_deadline());
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let progress = ValidatedProgressSink::new(
+            MediaOperationKind::BuildPlan,
+            PanicOnceProgressSink {
+                panic_next: AtomicBool::new(true),
+                stages: Arc::clone(&stages),
+            },
+        );
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            progress.try_send(progress_event(&context, ProgressStage::Queued, 0, None))
+        }));
+        assert!(outcome.is_err());
+        {
+            let state = progress
+                .state
+                .lock()
+                .expect("validated progress state lock");
+            assert!(!state.draining);
+            assert!(state.pending.is_empty());
+        }
+
+        assert!(progress.try_send(progress_event(&context, ProgressStage::Estimating, 0, None,)));
+        assert_eq!(
+            *stages.lock().expect("panic sink stages lock"),
+            vec![ProgressStage::Estimating]
+        );
+    }
+
+    #[test]
+    fn preview_progress_keeps_native_total_unknown_and_video_total_fixed() {
+        let native_context = OperationContext::new("preview-native".into(), future_deadline());
+        let native_recording = RecordingProgressSink::default();
+        let native =
+            ValidatedProgressSink::new(MediaOperationKind::Preview, native_recording.clone());
+        assert!(native.try_send(progress_event(
+            &native_context,
+            ProgressStage::Queued,
+            0,
+            None,
+        )));
+        assert!(native.try_send(progress_event(
+            &native_context,
+            ProgressStage::Decoding,
+            0,
+            None,
+        )));
+        assert!(native.try_send(progress_event(
+            &native_context,
+            ProgressStage::Decoding,
+            12,
+            None,
+        )));
+
+        let video_context = OperationContext::new("preview-video".into(), future_deadline());
+        let video_recording = RecordingProgressSink::default();
+        let video =
+            ValidatedProgressSink::new(MediaOperationKind::Preview, video_recording.clone());
+        assert!(video.try_send(progress_event(
+            &video_context,
+            ProgressStage::Queued,
+            0,
+            None,
+        )));
+        assert!(video.try_send(progress_event(
+            &video_context,
+            ProgressStage::Decoding,
+            0,
+            Some(2),
+        )));
+        assert!(video.try_send(progress_event(
+            &video_context,
+            ProgressStage::Decoding,
+            2,
+            Some(2),
+        )));
+        assert!(video.try_send(progress_event(
+            &video_context,
+            ProgressStage::Encoding,
+            0,
+            Some(2),
+        )));
+        assert!(video.try_send(progress_event(
+            &video_context,
+            ProgressStage::Encoding,
+            2,
+            Some(2),
+        )));
+
+        assert!(native_recording
+            .values
+            .lock()
+            .expect("native recording sink lock")
+            .iter()
+            .filter(|value| value.stage == ProgressStage::Decoding)
+            .all(|value| value.total.is_none()));
+        assert!(video_recording
+            .values
+            .lock()
+            .expect("video recording sink lock")
+            .iter()
+            .filter(|value| matches!(
+                value.stage,
+                ProgressStage::Decoding | ProgressStage::Encoding
+            ))
+            .all(|value| value.total == Some(2)));
     }
 }
