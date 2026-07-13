@@ -182,12 +182,11 @@ function Test-VendorPolicyDecision {
   if (-not $SameRepository) {
     return [pscustomobject]@{ Approved = $false; Reason = "protected-change-from-fork" }
   }
-  if (-not [string]::Equals($Association, "OWNER", [System.StringComparison]::Ordinal) -and
-      -not [string]::Equals($Association, "MEMBER", [System.StringComparison]::Ordinal)) {
+  if (-not [string]::Equals($Association, "OWNER", [System.StringComparison]::Ordinal)) {
     return [pscustomobject]@{ Approved = $false; Reason = "untrusted-author-association" }
   }
   if (-not $VendorArtifactChanged) {
-    return [pscustomobject]@{ Approved = $true; Reason = "authority-change-approved-by-environment" }
+    return [pscustomobject]@{ Approved = $true; Reason = "authority-change-authorized-by-protected-policy" }
   }
   if (-not $RunPresent) {
     return [pscustomobject]@{ Approved = $false; Reason = "missing-vendor-update-run" }
@@ -202,7 +201,7 @@ function Test-VendorPolicyDecision {
     return [pscustomobject]@{ Approved = $false; Reason = "vendor-artifact-mismatch" }
   }
 
-  return [pscustomobject]@{ Approved = $true; Reason = "approved-vendor-artifact-match" }
+  return [pscustomobject]@{ Approved = $true; Reason = "verified-vendor-artifact-match" }
 }
 
 function Invoke-SelfTest {
@@ -210,12 +209,13 @@ function Invoke-SelfTest {
     @{ Name = "no-change"; Expected = $true; Args = @($false, $true, "NONE", $false, $false, $false, $false, $false) },
     @{ Name = "fork"; Expected = $false; Args = @($true, $false, "OWNER", $false, $false, $false, $false, $false) },
     @{ Name = "untrusted-association"; Expected = $false; Args = @($true, $true, "COLLABORATOR", $false, $false, $false, $false, $false) },
+    @{ Name = "member-rejected"; Expected = $false; Args = @($true, $true, "MEMBER", $false, $false, $false, $false, $false) },
     @{ Name = "missing-run"; Expected = $false; Args = @($true, $true, "OWNER", $true, $false, $false, $false, $false) },
-    @{ Name = "failed-run"; Expected = $false; Args = @($true, $true, "MEMBER", $true, $true, $false, $true, $true) },
+    @{ Name = "failed-run"; Expected = $false; Args = @($true, $true, "OWNER", $true, $true, $false, $true, $true) },
     @{ Name = "untrusted-run"; Expected = $false; Args = @($true, $true, "OWNER", $true, $true, $true, $false, $true) },
     @{ Name = "hash-mismatch"; Expected = $false; Args = @($true, $true, "OWNER", $true, $true, $true, $true, $false) },
-    @{ Name = "approved-authority"; Expected = $true; Args = @($true, $true, "MEMBER", $false, $false, $false, $false, $false) },
-    @{ Name = "approved-match"; Expected = $true; Args = @($true, $true, "OWNER", $true, $true, $true, $true, $true) }
+    @{ Name = "protected-authority"; Expected = $true; Args = @($true, $true, "OWNER", $false, $false, $false, $false, $false) },
+    @{ Name = "verified-match"; Expected = $true; Args = @($true, $true, "OWNER", $true, $true, $true, $true, $true) }
   )
 
   foreach ($fixture in $fixtures) {
@@ -232,6 +232,99 @@ function Invoke-SelfTest {
     if ($actual.Approved -ne $fixture.Expected) {
       throw "Vendor policy fixture '$($fixture.Name)' failed: $($actual.Reason)"
     }
+  }
+
+  $ownerRunActorFixtures = @(
+    @{ Name = "owner-dispatch-and-rerun"; Expected = $true; Actor = "Ayumudayo"; TriggeringActor = "Ayumudayo" },
+    @{ Name = "non-owner-dispatch"; Expected = $false; Actor = "collaborator"; TriggeringActor = "Ayumudayo" },
+    @{ Name = "non-owner-rerun"; Expected = $false; Actor = "Ayumudayo"; TriggeringActor = "collaborator" }
+  )
+  foreach ($fixture in $ownerRunActorFixtures) {
+    $run = [pscustomobject]@{
+      actor = [pscustomobject]@{ login = $fixture.Actor }
+      triggering_actor = [pscustomobject]@{ login = $fixture.TriggeringActor }
+    }
+    $actual = Test-OwnerRunActors -Run $run
+    if ($actual.Approved -ne $fixture.Expected) {
+      throw "Vendor run actor fixture '$($fixture.Name)' failed: $($actual.Reason)"
+    }
+  }
+  $missingTriggeringActor = [pscustomobject]@{
+    actor = [pscustomobject]@{ login = "Ayumudayo" }
+  }
+  if ((Test-OwnerRunActors -Run $missingTriggeringActor).Approved) {
+    throw "Vendor run actor fixture 'missing-triggering-actor' was accepted."
+  }
+  $missingInitialActor = [pscustomobject]@{
+    triggering_actor = [pscustomobject]@{ login = "Ayumudayo" }
+  }
+  if ((Test-OwnerRunActors -Run $missingInitialActor).Approved) {
+    throw "Vendor run actor fixture 'missing-initial-actor' was accepted."
+  }
+
+  function Get-WorkflowJobIfBlock {
+    param(
+      [Parameter(Mandatory = $true)][string]$Source,
+      [Parameter(Mandatory = $true)][string]$JobName
+    )
+
+    $lines = @([regex]::Split($Source, "\r?\n"))
+    $jobHeader = "  ${JobName}:"
+    $jobStart = [Array]::IndexOf($lines, $jobHeader)
+    if ($jobStart -lt 0) {
+      throw "Workflow job '$JobName' is missing."
+    }
+
+    $jobEnd = $lines.Count
+    for ($index = $jobStart + 1; $index -lt $lines.Count; $index++) {
+      if ($lines[$index] -match '\A  [A-Za-z0-9_-]+:\z') {
+        $jobEnd = $index
+        break
+      }
+    }
+
+    $ifStart = -1
+    $runsOn = -1
+    for ($index = $jobStart + 1; $index -lt $jobEnd; $index++) {
+      if ($lines[$index] -eq '    if: >-') {
+        $ifStart = $index
+      }
+      if ($lines[$index] -match '\A    runs-on:') {
+        $runsOn = $index
+        break
+      }
+    }
+    if ($ifStart -lt 0 -or $runsOn -le $ifStart) {
+      throw "Workflow job '$JobName' does not have the expected multiline if block before runs-on."
+    }
+
+    return ($lines[$ifStart..($runsOn - 1)] -join "`n")
+  }
+
+  $workflowRoot = Join-Path $PSScriptRoot "..\.github\workflows"
+  $updateWorkflowSource = Get-Content -Raw -LiteralPath (Join-Path $workflowRoot "update-ffmpeg-vendor.yml")
+  $releaseWorkflowSource = Get-Content -Raw -LiteralPath (Join-Path $workflowRoot "release.yml")
+  $vendorPolicyWorkflowSource = Get-Content -Raw -LiteralPath (Join-Path $workflowRoot "vendor-policy.yml")
+  $ownerGatedIfBlocks = @(
+    Get-WorkflowJobIfBlock -Source $updateWorkflowSource -JobName 'update'
+    Get-WorkflowJobIfBlock -Source $releaseWorkflowSource -JobName 'release'
+    Get-WorkflowJobIfBlock -Source $releaseWorkflowSource -JobName 'finalize'
+  )
+  foreach ($ownerCondition in @(
+      'github.actor == github.repository_owner',
+      'github.triggering_actor == github.repository_owner'
+    )) {
+    foreach ($ifBlock in $ownerGatedIfBlocks) {
+      if (-not $ifBlock.Contains($ownerCondition)) {
+        throw "Protected manual workflow job does not enforce the owner actor condition: $ownerCondition"
+      }
+    }
+  }
+  $protectedReviewIfBlock = Get-WorkflowJobIfBlock -Source $vendorPolicyWorkflowSource -JobName 'protected_review'
+  if (-not $protectedReviewIfBlock.Contains("github.event.pull_request.author_association == 'OWNER'") -or
+      -not $protectedReviewIfBlock.Contains('github.event.pull_request.user.login == github.repository_owner') -or
+      $protectedReviewIfBlock.Contains("github.event.pull_request.author_association == 'MEMBER'")) {
+    throw "Protected vendor policy must authorize only the repository owner."
   }
 
   $expectedAuthorityPaths = @(
@@ -399,7 +492,7 @@ function Invoke-SelfTest {
     throw "Mismatched replacement preconditions were accepted."
   }
 
-  Write-Host "Vendor policy source-only fixtures passed: $($fixtures.Count) decisions plus authority/version/precondition contracts"
+  Write-Host "Vendor policy source-only fixtures passed: $($fixtures.Count) decisions, $($ownerRunActorFixtures.Count) owner-run actors, plus authority/version/precondition contracts"
 }
 
 function Assert-OnlineParameters {
@@ -707,6 +800,38 @@ function Save-GitHubArtifactArchive {
   }
 }
 
+function Test-OwnerRunActors {
+  param(
+    [Parameter(Mandatory = $true)]$Run
+  )
+
+  $actorLogin = $null
+  $actorProperty = $Run.PSObject.Properties['actor']
+  if ($null -ne $actorProperty -and $null -ne $actorProperty.Value) {
+    $actorLoginProperty = $actorProperty.Value.PSObject.Properties['login']
+    if ($null -ne $actorLoginProperty) {
+      $actorLogin = [string]$actorLoginProperty.Value
+    }
+  }
+  if (-not [string]::Equals($actorLogin, "Ayumudayo", [System.StringComparison]::OrdinalIgnoreCase)) {
+    return [pscustomobject]@{ Approved = $false; Reason = "vendor-update-run-not-dispatched-by-owner" }
+  }
+
+  $triggeringActorLogin = $null
+  $triggeringActorProperty = $Run.PSObject.Properties['triggering_actor']
+  if ($null -ne $triggeringActorProperty -and $null -ne $triggeringActorProperty.Value) {
+    $triggeringActorLoginProperty = $triggeringActorProperty.Value.PSObject.Properties['login']
+    if ($null -ne $triggeringActorLoginProperty) {
+      $triggeringActorLogin = [string]$triggeringActorLoginProperty.Value
+    }
+  }
+  if (-not [string]::Equals($triggeringActorLogin, "Ayumudayo", [System.StringComparison]::OrdinalIgnoreCase)) {
+    return [pscustomobject]@{ Approved = $false; Reason = "vendor-update-run-not-triggered-by-owner" }
+  }
+
+  return [pscustomobject]@{ Approved = $true; Reason = "vendor-update-run-owner-actors-match" }
+}
+
 function Assert-RunTrust {
   param(
     [Parameter(Mandatory = $true)]$Run,
@@ -715,6 +840,10 @@ function Assert-RunTrust {
 
   if (-not [string]::Equals([string]$Run.repository.full_name, "Ayumudayo/StickerFit", [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Vendor update run $RunId belongs to an unexpected repository."
+  }
+  $actorDecision = Test-OwnerRunActors -Run $Run
+  if (-not $actorDecision.Approved) {
+    throw "Vendor update run $RunId was not owner-authorized: $($actorDecision.Reason)."
   }
   if (-not [string]::Equals([string]$Run.event, "workflow_dispatch", [System.StringComparison]::Ordinal)) {
     throw "Vendor update run $RunId was not workflow_dispatch."
@@ -883,7 +1012,7 @@ function Assert-UpdateFragment {
       [long]$fragment.schemaVersion -ne 1 -or
       $fragment.applyOnlyAfterProtectedReview -isnot [bool] -or
       $fragment.applyOnlyAfterProtectedReview -ne $true) {
-    throw "update-fragment.json is not an approval-gated schema v1 fragment."
+    throw "update-fragment.json is not a protected-policy-gated schema v1 fragment."
   }
   if (($fragment.sourceWorkflow.runId -isnot [int] -and $fragment.sourceWorkflow.runId -isnot [long]) -or
       $fragment.sourceWorkflow.sourceCommit -isnot [string] -or
@@ -891,7 +1020,7 @@ function Assert-UpdateFragment {
       [string]$fragment.sourceWorkflow.runId -ne $RunId -or
       -not [string]::Equals([string]$fragment.sourceWorkflow.sourceCommit, $RunHeadSha, [System.StringComparison]::OrdinalIgnoreCase) -or
       -not [string]::Equals([string]$fragment.sourceWorkflow.workflowRef, $script:ApprovedVendorWorkflowRef, [System.StringComparison]::Ordinal)) {
-    throw "update-fragment.json does not identify the approved workflow run."
+    throw "update-fragment.json does not identify the protected workflow run."
   }
   $preconditionDecision = Test-UpdatePreconditions `
     -Preconditions $fragment.preconditions `
@@ -996,7 +1125,7 @@ function Assert-VendorArtifact {
   $missingRequiredPaths = @($requiredChangedPaths | Where-Object { -not $actualChangedPaths.Contains($_) })
   $unexpectedChangedPaths = @($actualChangedPaths | Where-Object { -not $allowedChangedPaths.Contains($_) })
   if ($missingRequiredPaths.Count -ne 0 -or $unexpectedChangedPaths.Count -ne 0) {
-    throw "Protected vendor update changed paths outside the exact approved replacement/deletion set."
+    throw "Protected vendor update changed paths outside the exact policy-defined replacement/deletion set."
   }
 
   $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("stickerfit-vendor-policy-" + [System.Guid]::NewGuid().ToString("N"))
@@ -1016,7 +1145,7 @@ function Assert-VendorArtifact {
         ($provenance.vendorUpdateRunId -isnot [int] -and $provenance.vendorUpdateRunId -isnot [long]) -or
         [string]$manifest.vendorUpdateRunId -ne $RunId -or
         [string]$provenance.vendorUpdateRunId -ne $RunId) {
-      throw "Manifest/provenance vendorUpdateRunId does not match the approved workflow run."
+      throw "Manifest/provenance vendorUpdateRunId does not match the protected workflow run."
     }
     if ($provenance.legacyBootstrap -isnot [bool] -or $provenance.legacyBootstrap -ne $false) {
       throw "Protected vendor updates must replace legacy bootstrap provenance."
@@ -1024,7 +1153,7 @@ function Assert-VendorArtifact {
     if (-not [string]::Equals([string]$manifest.version, $script:ApprovedVendorVersion, [System.StringComparison]::Ordinal) -or
         [string]$manifest.sourceArchiveSha256 -notmatch "\A[0-9a-fA-F]{64}\z" -or
         [string]$manifest.expectedExeSha256 -notmatch "\A[0-9a-fA-F]{64}\z") {
-      throw "Head FFmpeg manifest is not the approved 8.1.2 update or contains an invalid hash."
+      throw "Head FFmpeg manifest is not the policy-defined 8.1.2 update or contains an invalid hash."
     }
     if (-not [string]::Equals([string]$manifest.version, [string]$provenance.version, [System.StringComparison]::Ordinal) -or
         -not [string]::Equals([string]$manifest.sourceArchiveSha256, [string]$provenance.sourceArchiveSha256, [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -1075,10 +1204,10 @@ function Assert-VendorArtifact {
       throw "Expected exactly one run artifact named '$expectedArtifactName'; found $($artifactList.Count) total and $($matches.Count) matching."
     }
     if ([long]$matches[0].size_in_bytes -le 0 -or [long]$matches[0].size_in_bytes -gt 32MB) {
-      throw "Approved vendor artifact has an invalid compressed size."
+      throw "Verified vendor artifact has an invalid compressed size."
     }
     if ([string]$matches[0].digest -notmatch "\Asha256:([0-9a-f]{64})\z") {
-      throw "Approved vendor artifact does not expose a valid immutable SHA-256 digest."
+      throw "Verified vendor artifact does not expose a valid immutable SHA-256 digest."
     }
     $archiveDigest = $Matches[1]
 
@@ -1151,7 +1280,7 @@ if (-not $classification.protectedChanged) {
 }
 
 if (-not $classification.vendorArtifactChanged) {
-  Write-Host "Protected authority-only change accepted after same-repository author and environment approval checks."
+  Write-Host "Protected authority-only change accepted after owner and protected-policy checks."
   return
 }
 
@@ -1177,4 +1306,4 @@ Assert-VendorArtifact `
   -Run $run `
   -HeadTree $comparison.HeadTree `
   -ChangedPaths @($comparison.Changed)
-Write-Host "Protected vendor payload exactly matches approved workflow run $runId."
+Write-Host "Protected vendor payload exactly matches protected workflow run $runId."

@@ -100,7 +100,8 @@ jobs:
     if: >-
       needs.classify.outputs.protected_changed == 'true' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      (github.event.pull_request.author_association == 'OWNER' || github.event.pull_request.author_association == 'MEMBER')
+      github.event.pull_request.author_association == 'OWNER' &&
+      github.event.pull_request.user.login == github.repository_owner
     runs-on: windows-latest
     timeout-minutes: 20
     environment: ffmpeg-vendor-update
@@ -151,11 +152,11 @@ jobs:
           if ($env:CLASSIFY_RESULT -ne "success") { throw "Protected change classification did not succeed." }
           if ($env:PROTECTED_CHANGED -eq "true") {
             if ($env:PROTECTED_RESULT -ne "success" -or $env:UNPROTECTED_RESULT -ne "skipped") {
-              throw "Protected vendor review did not succeed."
+              throw "Protected vendor policy validation did not succeed."
             }
           } elseif ($env:PROTECTED_CHANGED -eq "false") {
             if ($env:UNPROTECTED_RESULT -ne "success" -or $env:PROTECTED_RESULT -ne "skipped") {
-              throw "Protected byte-identity review did not succeed."
+              throw "Protected byte-identity validation did not succeed."
             }
           } else {
             throw "Protected change classification output is invalid."

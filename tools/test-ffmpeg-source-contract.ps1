@@ -458,6 +458,9 @@ Assert-True `
   -Condition ($protectedContextSource.Contains(
       "'Ayumudayo/StickerFit/.github/workflows/update-ffmpeg-vendor.yml@refs/heads/main'"
     ) -and
+    $protectedContextSource.Contains('$env:GITHUB_ACTOR') -and
+    $protectedContextSource.Contains('$env:GITHUB_TRIGGERING_ACTOR') -and
+    $protectedContextSource.Contains("'Ayumudayo'") -and
     $protectedContextSource.Contains("`$env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$'") -and
     ([regex]::Matches(
         $protectedContextSource,
@@ -469,7 +472,9 @@ foreach ($forbiddenAuthorityComparison in @(
     '$env:GITHUB_REF -ne',
     '$env:GITHUB_WORKFLOW_REF -notmatch',
     '$env:STICKERFIT_PROTECTED_FFMPEG_UPDATE -ne',
-    '$env:GITHUB_EVENT_NAME -ne'
+    '$env:GITHUB_EVENT_NAME -ne',
+    '$env:GITHUB_ACTOR -ne',
+    '$env:GITHUB_TRIGGERING_ACTOR -ne'
   )) {
   Assert-True `
     -Condition (-not $protectedContextSource.Contains($forbiddenAuthorityComparison)) `

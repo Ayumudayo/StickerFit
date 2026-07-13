@@ -21,8 +21,13 @@ concurrency:
 
 jobs:
   release:
-    name: Build approved beta artifact
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'Ayumudayo/StickerFit'
+    name: Build verified beta artifact
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'Ayumudayo/StickerFit' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
     runs-on: windows-latest
     timeout-minutes: 60
     environment: beta-release
@@ -70,7 +75,7 @@ jobs:
           git merge-base --is-ancestor $env:COMMIT_SHA $env:WORKFLOW_SHA
           if ($LASTEXITCODE -ne 0) { throw "commitSha is not an ancestor of the immutable protected policy revision." }
           git checkout --detach $env:COMMIT_SHA
-          if ($LASTEXITCODE -ne 0) { throw "Could not detach the approved release commit." }
+          if ($LASTEXITCODE -ne 0) { throw "Could not detach the verified release commit." }
           $actual = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($actual, $env:COMMIT_SHA, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Detached checkout does not match commitSha."
@@ -756,7 +761,13 @@ jobs:
   finalize:
     name: Independently verify and publish beta artifact
     needs: release
-    if: needs.release.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'Ayumudayo/StickerFit'
+    if: >-
+      needs.release.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'Ayumudayo/StickerFit' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
     runs-on: windows-latest
     timeout-minutes: 20
     steps:

@@ -105,6 +105,19 @@ function Assert-ProtectedVendorUpdateContext {
     throw "Protected workflow event or repository authority is invalid."
   }
 
+  if (-not [string]::Equals(
+      $env:GITHUB_ACTOR,
+      'Ayumudayo',
+      [System.StringComparison]::OrdinalIgnoreCase
+    ) -or
+      -not [string]::Equals(
+        $env:GITHUB_TRIGGERING_ACTOR,
+        'Ayumudayo',
+        [System.StringComparison]::OrdinalIgnoreCase
+      )) {
+    throw "Protected workflow dispatch and rerun actors must be the repository owner."
+  }
+
   foreach ($pathEnvironmentName in @(
       'STICKERFIT_BASH_PATH',
       'STICKERFIT_GPG_PATH',

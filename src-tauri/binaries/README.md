@@ -20,7 +20,7 @@ hash and embedded configure string are known, but its original build toolchain,
 source date epoch, workflow run, and exact relationship to the separately
 verified source archive are not. Those unknowns remain explicit `null` values in
 `ffmpeg-provenance.json`; this payload must not be treated as a reproducible or
-release-approved build.
+policy-verified release build.
 
 Supply-chain metadata and verification entry points:
 
@@ -34,7 +34,7 @@ Routine verification may accept a legacy payload only through the explicit
 produced only by the protected, staging-only `-UpdateVendorArtifacts` workflow;
 the build script never writes a newly built binary directly into this directory.
 
-Approved replacement state (`legacyBootstrap: false`):
+Policy-verified replacement state (`legacyBootstrap: false`):
 
 - `ffmpeg-x86_64-pc-windows-msvc.exe` is the only FFmpeg runtime file
 - `runtimeDependencies` and `vendor.expectedRuntimeDependencies` are empty
@@ -46,11 +46,11 @@ Approved replacement state (`legacyBootstrap: false`):
 The protected update artifact carries the exact `src-tauri/tauri.conf.json`
 resource-map replacement together with the executable, manifest, provenance,
 license, and explicit legacy-file deletions. Its fragment is applied only after
-protected review; release validation rejects any other resource membership.
+protected-policy validation; release validation rejects any other resource membership.
 
 `LICENSE-ffmpeg.txt` is the normalized FFmpeg source license kept for both
 states. In the legacy state, `LICENSE-ffmpeg-BtbN.txt` additionally describes
 that distribution and `LICENSE-libwinpthread.txt` covers its runtime DLL, whose
 repository bytes match the inspected MSYS2 installation. The two legacy-specific
-licenses stay paired with the DLL and are removed together by the approved
+licenses stay paired with the DLL and are removed together by the policy-verified
 replacement.

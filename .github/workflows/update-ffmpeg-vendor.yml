@@ -22,7 +22,12 @@ concurrency:
 jobs:
   update:
     name: Build staged FFmpeg vendor artifact
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'Ayumudayo/StickerFit'
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'Ayumudayo/StickerFit' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
     runs-on: windows-latest
     timeout-minutes: 90
     environment: ffmpeg-vendor-update
