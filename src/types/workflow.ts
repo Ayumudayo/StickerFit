@@ -101,6 +101,56 @@ export type OptimizerSearchRequest = OptimizerPlanRequest & {
   outputDirectory: string | null;
 };
 
+export type ExactStaticSizeEstimate = {
+  kind: "exact-static";
+  basis: "exact-static";
+  bytes: number;
+  candidateId: null;
+  limitBytes: number;
+  outputFrameCount: 1;
+};
+
+export type ExactCandidateSizeEstimate = {
+  kind: "exact-candidate";
+  basis: "exact-full-sequence" | "probe";
+  bytes: number;
+  candidateId: string;
+  limitBytes: number;
+  outputFrameCount: number;
+};
+
+export type SampledSizeEstimate = {
+  kind: "range";
+  basis: "sampled";
+  lowerBytes: number;
+  predictedBytes: number;
+  upperBytes: number;
+  confidence: "low" | "medium" | "high";
+  candidateId: string;
+  limitBytes: number;
+  measuredContributionCount: number;
+  outputFrameCount: number;
+};
+
+export type OutputSizeEstimate =
+  | ExactStaticSizeEstimate
+  | ExactCandidateSizeEstimate
+  | SampledSizeEstimate;
+
+export type StaticSizeEstimateRequest = {
+  inputPath: string;
+  sourceRevision: string;
+  locale: Locale;
+  cropRegion: CropRegion | null;
+};
+
+export type OptimizerSizeEstimateRequest = OptimizerPlanRequest & {
+  inputPath: string;
+  sourceRevision: string;
+  sampleSeed: string; // Exactly 16 lowercase hexadecimal characters.
+  candidateIds: string[];
+};
+
 export type StaticImageConversionRequest = {
   inputPath: string;
   sourceRevision: string;

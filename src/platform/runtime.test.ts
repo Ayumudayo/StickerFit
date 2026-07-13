@@ -6,7 +6,9 @@ import type {
   MediaOperationProgressMessageCode,
   MediaOperationReasonCode,
   OperationProgress,
+  OutputSizeEstimate,
   OptimizerPlanRequest,
+  StaticSizeEstimateRequest,
 } from "../types/workflow";
 import {
   MESSAGES,
@@ -18,6 +20,7 @@ import {
   buildWebFileSourceRevision,
   getAppRuntime,
   invokeDesktopMediaOperation,
+  invokeDesktopStaticSizeEstimate,
   normalizeLegacyMediaError,
   normalizeLegacyMediaResponse,
   normalizeLegacyOptimizerSearchResponse,
@@ -696,6 +699,29 @@ const PROGRESS_MESSAGE_CODE_BY_STAGE: Record<
   finalizing: "media-operation-finalizing",
 };
 
+type OutputSizeEstimateContractKey = OutputSizeEstimate extends infer Estimate
+  ? Estimate extends {
+      kind: infer Kind extends string;
+      basis: infer Basis extends string;
+    }
+    ? `${Kind}:${Basis}`
+    : never
+  : never;
+
+const EXPECTED_OUTPUT_SIZE_ESTIMATE_CONTRACT = [
+  "exact-static:exact-static",
+  "exact-candidate:exact-full-sequence",
+  "exact-candidate:probe",
+  "range:sampled",
+] as const satisfies readonly OutputSizeEstimateContractKey[];
+
+const OUTPUT_SIZE_ESTIMATE_CONTRACT_IS_COMPLETE: Exclude<
+  OutputSizeEstimateContractKey,
+  (typeof EXPECTED_OUTPUT_SIZE_ESTIMATE_CONTRACT)[number]
+> extends never
+  ? true
+  : false = true;
+
 function operationProgress(
   operationId: string,
   stage: OperationProgress["stage"] = "encoding",
@@ -733,6 +759,85 @@ describe("operation progress localization", () => {
 });
 
 describe("desktop media operation adapter", () => {
+  it("keeps the output-size estimate union closed across every kind and basis", () => {
+    expect(OUTPUT_SIZE_ESTIMATE_CONTRACT_IS_COMPLETE).toBe(true);
+    expect(EXPECTED_OUTPUT_SIZE_ESTIMATE_CONTRACT).toEqual([
+      "exact-static:exact-static",
+      "exact-candidate:exact-full-sequence",
+      "exact-candidate:probe",
+      "range:sampled",
+    ]);
+  });
+
+  it("sends the static estimate request unchanged through the managed command envelope", async () => {
+    const request = {
+      inputPath: "C:/media/sticker.png",
+      sourceRevision: "source-revision-1",
+      locale: "ko",
+      cropRegion: { x: 0.1, y: 0.2, width: 0.7, height: 0.6 },
+    } satisfies StaticSizeEstimateRequest;
+    const estimate = {
+      kind: "exact-static",
+      basis: "exact-static",
+      bytes: 12_345,
+      candidateId: null,
+      limitBytes: 512 * 1_024,
+      outputFrameCount: 1,
+    } satisfies OutputSizeEstimate;
+    const channel = { serialized: "__TAURI_CHANNEL__" };
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+
+    await expect(
+      invokeDesktopStaticSizeEstimate(
+        request,
+        { operationId: "operation-static-estimate" },
+        {
+          createChannel: () => channel,
+          invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+            calls.push({ command, args });
+            return estimate as unknown as T;
+          },
+        },
+      ),
+    ).resolves.toBe(estimate);
+
+    expect(calls).toEqual([
+      {
+        command: "estimate_static_output_size",
+        args: {
+          request,
+          operationId: "operation-static-estimate",
+          onProgress: channel,
+        },
+      },
+    ]);
+    expect(request).not.toHaveProperty("operationId");
+  });
+
+  it("preserves a closed backend estimate rejection for one caller-side normalization", async () => {
+    const rejection = {
+      errorCode: "source-changed",
+      reasonCode: null,
+      errorMessage: "Source changed before estimate publication.",
+    };
+
+    await expect(
+      invokeDesktopStaticSizeEstimate(
+        {
+          inputPath: "C:/media/sticker.png",
+          sourceRevision: "stale-revision",
+          locale: "en",
+          cropRegion: null,
+        },
+        { operationId: "operation-static-estimate-rejected" },
+        {
+          createChannel: () => ({}),
+          invoke: () => Promise.reject(rejection),
+        },
+      ),
+    ).rejects.toBe(rejection);
+  });
+
   it("keeps the DTO unchanged and adds operationId plus the Channel at top level", async () => {
     const request = { inputPath: "C:/media/input.gif", locale: "en" };
     const channel = { serialized: "__TAURI_CHANNEL__" };
@@ -1166,6 +1271,9 @@ describe("web media operation adapter contract", () => {
     ).rejects.toThrow("available only in the desktop app");
     await expect(
       runtime.convertStaticImageToPng({} as never, options),
+    ).rejects.toThrow("available only in the desktop app");
+    await expect(
+      runtime.estimateStaticOutputSize({} as never, options),
     ).rejects.toThrow("available only in the desktop app");
     await expect(
       runtime.extractFramePreview({} as never, options),

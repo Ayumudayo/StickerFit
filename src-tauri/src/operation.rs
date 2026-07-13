@@ -20,6 +20,7 @@ const MAX_RECENT_FINISHED: usize = 1024;
 pub(crate) enum PermitProfile {
     None,
     Decode,
+    EstimateDecode,
     OutputDecode,
 }
 
@@ -28,6 +29,7 @@ pub(crate) enum MediaOperationKind {
     Inspect,
     BuildPlan,
     Preview,
+    StaticEstimate,
     StaticConversion,
     OptimizerSearch,
 }
@@ -37,7 +39,7 @@ impl MediaOperationKind {
         match self {
             Self::Inspect | Self::BuildPlan => Duration::from_secs(15),
             Self::Preview => Duration::from_secs(30),
-            Self::StaticConversion => Duration::from_secs(60),
+            Self::StaticEstimate | Self::StaticConversion => Duration::from_secs(60),
             Self::OptimizerSearch => Duration::from_secs(180),
         }
     }
@@ -46,6 +48,7 @@ impl MediaOperationKind {
         match self {
             Self::BuildPlan => PermitProfile::None,
             Self::Inspect | Self::Preview => PermitProfile::Decode,
+            Self::StaticEstimate => PermitProfile::EstimateDecode,
             Self::StaticConversion | Self::OptimizerSearch => PermitProfile::OutputDecode,
         }
     }
@@ -538,6 +541,7 @@ impl PipelineState {
         Ok(PreflightReservation {
             registration,
             output: Arc::clone(&self.output),
+            estimate: Arc::clone(&self.estimate),
             decode: Arc::clone(&self.decode),
         })
     }
@@ -595,6 +599,7 @@ pub(crate) struct EstimateDecodePermits {
 pub(crate) struct PreflightReservation {
     registration: RegisteredOperation,
     output: Arc<Semaphore>,
+    estimate: Arc<Semaphore>,
     decode: Arc<Semaphore>,
 }
 
@@ -634,6 +639,16 @@ impl PreflightReservation {
             PermitProfile::Decode => ManagedPermits::Decode(
                 acquire_permit(Arc::clone(&self.decode), self.registration.context()).await?,
             ),
+            PermitProfile::EstimateDecode => {
+                let estimate =
+                    acquire_permit(Arc::clone(&self.estimate), self.registration.context()).await?;
+                let decode =
+                    acquire_permit(Arc::clone(&self.decode), self.registration.context()).await?;
+                ManagedPermits::EstimateDecode(EstimateDecodePermits {
+                    _estimate: estimate,
+                    _decode: decode,
+                })
+            }
             PermitProfile::OutputDecode => {
                 let output =
                     acquire_permit(Arc::clone(&self.output), self.registration.context()).await?;
@@ -656,6 +671,7 @@ impl PreflightReservation {
 enum ManagedPermits {
     None,
     Decode(OwnedSemaphorePermit),
+    EstimateDecode(EstimateDecodePermits),
     OutputDecode(OutputDecodePermits),
 }
 
@@ -851,7 +867,7 @@ fn progress_transition_allowed(
             (ProgressStage::Queued, ProgressStage::Estimating)
                 | (ProgressStage::Estimating, ProgressStage::Finalizing)
         ),
-        MediaOperationKind::StaticConversion => matches!(
+        MediaOperationKind::StaticEstimate | MediaOperationKind::StaticConversion => matches!(
             (current, next),
             (ProgressStage::Queued, ProgressStage::Inspecting)
                 | (ProgressStage::Inspecting, ProgressStage::Decoding)
@@ -1337,6 +1353,11 @@ mod tests {
                 PermitProfile::OutputDecode,
             ),
             (
+                MediaOperationKind::StaticEstimate,
+                Duration::from_secs(60),
+                PermitProfile::EstimateDecode,
+            ),
+            (
                 MediaOperationKind::OptimizerSearch,
                 Duration::from_secs(180),
                 PermitProfile::OutputDecode,
@@ -1347,6 +1368,32 @@ mod tests {
             assert_eq!(kind.timeout(), deadline);
             assert_eq!(kind.permit_profile(), permits);
         }
+    }
+
+    #[test]
+    fn static_estimate_promotion_owns_estimate_then_decode_without_output_permit() {
+        test_runtime().block_on(async {
+            let state = PipelineState::new();
+            let progress = ValidatedProgressSink::new(
+                MediaOperationKind::StaticEstimate,
+                RecordingProgressSink::default(),
+            );
+            let managed = state
+                .reserve("static-estimate-permits")
+                .expect("estimate reservation")
+                .promote(MediaOperationKind::StaticEstimate, &progress)
+                .await
+                .expect("estimate promotion");
+
+            assert_eq!(state.estimate.available_permits(), 0);
+            assert_eq!(state.decode.available_permits(), 1);
+            assert_eq!(state.output.available_permits(), 1);
+
+            drop(managed);
+            assert_eq!(state.estimate.available_permits(), 1);
+            assert_eq!(state.decode.available_permits(), 2);
+            assert_eq!(state.output.available_permits(), 1);
+        });
     }
 
     #[test]
@@ -1361,6 +1408,10 @@ mod tests {
             (
                 "convert_static_image_to_png",
                 "MediaOperationKind::StaticConversion",
+            ),
+            (
+                "estimate_static_output_size",
+                "MediaOperationKind::StaticEstimate",
             ),
             (
                 "run_optimizer_search",
@@ -1907,6 +1958,69 @@ mod tests {
     }
 
     #[test]
+    fn estimate_then_decode_promotion_cancellation_releases_partial_permits_and_registry() {
+        test_runtime().block_on(async {
+            let state = PipelineState::new();
+            let held_decode_a = state
+                .decode
+                .clone()
+                .try_acquire_owned()
+                .expect("first decode permit must be held");
+            let held_decode_b = state
+                .decode
+                .clone()
+                .try_acquire_owned()
+                .expect("second decode permit must be held");
+            let reservation = state
+                .reserve("promote-estimate-before-decode")
+                .expect("reservation must be created");
+            let recording = RecordingProgressSink::default();
+            let waiter_recording = recording.clone();
+            let waiter = tokio::spawn(async move {
+                let progress = ValidatedProgressSink::new(
+                    MediaOperationKind::StaticEstimate,
+                    waiter_recording,
+                );
+                reservation
+                    .promote(MediaOperationKind::StaticEstimate, &progress)
+                    .await
+            });
+
+            within_test_timeout(async {
+                loop {
+                    if state.estimate.available_permits() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert_eq!(state.estimate.available_permits(), 0);
+            assert_eq!(state.decode.available_permits(), 0);
+            assert_eq!(state.output.available_permits(), 1);
+            assert_eq!(state.registry.lock_state().active.len(), 1);
+            let queued = recording.values.lock().expect("recording sink lock");
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].stage, ProgressStage::Queued);
+            drop(queued);
+
+            assert!(state.cancel("promote-estimate-before-decode"));
+            let result = within_test_timeout(waiter)
+                .await
+                .expect("promotion task must not panic");
+            assert!(matches!(result, Err(PipelineError::Cancelled)));
+            assert!(state.registry.lock_state().active.is_empty());
+            assert_eq!(state.estimate.available_permits(), 1);
+            assert_eq!(state.decode.available_permits(), 0);
+            assert_eq!(state.output.available_permits(), 1);
+
+            drop(held_decode_a);
+            drop(held_decode_b);
+            assert_eq!(state.decode.available_permits(), 2);
+        });
+    }
+
+    #[test]
     fn reservation_promotion_starts_deadline_and_emits_queued_once() {
         test_runtime().block_on(async {
             let state = PipelineState::new();
@@ -2135,6 +2249,16 @@ mod tests {
                 ],
             ),
             (
+                MediaOperationKind::StaticEstimate,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Inspecting,
+                    ProgressStage::Decoding,
+                    ProgressStage::Encoding,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
                 MediaOperationKind::OptimizerSearch,
                 &[
                     ProgressStage::Queued,
@@ -2214,6 +2338,11 @@ mod tests {
             ),
             (
                 MediaOperationKind::StaticConversion,
+                &[ProgressStage::Queued, ProgressStage::Inspecting],
+                ProgressStage::Estimating,
+            ),
+            (
+                MediaOperationKind::StaticEstimate,
                 &[ProgressStage::Queued, ProgressStage::Inspecting],
                 ProgressStage::Estimating,
             ),

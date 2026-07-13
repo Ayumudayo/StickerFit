@@ -1,3 +1,4 @@
+mod estimation;
 mod frame_source;
 mod locale;
 mod media_error;
@@ -51,6 +52,10 @@ use windows::Win32::Media::MediaFoundation::{
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
+use crate::estimation::{
+    estimate_static_png_with_operation, OutputSizeEstimate, OutputSizeEstimateError,
+    StaticSizeEstimateRequest,
+};
 use crate::frame_source::{
     build_candidate_output_sequence, build_inspected_timing_grid, checked_prepared_bytes,
     checked_timeline_duration, project_timing_grid, FramePreparationRequest, FrameSourceLoader,
@@ -7241,6 +7246,140 @@ async fn build_optimizer_plan(
 }
 
 #[tauri::command]
+async fn estimate_static_output_size(
+    request: StaticSizeEstimateRequest,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
+) -> Result<OutputSizeEstimate, OutputSizeEstimateError> {
+    let locale = parse_ui_locale(Some(request.locale.as_str()));
+    if request.input_path.trim().is_empty() || request.source_revision.trim().is_empty() {
+        return Err(OutputSizeEstimateError::from_pipeline(
+            &PipelineError::InvalidRequestWithoutReason,
+            locale,
+        ));
+    }
+
+    let kind = MediaOperationKind::StaticEstimate;
+    let state = pipeline_state.inner().clone();
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = state
+        .reserve(&operation_id)
+        .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = request.input_path.clone();
+    let preflight_source_revision = request.source_revision.clone();
+    let preflight = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            SourcePreflight::validate_expected(
+                Path::new(&preflight_input_path),
+                Some(preflight_source_revision.as_str()),
+                MediaLimits::default(),
+            )
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return Err(OutputSizeEstimateError::from_pipeline(&error, locale)),
+        Err(message) => {
+            return Err(OutputSizeEstimateError::from_pipeline(
+                &PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+                locale,
+            ))
+        }
+    };
+    let managed = reservation
+        .promote(kind, &progress)
+        .await
+        .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+    let context = managed.context().clone();
+
+    match run_managed_blocking(managed, move || {
+        let estimate = (|| -> Result<OutputSizeEstimate, OutputSizeEstimateError> {
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+                .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+            publish_progress(&progress, &context, ProgressStage::Inspecting, 0, Some(1));
+            let canonical_path = preflight.canonical_path().to_string_lossy().into_owned();
+            let mut checkpoint = || context.checkpoint();
+            let inspection = inspect_input_media_preflighted_with_callbacks(
+                &canonical_path,
+                &preflight,
+                locale,
+                Some(&context),
+                &mut checkpoint,
+            );
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+                .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+            publish_progress(&progress, &context, ProgressStage::Inspecting, 1, Some(1));
+            if !inspection.ok {
+                return Err(OutputSizeEstimateError::new(
+                    inspection
+                        .error_code
+                        .unwrap_or(MediaOperationErrorCode::InternalTaskFailed),
+                    inspection.reason_code,
+                    inspection.error_message.unwrap_or_else(|| {
+                        locale::media_pipeline_diagnostic(locale, "internal-task-failed")
+                    }),
+                ));
+            }
+            if !inspection.is_static_image {
+                return Err(OutputSizeEstimateError::new(
+                    MediaOperationErrorCode::InvalidRequest,
+                    Some(MediaOperationReasonCode::UnsupportedSourceFormat),
+                    locale::unsupported_still_image_error(locale),
+                ));
+            }
+            if let Err(error_message) = resolve_crop_region(
+                request.crop_region.as_ref(),
+                inspection.width,
+                inspection.height,
+                locale,
+            ) {
+                return Err(OutputSizeEstimateError::new(
+                    MediaOperationErrorCode::InvalidRequest,
+                    Some(MediaOperationReasonCode::InvalidCrop),
+                    error_message,
+                ));
+            }
+
+            let estimate = estimate_static_png_with_operation(
+                preflight.canonical_path(),
+                request.crop_region.as_ref(),
+                preflight.identity(),
+                &context,
+                MediaLimits::default(),
+                &progress,
+            )
+            .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+            finalize_source_publication(&context, preflight.identity(), || {
+                publish_progress(&progress, &context, ProgressStage::Finalizing, 1, Some(1));
+                Ok(estimate)
+            })
+            .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))
+        })();
+        match finalize_managed_response(&context, estimate) {
+            Ok(estimate) => estimate,
+            Err(error) => Err(OutputSizeEstimateError::from_pipeline(&error, locale)),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => Err(OutputSizeEstimateError::from_pipeline(
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+            locale,
+        )),
+    }
+}
+
+#[tauri::command]
 async fn convert_static_image_to_png(
     request: StaticImageConversionRequest,
     operation_id: String,
@@ -13542,6 +13681,11 @@ mod tests {
                 None,
             ),
             (
+                "estimate_static_output_size",
+                "MediaOperationKind::StaticEstimate",
+                Some("estimate_static_png_with_operation("),
+            ),
+            (
                 "convert_static_image_to_png",
                 "MediaOperationKind::StaticConversion",
                 Some("convert_static_image_to_png_with_operation("),
@@ -14353,6 +14497,7 @@ pub fn run() {
             check_media_tools,
             inspect_input_media,
             build_optimizer_plan,
+            estimate_static_output_size,
             run_optimizer_search,
             convert_static_image_to_png,
             extract_frame_preview,

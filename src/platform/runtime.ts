@@ -10,6 +10,7 @@ import type {
   FramePreviewResult,
   FramePreviewsRequest,
   FramePreviewsResult,
+  OutputSizeEstimate,
   OptimizerPlanRequest,
   OptimizerPlanResponse,
   OptimizerSearchRequest,
@@ -17,6 +18,7 @@ import type {
   SearchAttemptResult,
   StaticImageConversionRequest,
   StaticImageConversionResult,
+  StaticSizeEstimateRequest,
   ToolHealthReport,
 } from "../types/workflow";
 
@@ -481,6 +483,10 @@ export type AppRuntime = {
     request: StaticImageConversionRequest,
     options: MediaOperationOptions,
   ) => Promise<StaticImageConversionResult>;
+  estimateStaticOutputSize: (
+    request: StaticSizeEstimateRequest,
+    options: MediaOperationOptions,
+  ) => Promise<OutputSizeEstimate>;
   extractFramePreview: (
     request: FramePreviewRequest,
     options: MediaOperationOptions,
@@ -831,6 +837,19 @@ export async function invokeDesktopMediaOperation<T>(
   }
 }
 
+export function invokeDesktopStaticSizeEstimate(
+  request: StaticSizeEstimateRequest,
+  options: MediaOperationOptions,
+  bridge?: DesktopMediaOperationBridge,
+) {
+  return invokeDesktopMediaOperation<OutputSizeEstimate>(
+    "estimate_static_output_size",
+    { request },
+    options,
+    bridge,
+  );
+}
+
 async function loadTauriDialog() {
   return import("@tauri-apps/plugin-dialog");
 }
@@ -957,6 +976,9 @@ const tauriRuntime: AppRuntime = {
     );
     return normalizeLegacyMediaResponse(result);
   },
+  async estimateStaticOutputSize(request, options) {
+    return invokeDesktopStaticSizeEstimate(request, options);
+  },
   async extractFramePreview(request, options) {
     const result = await invokeDesktopMediaOperation<
       LegacyMediaResponse<FramePreviewResult>
@@ -1078,6 +1100,9 @@ const webRuntime: AppRuntime = {
     throw new Error(DESKTOP_ONLY_ERROR);
   },
   async convertStaticImageToPng(_request, _options) {
+    throw new Error(DESKTOP_ONLY_ERROR);
+  },
+  async estimateStaticOutputSize(_request, _options) {
     throw new Error(DESKTOP_ONLY_ERROR);
   },
   async extractFramePreview(_request, _options) {
