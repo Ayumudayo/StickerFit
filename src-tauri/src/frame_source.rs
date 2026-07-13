@@ -426,6 +426,7 @@ mod tests {
             fit_mode: "contain".into(),
             score: 1.0,
             source_similarity_score: 1.0,
+            relative_size_factor: 1.0,
             summary: "test".into(),
             frame_sample_step,
         }

@@ -53,8 +53,8 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 use crate::estimation::{
-    estimate_static_png_with_operation, OutputSizeEstimate, OutputSizeEstimateError,
-    StaticSizeEstimateRequest,
+    estimate_candidate_size, estimate_static_png_with_operation, parse_sample_seed,
+    probe_candidate_size, OutputSizeEstimate, OutputSizeEstimateError, StaticSizeEstimateRequest,
 };
 use crate::frame_source::{
     build_candidate_output_sequence, build_inspected_timing_grid, checked_prepared_bytes,
@@ -296,7 +296,7 @@ pub(crate) struct CropRegion {
     height: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OptimizerPlanRequest {
     locale: Option<String>,
@@ -318,6 +318,27 @@ pub(crate) struct OptimizerPlanRequest {
     timeline_frames: Option<Vec<EditedTimelineFrame>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OptimizerSizeEstimateRequest {
+    input_path: String,
+    source_revision: String,
+    candidate_ids: Vec<String>,
+    sample_seed: String,
+    #[serde(flatten)]
+    plan: OptimizerPlanRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateSizeProbeRequest {
+    input_path: String,
+    source_revision: String,
+    candidate_id: String,
+    #[serde(flatten)]
+    plan: OptimizerPlanRequest,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditedTimelineFrame {
@@ -337,6 +358,7 @@ pub(crate) struct CandidatePreview {
     fit_mode: String,
     score: f64,
     source_similarity_score: f64,
+    relative_size_factor: f64,
     summary: String,
     #[serde(skip_serializing)]
     frame_sample_step: u32,
@@ -871,10 +893,14 @@ fn preset_size_factor(preset: &str) -> f64 {
     }
 }
 
+fn relative_size_factor_for(frame_sample_step: u32, content_scale: f64, preset: &str) -> f64 {
+    let frame_factor = 1.0 / frame_sample_step.max(1) as f64;
+    let scale_factor = content_scale.clamp(0.01, 1.0).powi(2);
+    frame_factor * scale_factor * preset_size_factor(preset)
+}
+
 fn candidate_estimated_size_factor(candidate: &CandidatePreview) -> f64 {
-    let frame_factor = 1.0 / candidate.frame_sample_step.max(1) as f64;
-    let scale_factor = candidate.content_scale.clamp(0.01, 1.0).powi(2);
-    frame_factor * scale_factor * preset_size_factor(&candidate.preset)
+    candidate.relative_size_factor
 }
 
 fn push_unique_candidate(
@@ -1614,6 +1640,7 @@ fn build_candidate_universe_fixed_duration(
                 fit_mode: CANONICAL_FIT_MODE.into(),
                 score,
                 source_similarity_score: score,
+                relative_size_factor: relative_size_factor_for(1, *scale, preset),
                 summary,
                 frame_sample_step: 1,
             });
@@ -2844,6 +2871,7 @@ fn required_video_source_indexes(
                 fit_mode: CANONICAL_FIT_MODE.into(),
                 score: 0.0,
                 source_similarity_score: 0.0,
+                relative_size_factor: relative_size_factor_for(frame_sample_step, 1.0, "standard"),
                 summary: String::new(),
                 frame_sample_step,
             };
@@ -4009,6 +4037,160 @@ fn publish_optimizer_selection(
     }))
 }
 
+pub(crate) struct NativeApngWriteSession<W: Write> {
+    writer: png::Writer<W>,
+    frame_delays: Vec<(u16, u16)>,
+    width: u32,
+    height: u32,
+    declared_frame_count: usize,
+    written_frame_count: usize,
+    last_output_position: usize,
+    validate_complete: bool,
+}
+
+impl<W: Write> NativeApngWriteSession<W> {
+    pub(crate) fn begin(
+        writer: W,
+        width: u32,
+        height: u32,
+        declared_frame_count: usize,
+        durations_us: &[u64],
+        preset: &str,
+        validate_complete: bool,
+    ) -> Result<Self, PipelineError> {
+        if declared_frame_count == 0 {
+            return Err(PipelineError::InvalidRequest {
+                reason: "no-frames-selected",
+            });
+        }
+        if durations_us.len() != declared_frame_count {
+            return Err(PipelineError::MalformedProcessOutput {
+                reason: "APNG duration count did not match frame count".into(),
+            });
+        }
+        let frame_count_u32 =
+            u32::try_from(declared_frame_count).map_err(|_| PipelineError::LimitExceeded {
+                resource: "frame-count",
+                limit: u64::from(u32::MAX),
+                actual: u64::try_from(declared_frame_count).unwrap_or(u64::MAX),
+            })?;
+        let frame_delays = quantize_apng_delays(durations_us)
+            .map_err(|reason| PipelineError::InvalidRequest { reason })?;
+
+        let mut encoder = NativePngEncoder::new(writer, width, height);
+        encoder.set_color(PngColorType::Rgba);
+        encoder.set_depth(PngBitDepth::Eight);
+        encoder
+            .set_animated(frame_count_u32, 0)
+            .map_err(|error| pipeline_io_error("configure APNG output", error))?;
+        encoder
+            .set_sep_def_img(false)
+            .map_err(|error| pipeline_io_error("configure APNG output", error))?;
+        encoder.set_deflate_compression(native_png_deflate_for_preset(preset));
+        encoder.set_filter(native_png_filter_for_preset(preset));
+        encoder
+            .set_blend_op(PngBlendOp::Source)
+            .map_err(|error| pipeline_io_error("configure APNG output", error))?;
+        encoder
+            .set_dispose_op(PngDisposeOp::None)
+            .map_err(|error| pipeline_io_error("configure APNG output", error))?;
+        let (delay_num, delay_den) = frame_delays[0];
+        encoder
+            .set_frame_delay(delay_num, delay_den)
+            .map_err(|error| pipeline_io_error("configure APNG output", error))?;
+        encoder.validate_sequence(validate_complete);
+        let writer = encoder
+            .write_header()
+            .map_err(|error| pipeline_io_error("write APNG header", error))?;
+
+        Ok(Self {
+            writer,
+            frame_delays,
+            width,
+            height,
+            declared_frame_count,
+            written_frame_count: 0,
+            last_output_position: 0,
+            validate_complete,
+        })
+    }
+
+    pub(crate) fn write_first(&mut self, pixels: &RgbaImage) -> Result<(), PipelineError> {
+        if self.written_frame_count != 0 || pixels.dimensions() != (self.width, self.height) {
+            return Err(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            });
+        }
+        self.writer
+            .write_image_data(pixels.as_raw())
+            .map_err(|error| pipeline_io_error("write APNG frame", error))?;
+        self.written_frame_count = 1;
+        Ok(())
+    }
+
+    pub(crate) fn write_transition(
+        &mut self,
+        output_position: usize,
+        previous: &RgbaImage,
+        current: &RgbaImage,
+    ) -> Result<(), PipelineError> {
+        if self.written_frame_count == 0
+            || output_position == 0
+            || output_position >= self.declared_frame_count
+            || output_position <= self.last_output_position
+            || previous.dimensions() != (self.width, self.height)
+            || current.dimensions() != (self.width, self.height)
+        {
+            return Err(PipelineError::InvalidRequest {
+                reason: "invalid-frame-selection",
+            });
+        }
+        let (delay_num, delay_den) = self.frame_delays[output_position];
+        let region = changed_frame_region(previous, current);
+        self.writer
+            .reset_frame_position()
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
+        self.writer
+            .set_frame_dimension(region.width, region.height)
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
+        self.writer
+            .set_frame_position(region.x, region.y)
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
+        self.writer
+            .set_frame_delay(delay_num, delay_den)
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
+        self.writer
+            .set_blend_op(PngBlendOp::Source)
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
+        self.writer
+            .set_dispose_op(PngDisposeOp::None)
+            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
+        let region_pixels = frame_region_pixels(current, region);
+        self.writer
+            .write_image_data(&region_pixels)
+            .map_err(|error| pipeline_io_error("write APNG frame", error))?;
+        self.written_frame_count += 1;
+        self.last_output_position = output_position;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<(), PipelineError> {
+        if self.written_frame_count == 0 {
+            return Err(PipelineError::MalformedProcessOutput {
+                reason: "APNG frame iterator ended before the first frame".into(),
+            });
+        }
+        if self.validate_complete && self.written_frame_count != self.declared_frame_count {
+            return Err(PipelineError::MalformedProcessOutput {
+                reason: "APNG frame iterator ended before the declared frame count".into(),
+            });
+        }
+        self.writer
+            .finish()
+            .map_err(|error| pipeline_io_error("finish APNG output", error))
+    }
+}
+
 fn write_native_apng<W: Write>(
     writer: W,
     frames: &[StickerFrame],
@@ -4060,15 +4242,6 @@ where
             reason: "APNG duration count did not match frame count".into(),
         });
     }
-    let frame_count_u32 = u32::try_from(frame_count).map_err(|_| PipelineError::LimitExceeded {
-        resource: "frame-count",
-        limit: u64::from(u32::MAX),
-        actual: u64::try_from(frame_count).unwrap_or(u64::MAX),
-    })?;
-    let frame_delays = quantize_apng_delays(durations_us)
-        .map_err(|reason| PipelineError::InvalidRequest { reason })?;
-
-    checkpoint()?;
     let first = frames
         .next()
         .ok_or_else(|| PipelineError::MalformedProcessOutput {
@@ -4082,37 +4255,17 @@ where
 
     let width = first.pixels.width();
     let height = first.pixels.height();
-
-    let mut encoder = NativePngEncoder::new(writer, width, height);
-    encoder.set_color(PngColorType::Rgba);
-    encoder.set_depth(PngBitDepth::Eight);
-    encoder
-        .set_animated(frame_count_u32, 0)
-        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
-    encoder
-        .set_sep_def_img(false)
-        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
-    encoder.set_deflate_compression(native_png_deflate_for_preset(preset));
-    encoder.set_filter(native_png_filter_for_preset(preset));
-    encoder
-        .set_blend_op(PngBlendOp::Source)
-        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
-    encoder
-        .set_dispose_op(PngDisposeOp::None)
-        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
-    let (delay_num, delay_den) = frame_delays[0];
-    encoder
-        .set_frame_delay(delay_num, delay_den)
-        .map_err(|error| pipeline_io_error("configure APNG output", error))?;
-    encoder.validate_sequence(true);
-
-    let mut png_writer = encoder
-        .write_header()
-        .map_err(|error| pipeline_io_error("write APNG header", error))?;
+    let mut session = NativeApngWriteSession::begin(
+        writer,
+        width,
+        height,
+        frame_count,
+        durations_us,
+        preset,
+        true,
+    )?;
     checkpoint()?;
-    png_writer
-        .write_image_data(first.pixels.as_raw())
-        .map_err(|error| pipeline_io_error("write APNG frame", error))?;
+    session.write_first(&first.pixels)?;
     checkpoint()?;
 
     let mut previous_frame = first.pixels;
@@ -4133,31 +4286,8 @@ where
                 reason: "invalid-frame-selection",
             });
         }
-        let (delay_num, delay_den) = frame_delays[frame_index];
         checkpoint()?;
-        let region = changed_frame_region(&previous_frame, &frame.pixels);
-        png_writer
-            .reset_frame_position()
-            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
-        png_writer
-            .set_frame_dimension(region.width, region.height)
-            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
-        png_writer
-            .set_frame_position(region.x, region.y)
-            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
-        png_writer
-            .set_frame_delay(delay_num, delay_den)
-            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
-        png_writer
-            .set_blend_op(PngBlendOp::Source)
-            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
-        png_writer
-            .set_dispose_op(PngDisposeOp::None)
-            .map_err(|error| pipeline_io_error("configure APNG frame", error))?;
-        let region_pixels = frame_region_pixels(&frame.pixels, region);
-        png_writer
-            .write_image_data(&region_pixels)
-            .map_err(|error| pipeline_io_error("write APNG frame", error))?;
+        session.write_transition(frame_index, &previous_frame, &frame.pixels)?;
         checkpoint()?;
         previous_frame = frame.pixels;
     }
@@ -4174,9 +4304,7 @@ where
     }
 
     checkpoint()?;
-    png_writer
-        .finish()
-        .map_err(|error| pipeline_io_error("finish APNG output", error))
+    session.finish()
 }
 
 fn validate_raw_rgba_output(
@@ -4439,6 +4567,11 @@ fn build_candidate_universe_with_checkpoint(
                         fit_mode: CANONICAL_FIT_MODE.into(),
                         score,
                         source_similarity_score: score,
+                        relative_size_factor: relative_size_factor_for(
+                            frame_sample_step,
+                            *scale,
+                            preset,
+                        ),
                         summary,
                         frame_sample_step,
                     });
@@ -4907,6 +5040,223 @@ fn prepare_optimizer_plan_with_operation(
         Ok(response) => response,
         Err(error) => optimizer_plan_pipeline_error(locale, warnings, &error),
     }
+}
+
+fn validate_candidate_ids(candidate_ids: &[String]) -> Result<(), PipelineError> {
+    if candidate_ids.is_empty() || candidate_ids.len() > 5 {
+        return Err(PipelineError::InvalidRequestWithoutReason);
+    }
+    let mut unique = BTreeSet::new();
+    for candidate_id in candidate_ids {
+        if candidate_id.trim().is_empty() || !unique.insert(candidate_id.as_str()) {
+            return Err(PipelineError::InvalidRequestWithoutReason);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_candidate_frame_view(
+    request: &OptimizerPlanRequest,
+) -> Result<(Option<Vec<ResolvedTimelineFrame>>, Option<Vec<u32>>), PipelineError> {
+    let optimizer_goal = normalized_optimizer_goal(
+        request.optimizer_goal.as_deref(),
+        request.preset_strategy.as_deref(),
+    );
+    let quality_interval =
+        normalized_quality_frame_drop_interval(request.quality_frame_drop_interval);
+    let timeline_frames =
+        resolve_timeline_frames(request.timeline_frames.as_ref(), request.base_frame_count)
+            .map_err(|reason| PipelineError::InvalidRequest { reason })?;
+    if let Some(timeline_frames) = timeline_frames {
+        let timeline_frames = if optimizer_goal == "quality" {
+            apply_quality_frame_drop_to_timeline_frames(timeline_frames, quality_interval)
+                .map_err(|reason| PipelineError::InvalidRequest { reason })?
+        } else {
+            timeline_frames
+        };
+        return Ok((Some(timeline_frames), None));
+    }
+
+    let selection =
+        resolve_frame_selection(request.selected_frames.as_ref(), request.base_frame_count)
+            .map_err(|reason| PipelineError::InvalidRequest { reason })?;
+    let selection = if optimizer_goal == "quality" {
+        apply_quality_frame_drop_to_selection(selection, quality_interval)
+            .map_err(|reason| PipelineError::InvalidRequest { reason })?
+    } else {
+        selection
+    };
+    Ok((None, selection.selected_frames))
+}
+
+fn prepare_candidate_estimation_source(
+    request: &OptimizerPlanRequest,
+    requested_candidate_ids: &[String],
+    input_path: &Path,
+    source_revision: &str,
+    locale: UiLocale,
+    loader: &impl FrameSourceLoader,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> Result<(OptimizerPlanResponse, PreparedSearchSource), PipelineError> {
+    context.checkpoint()?;
+    let plan =
+        prepare_optimizer_plan_with_checkpoint(request, locale, &mut || context.checkpoint());
+    if !plan.ok {
+        return Err(PipelineError::InvalidRequest {
+            reason: "plan-invalid",
+        });
+    }
+    if requested_candidate_ids.iter().any(|candidate_id| {
+        !plan
+            .candidates
+            .iter()
+            .any(|candidate| &candidate.id == candidate_id)
+    }) {
+        return Err(PipelineError::InvalidRequestWithoutReason);
+    }
+    let (resolved_timeline_frames, selected_frame_indexes) = resolve_candidate_frame_view(request)?;
+    let optimizer_goal = normalized_optimizer_goal(
+        request.optimizer_goal.as_deref(),
+        request.preset_strategy.as_deref(),
+    );
+    publish_progress(progress, context, ProgressStage::Decoding, 0, Some(1));
+    let prepared = loader.prepare(
+        FramePreparationRequest {
+            input_path,
+            source_revision,
+            crop_region: request.crop_region.as_ref(),
+            input_width: request.input_width,
+            input_height: request.input_height,
+            base_frame_count: request.base_frame_count,
+            timeline_frames: request.timeline_frames.as_deref(),
+            resolved_timeline_frames: resolved_timeline_frames.as_deref(),
+            selected_frame_indexes: selected_frame_indexes.as_deref(),
+            source_duration_seconds: request.source_duration_seconds,
+            avg_fps: request.avg_fps,
+            locale,
+            optimizer_goal,
+        },
+        &plan,
+        context,
+        MediaLimits::default(),
+    )?;
+    publish_progress(progress, context, ProgressStage::Decoding, 1, Some(1));
+    Ok((plan, prepared))
+}
+
+fn synchronize_candidate_estimation_plan(
+    plan: &mut OptimizerPlanResponse,
+    prepared: &PreparedSearchSource,
+    request: &OptimizerPlanRequest,
+    locale: UiLocale,
+    context: &OperationContext,
+) -> Result<(), PipelineError> {
+    synchronize_candidates_with_prepared_duration(
+        plan,
+        prepared,
+        request.input_width,
+        request.input_height,
+        normalized_preset_strategy(request.preset_strategy.as_deref()),
+        normalized_optimizer_goal(
+            request.optimizer_goal.as_deref(),
+            request.preset_strategy.as_deref(),
+        ),
+        locale,
+        context,
+    )
+}
+
+fn estimate_optimizer_candidates_with_loader(
+    request: &OptimizerSizeEstimateRequest,
+    preflight: &SourcePreflight,
+    locale: UiLocale,
+    loader: &impl FrameSourceLoader,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> Result<Vec<OutputSizeEstimate>, PipelineError> {
+    validate_candidate_ids(&request.candidate_ids)?;
+    let sample_seed = parse_sample_seed(&request.sample_seed)?;
+    let source_revision = preflight.identity().revision();
+    let (mut plan, prepared) = prepare_candidate_estimation_source(
+        &request.plan,
+        &request.candidate_ids,
+        preflight.canonical_path(),
+        &source_revision,
+        locale,
+        loader,
+        context,
+        progress,
+    )?;
+    checkpointed_source_check(context, preflight.identity(), MediaLimits::default())?;
+    synchronize_candidate_estimation_plan(&mut plan, &prepared, &request.plan, locale, context)?;
+    if request.candidate_ids.iter().any(|candidate_id| {
+        !plan
+            .candidates
+            .iter()
+            .any(|candidate| &candidate.id == candidate_id)
+    }) {
+        return Err(PipelineError::InvalidRequestWithoutReason);
+    }
+
+    let total = u32::try_from(request.candidate_ids.len()).unwrap_or(u32::MAX);
+    publish_progress(progress, context, ProgressStage::Estimating, 0, Some(total));
+    let mut estimates = Vec::with_capacity(request.candidate_ids.len());
+    for (index, candidate_id) in request.candidate_ids.iter().enumerate() {
+        context.checkpoint()?;
+        checkpointed_source_check(context, preflight.identity(), MediaLimits::default())?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| &candidate.id == candidate_id)
+            .ok_or(PipelineError::InvalidRequestWithoutReason)?;
+        let sequence = build_candidate_output_sequence(&prepared, candidate, context)?;
+        estimates.push(estimate_candidate_size(&sequence, sample_seed, context)?);
+        publish_progress(
+            progress,
+            context,
+            ProgressStage::Estimating,
+            u32::try_from(index + 1).unwrap_or(u32::MAX),
+            Some(total),
+        );
+    }
+    checkpointed_source_check(context, preflight.identity(), MediaLimits::default())?;
+    Ok(estimates)
+}
+
+fn probe_optimizer_candidate_with_loader(
+    request: &CandidateSizeProbeRequest,
+    preflight: &SourcePreflight,
+    locale: UiLocale,
+    loader: &impl FrameSourceLoader,
+    context: &OperationContext,
+    progress: &impl ProgressSink,
+) -> Result<OutputSizeEstimate, PipelineError> {
+    validate_candidate_ids(std::slice::from_ref(&request.candidate_id))?;
+    let source_revision = preflight.identity().revision();
+    let (mut plan, prepared) = prepare_candidate_estimation_source(
+        &request.plan,
+        std::slice::from_ref(&request.candidate_id),
+        preflight.canonical_path(),
+        &source_revision,
+        locale,
+        loader,
+        context,
+        progress,
+    )?;
+    checkpointed_source_check(context, preflight.identity(), MediaLimits::default())?;
+    synchronize_candidate_estimation_plan(&mut plan, &prepared, &request.plan, locale, context)?;
+    let candidate = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.id == request.candidate_id)
+        .ok_or(PipelineError::InvalidRequestWithoutReason)?;
+    publish_progress(progress, context, ProgressStage::Encoding, 0, Some(1));
+    let sequence = build_candidate_output_sequence(&prepared, candidate, context)?;
+    let estimate = probe_candidate_size(&sequence, context)?;
+    checkpointed_source_check(context, preflight.identity(), MediaLimits::default())?;
+    publish_progress(progress, context, ProgressStage::Encoding, 1, Some(1));
+    Ok(estimate)
 }
 
 fn encode_prepared_candidate_with_checkpoint(
@@ -7380,6 +7730,183 @@ async fn estimate_static_output_size(
 }
 
 #[tauri::command]
+async fn estimate_optimizer_candidates(
+    request: OptimizerSizeEstimateRequest,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
+) -> Result<Vec<OutputSizeEstimate>, OutputSizeEstimateError> {
+    let locale = parse_ui_locale(request.plan.locale.as_deref());
+    if request.input_path.trim().is_empty()
+        || request.source_revision.trim().is_empty()
+        || validate_candidate_ids(&request.candidate_ids).is_err()
+        || parse_sample_seed(&request.sample_seed).is_err()
+    {
+        return Err(OutputSizeEstimateError::from_pipeline(
+            &PipelineError::InvalidRequestWithoutReason,
+            locale,
+        ));
+    }
+    let kind = MediaOperationKind::OptimizerEstimate;
+    let state = pipeline_state.inner().clone();
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = state
+        .reserve(&operation_id)
+        .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = request.input_path.clone();
+    let preflight_source_revision = request.source_revision.clone();
+    let preflight = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            SourcePreflight::validate_expected(
+                Path::new(&preflight_input_path),
+                Some(preflight_source_revision.as_str()),
+                MediaLimits::default(),
+            )
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return Err(OutputSizeEstimateError::from_pipeline(&error, locale)),
+        Err(message) => {
+            return Err(OutputSizeEstimateError::from_pipeline(
+                &PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+                locale,
+            ))
+        }
+    };
+    let managed = reservation
+        .promote(kind, &progress)
+        .await
+        .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+    let context = managed.context().clone();
+
+    match run_managed_blocking(managed, move || {
+        let result = (|| -> Result<Vec<OutputSizeEstimate>, OutputSizeEstimateError> {
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+                .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+            let loader = DefaultFrameSourceLoader;
+            let estimates = estimate_optimizer_candidates_with_loader(
+                &request, &preflight, locale, &loader, &context, &progress,
+            )
+            .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+            finalize_source_publication(&context, preflight.identity(), || {
+                publish_progress(&progress, &context, ProgressStage::Finalizing, 1, Some(1));
+                Ok(estimates)
+            })
+            .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))
+        })();
+        match finalize_managed_response(&context, result) {
+            Ok(result) => result,
+            Err(error) => Err(OutputSizeEstimateError::from_pipeline(&error, locale)),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => Err(OutputSizeEstimateError::from_pipeline(
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+            locale,
+        )),
+    }
+}
+
+#[tauri::command]
+async fn probe_optimizer_candidate_size(
+    request: CandidateSizeProbeRequest,
+    operation_id: String,
+    on_progress: Channel<OperationProgress>,
+    pipeline_state: State<'_, PipelineState>,
+) -> Result<OutputSizeEstimate, OutputSizeEstimateError> {
+    let locale = parse_ui_locale(request.plan.locale.as_deref());
+    if request.input_path.trim().is_empty()
+        || request.source_revision.trim().is_empty()
+        || validate_candidate_ids(std::slice::from_ref(&request.candidate_id)).is_err()
+    {
+        return Err(OutputSizeEstimateError::from_pipeline(
+            &PipelineError::InvalidRequestWithoutReason,
+            locale,
+        ));
+    }
+    let kind = MediaOperationKind::OptimizerProbe;
+    let state = pipeline_state.inner().clone();
+    let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
+    let reservation = state
+        .reserve(&operation_id)
+        .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+    let preflight_context = reservation.context().clone();
+    let preflight_input_path = request.input_path.clone();
+    let preflight_source_revision = request.source_revision.clone();
+    let preflight = match run_blocking_task(move || {
+        run_reserved_preflight(&preflight_context, || {
+            SourcePreflight::validate_expected(
+                Path::new(&preflight_input_path),
+                Some(preflight_source_revision.as_str()),
+                MediaLimits::default(),
+            )
+        })
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return Err(OutputSizeEstimateError::from_pipeline(&error, locale)),
+        Err(message) => {
+            return Err(OutputSizeEstimateError::from_pipeline(
+                &PipelineError::Io {
+                    operation: "join source preflight",
+                    message,
+                },
+                locale,
+            ))
+        }
+    };
+    let managed = reservation
+        .promote(kind, &progress)
+        .await
+        .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+    let context = managed.context().clone();
+
+    match run_managed_blocking(managed, move || {
+        let result = (|| -> Result<OutputSizeEstimate, OutputSizeEstimateError> {
+            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+                .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+            let loader = DefaultFrameSourceLoader;
+            let estimate = probe_optimizer_candidate_with_loader(
+                &request, &preflight, locale, &loader, &context, &progress,
+            )
+            .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))?;
+            finalize_source_publication(&context, preflight.identity(), || {
+                publish_progress(&progress, &context, ProgressStage::Finalizing, 1, Some(1));
+                Ok(estimate)
+            })
+            .map_err(|error| OutputSizeEstimateError::from_pipeline(&error, locale))
+        })();
+        match finalize_managed_response(&context, result) {
+            Ok(result) => result,
+            Err(error) => Err(OutputSizeEstimateError::from_pipeline(&error, locale)),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => Err(OutputSizeEstimateError::from_pipeline(
+            &PipelineError::Io {
+                operation: "join media worker",
+                message,
+            },
+            locale,
+        )),
+    }
+}
+
+#[tauri::command]
 async fn convert_static_image_to_png(
     request: StaticImageConversionRequest,
     operation_id: String,
@@ -8425,6 +8952,12 @@ mod tests {
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    struct IgnoringProgressSink;
+
+    impl ProgressSink for IgnoringProgressSink {
+        fn send(&self, _progress: OperationProgress) {}
+    }
+
     struct CountingFrameSourceLoader {
         prepare_count: AtomicUsize,
     }
@@ -8435,6 +8968,43 @@ mod tests {
                 prepare_count: AtomicUsize::new(0),
             }
         }
+    }
+
+    #[test]
+    fn candidate_estimate_preparation_calls_loader_once_and_stays_under_prepared_budget() {
+        let loader = CountingFrameSourceLoader::new();
+        let context = OperationContext::detached(MediaOperationKind::OptimizerEstimate.timeout());
+        let request = OptimizerPlanRequest {
+            locale: Some("en".into()),
+            source_duration_seconds: Some(0.1),
+            input_width: Some(320),
+            input_height: Some(320),
+            avg_fps: Some(20.0),
+            fit_mode: Some("contain".into()),
+            preset_strategy: Some("standard".into()),
+            optimizer_goal: Some("balanced".into()),
+            quality_frame_drop_interval: None,
+            search_depth: Some("quick".into()),
+            crop_region: None,
+            selected_frames: Some(vec![1, 2]),
+            base_frame_count: Some(2),
+            timeline_frames: None,
+        };
+
+        let (_, prepared) = prepare_candidate_estimation_source(
+            &request,
+            &[],
+            Path::new("ignored.gif"),
+            "revision",
+            UiLocale::En,
+            &loader,
+            &context,
+            &IgnoringProgressSink,
+        )
+        .expect("candidate estimate preparation");
+
+        assert_eq!(loader.prepare_count.load(AtomicOrdering::SeqCst), 1);
+        assert!(prepared.decoded_bytes <= MAX_PREPARED_SEARCH_BYTES);
     }
 
     impl FrameSourceLoader for CountingFrameSourceLoader {
@@ -9029,6 +9599,7 @@ mod tests {
             fit_mode: "contain".into(),
             score: 1.0,
             source_similarity_score: 1.0,
+            relative_size_factor: relative_size_factor_for(1, 1.0, "standard"),
             summary: "test candidate".into(),
             frame_sample_step: 1,
         }
@@ -13686,6 +14257,16 @@ mod tests {
                 Some("estimate_static_png_with_operation("),
             ),
             (
+                "estimate_optimizer_candidates",
+                "MediaOperationKind::OptimizerEstimate",
+                Some("estimate_optimizer_candidates_with_loader("),
+            ),
+            (
+                "probe_optimizer_candidate_size",
+                "MediaOperationKind::OptimizerProbe",
+                Some("probe_optimizer_candidate_with_loader("),
+            ),
+            (
                 "convert_static_image_to_png",
                 "MediaOperationKind::StaticConversion",
                 Some("convert_static_image_to_png_with_operation("),
@@ -14498,6 +15079,8 @@ pub fn run() {
             inspect_input_media,
             build_optimizer_plan,
             estimate_static_output_size,
+            estimate_optimizer_candidates,
+            probe_optimizer_candidate_size,
             run_optimizer_search,
             convert_static_image_to_png,
             extract_frame_preview,

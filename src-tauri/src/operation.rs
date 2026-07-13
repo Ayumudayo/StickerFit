@@ -32,6 +32,8 @@ pub(crate) enum MediaOperationKind {
     StaticEstimate,
     StaticConversion,
     OptimizerSearch,
+    OptimizerEstimate,
+    OptimizerProbe,
 }
 
 impl MediaOperationKind {
@@ -40,6 +42,8 @@ impl MediaOperationKind {
             Self::Inspect | Self::BuildPlan => Duration::from_secs(15),
             Self::Preview => Duration::from_secs(30),
             Self::StaticEstimate | Self::StaticConversion => Duration::from_secs(60),
+            Self::OptimizerEstimate => Duration::from_secs(90),
+            Self::OptimizerProbe => Duration::from_secs(120),
             Self::OptimizerSearch => Duration::from_secs(180),
         }
     }
@@ -48,7 +52,9 @@ impl MediaOperationKind {
         match self {
             Self::BuildPlan => PermitProfile::None,
             Self::Inspect | Self::Preview => PermitProfile::Decode,
-            Self::StaticEstimate => PermitProfile::EstimateDecode,
+            Self::StaticEstimate | Self::OptimizerEstimate | Self::OptimizerProbe => {
+                PermitProfile::EstimateDecode
+            }
             Self::StaticConversion | Self::OptimizerSearch => PermitProfile::OutputDecode,
         }
     }
@@ -881,6 +887,18 @@ fn progress_transition_allowed(
                 | (ProgressStage::Decoding, ProgressStage::Encoding)
                 | (ProgressStage::Encoding, ProgressStage::Finalizing)
         ),
+        MediaOperationKind::OptimizerEstimate => matches!(
+            (current, next),
+            (ProgressStage::Queued, ProgressStage::Decoding)
+                | (ProgressStage::Decoding, ProgressStage::Estimating)
+                | (ProgressStage::Estimating, ProgressStage::Finalizing)
+        ),
+        MediaOperationKind::OptimizerProbe => matches!(
+            (current, next),
+            (ProgressStage::Queued, ProgressStage::Decoding)
+                | (ProgressStage::Decoding, ProgressStage::Encoding)
+                | (ProgressStage::Encoding, ProgressStage::Finalizing)
+        ),
         MediaOperationKind::Preview => matches!(
             (current, next),
             (ProgressStage::Queued, ProgressStage::Decoding)
@@ -1362,6 +1380,16 @@ mod tests {
                 Duration::from_secs(180),
                 PermitProfile::OutputDecode,
             ),
+            (
+                MediaOperationKind::OptimizerEstimate,
+                Duration::from_secs(90),
+                PermitProfile::EstimateDecode,
+            ),
+            (
+                MediaOperationKind::OptimizerProbe,
+                Duration::from_secs(120),
+                PermitProfile::EstimateDecode,
+            ),
         ];
 
         for (kind, deadline, permits) in cases {
@@ -1397,6 +1425,38 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_estimate_and_probe_own_estimate_then_decode_without_output_permit() {
+        test_runtime().block_on(async {
+            for (kind, operation_id) in [
+                (
+                    MediaOperationKind::OptimizerEstimate,
+                    "optimizer-estimate-permits",
+                ),
+                (
+                    MediaOperationKind::OptimizerProbe,
+                    "optimizer-probe-permits",
+                ),
+            ] {
+                let state = PipelineState::new();
+                let progress = ValidatedProgressSink::new(kind, RecordingProgressSink::default());
+                let managed = state
+                    .reserve(operation_id)
+                    .expect("candidate estimate reservation")
+                    .promote(kind, &progress)
+                    .await
+                    .expect("candidate estimate promotion");
+                assert_eq!(state.estimate.available_permits(), 0);
+                assert_eq!(state.decode.available_permits(), 1);
+                assert_eq!(state.output.available_permits(), 1);
+                drop(managed);
+                assert_eq!(state.estimate.available_permits(), 1);
+                assert_eq!(state.decode.available_permits(), 2);
+                assert_eq!(state.output.available_permits(), 1);
+            }
+        });
+    }
+
+    #[test]
     fn tauri_builder_and_command_scope_are_statically_wired() {
         let source = include_str!("lib.rs");
         assert!(source.contains(".manage(PipelineState::new())"));
@@ -1416,6 +1476,14 @@ mod tests {
             (
                 "run_optimizer_search",
                 "MediaOperationKind::OptimizerSearch",
+            ),
+            (
+                "estimate_optimizer_candidates",
+                "MediaOperationKind::OptimizerEstimate",
+            ),
+            (
+                "probe_optimizer_candidate_size",
+                "MediaOperationKind::OptimizerProbe",
             ),
             ("extract_frame_preview", "MediaOperationKind::Preview"),
             ("extract_frame_previews", "MediaOperationKind::Preview"),
@@ -2231,6 +2299,24 @@ mod tests {
                 ],
             ),
             (
+                MediaOperationKind::OptimizerEstimate,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Decoding,
+                    ProgressStage::Estimating,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
+                MediaOperationKind::OptimizerProbe,
+                &[
+                    ProgressStage::Queued,
+                    ProgressStage::Decoding,
+                    ProgressStage::Encoding,
+                    ProgressStage::Finalizing,
+                ],
+            ),
+            (
                 MediaOperationKind::BuildPlan,
                 &[
                     ProgressStage::Queued,
@@ -2350,6 +2436,16 @@ mod tests {
                 MediaOperationKind::OptimizerSearch,
                 &[ProgressStage::Queued, ProgressStage::Estimating],
                 ProgressStage::Inspecting,
+            ),
+            (
+                MediaOperationKind::OptimizerEstimate,
+                &[ProgressStage::Queued, ProgressStage::Decoding],
+                ProgressStage::Encoding,
+            ),
+            (
+                MediaOperationKind::OptimizerProbe,
+                &[ProgressStage::Queued, ProgressStage::Decoding],
+                ProgressStage::Estimating,
             ),
             (
                 MediaOperationKind::Preview,

@@ -1,5 +1,7 @@
 import type { Locale } from "../locales/messages";
 import type {
+  CandidateSizeProbeRequest,
+  ExactCandidateSizeEstimate,
   MediaInspection,
   MediaInspectionFallbackReasonCode,
   MediaOperationErrorCode,
@@ -15,6 +17,7 @@ import type {
   OptimizerPlanResponse,
   OptimizerSearchRequest,
   OptimizerSearchResponse,
+  OptimizerSizeEstimateRequest,
   SearchAttemptResult,
   StaticImageConversionRequest,
   StaticImageConversionResult,
@@ -487,6 +490,14 @@ export type AppRuntime = {
     request: StaticSizeEstimateRequest,
     options: MediaOperationOptions,
   ) => Promise<OutputSizeEstimate>;
+  estimateOptimizerCandidates: (
+    request: OptimizerSizeEstimateRequest,
+    options: MediaOperationOptions,
+  ) => Promise<OutputSizeEstimate[]>;
+  probeOptimizerCandidateSize: (
+    request: CandidateSizeProbeRequest,
+    options: MediaOperationOptions,
+  ) => Promise<ExactCandidateSizeEstimate>;
   extractFramePreview: (
     request: FramePreviewRequest,
     options: MediaOperationOptions,
@@ -850,6 +861,32 @@ export function invokeDesktopStaticSizeEstimate(
   );
 }
 
+export function invokeDesktopEstimateOptimizerCandidates(
+  request: OptimizerSizeEstimateRequest,
+  options: MediaOperationOptions,
+  bridge?: DesktopMediaOperationBridge,
+) {
+  return invokeDesktopMediaOperation<OutputSizeEstimate[]>(
+    "estimate_optimizer_candidates",
+    { request },
+    options,
+    bridge,
+  );
+}
+
+export function invokeDesktopProbeOptimizerCandidateSize(
+  request: CandidateSizeProbeRequest,
+  options: MediaOperationOptions,
+  bridge?: DesktopMediaOperationBridge,
+) {
+  return invokeDesktopMediaOperation<ExactCandidateSizeEstimate>(
+    "probe_optimizer_candidate_size",
+    { request },
+    options,
+    bridge,
+  );
+}
+
 async function loadTauriDialog() {
   return import("@tauri-apps/plugin-dialog");
 }
@@ -979,6 +1016,12 @@ const tauriRuntime: AppRuntime = {
   async estimateStaticOutputSize(request, options) {
     return invokeDesktopStaticSizeEstimate(request, options);
   },
+  async estimateOptimizerCandidates(request, options) {
+    return invokeDesktopEstimateOptimizerCandidates(request, options);
+  },
+  async probeOptimizerCandidateSize(request, options) {
+    return invokeDesktopProbeOptimizerCandidateSize(request, options);
+  },
   async extractFramePreview(request, options) {
     const result = await invokeDesktopMediaOperation<
       LegacyMediaResponse<FramePreviewResult>
@@ -1103,6 +1146,12 @@ const webRuntime: AppRuntime = {
     throw new Error(DESKTOP_ONLY_ERROR);
   },
   async estimateStaticOutputSize(_request, _options) {
+    throw new Error(DESKTOP_ONLY_ERROR);
+  },
+  async estimateOptimizerCandidates(_request, _options) {
+    throw new Error(DESKTOP_ONLY_ERROR);
+  },
+  async probeOptimizerCandidateSize(_request, _options) {
     throw new Error(DESKTOP_ONLY_ERROR);
   },
   async extractFramePreview(_request, _options) {

@@ -2,12 +2,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import mediaOperationCodes from "../types/media-operation-error-codes.json";
 import type {
+  CandidateSizeProbeRequest,
+  ExactCandidateSizeEstimate,
   MediaOperationErrorCode,
   MediaOperationProgressMessageCode,
   MediaOperationReasonCode,
   OperationProgress,
   OutputSizeEstimate,
+  OptimizerCandidatePreview,
   OptimizerPlanRequest,
+  OptimizerSizeEstimateRequest,
   StaticSizeEstimateRequest,
 } from "../types/workflow";
 import {
@@ -19,7 +23,9 @@ import {
 import {
   buildWebFileSourceRevision,
   getAppRuntime,
+  invokeDesktopEstimateOptimizerCandidates,
   invokeDesktopMediaOperation,
+  invokeDesktopProbeOptimizerCandidateSize,
   invokeDesktopStaticSizeEstimate,
   normalizeLegacyMediaError,
   normalizeLegacyMediaResponse,
@@ -744,6 +750,21 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function optimizerPlanRequest(): OptimizerPlanRequest {
+  return {
+    locale: "en",
+    sourceDurationSeconds: 2,
+    inputWidth: 320,
+    inputHeight: 320,
+    avgFps: 12,
+    presetStrategy: "auto",
+    optimizerGoal: "balanced",
+    qualityFrameDropInterval: 1,
+    searchDepth: "standard",
+    cropRegion: null,
+  };
+}
+
 describe("operation progress localization", () => {
   it("keeps the six closed progress codes exhaustive and localized", () => {
     expect(PROGRESS_CODES_ARE_COMPLETE).toBe(true);
@@ -767,6 +788,23 @@ describe("desktop media operation adapter", () => {
       "exact-candidate:probe",
       "range:sampled",
     ]);
+  });
+
+  it("keeps the backend relative-size ordering hint on candidate previews", () => {
+    const candidate = {
+      id: "candidate-balanced",
+      rank: 1,
+      durationSeconds: 2,
+      fps: 12,
+      contentScale: 0.8,
+      preset: "default",
+      score: 0.91,
+      relativeSizeFactor: 0.64,
+      sourceSimilarityScore: 0.95,
+      summary: "Balanced candidate",
+    } satisfies OptimizerCandidatePreview;
+
+    expect(candidate.relativeSizeFactor).toBe(0.64);
   });
 
   it("sends the static estimate request unchanged through the managed command envelope", async () => {
@@ -836,6 +874,183 @@ describe("desktop media operation adapter", () => {
         },
       ),
     ).rejects.toBe(rejection);
+  });
+
+  it("sends candidate estimate requests unchanged through the direct managed envelope", async () => {
+    const request = {
+      ...optimizerPlanRequest(),
+      inputPath: "C:/media/sticker.gif",
+      sourceRevision: "source-revision-2",
+      sampleSeed: "0123456789abcdef",
+      candidateIds: ["candidate-balanced", "candidate-small"],
+    } satisfies OptimizerSizeEstimateRequest;
+    const estimates = [
+      {
+        kind: "range",
+        basis: "sampled",
+        lowerBytes: 220_000,
+        predictedBytes: 260_000,
+        upperBytes: 310_000,
+        confidence: "high",
+        candidateId: "candidate-balanced",
+        limitBytes: 512 * 1_024,
+        measuredContributionCount: 12,
+        outputFrameCount: 150,
+      },
+    ] satisfies OutputSizeEstimate[];
+    const channel = { serialized: "__TAURI_CHANNEL__" };
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+
+    await expect(
+      invokeDesktopEstimateOptimizerCandidates(
+        request,
+        { operationId: "operation-candidate-estimates" },
+        {
+          createChannel: () => channel,
+          invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+            calls.push({ command, args });
+            return estimates as unknown as T;
+          },
+        },
+      ),
+    ).resolves.toBe(estimates);
+
+    expect(calls).toEqual([
+      {
+        command: "estimate_optimizer_candidates",
+        args: {
+          request,
+          operationId: "operation-candidate-estimates",
+          onProgress: channel,
+        },
+      },
+    ]);
+    expect(request).not.toHaveProperty("operationId");
+  });
+
+  it("sends an exact candidate probe through the direct managed envelope", async () => {
+    const request = {
+      ...optimizerPlanRequest(),
+      inputPath: "C:/media/sticker.gif",
+      sourceRevision: "source-revision-3",
+      candidateId: "candidate-balanced",
+    } satisfies CandidateSizeProbeRequest;
+    const estimate = {
+      kind: "exact-candidate",
+      basis: "probe",
+      bytes: 271_828,
+      candidateId: "candidate-balanced",
+      limitBytes: 512 * 1_024,
+      outputFrameCount: 150,
+    } satisfies ExactCandidateSizeEstimate;
+    const channel = { serialized: "__TAURI_CHANNEL__" };
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+
+    await expect(
+      invokeDesktopProbeOptimizerCandidateSize(
+        request,
+        { operationId: "operation-candidate-probe" },
+        {
+          createChannel: () => channel,
+          invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+            calls.push({ command, args });
+            return estimate as unknown as T;
+          },
+        },
+      ),
+    ).resolves.toBe(estimate);
+
+    expect(calls).toEqual([
+      {
+        command: "probe_optimizer_candidate_size",
+        args: {
+          request,
+          operationId: "operation-candidate-probe",
+          onProgress: channel,
+        },
+      },
+    ]);
+    expect(request).not.toHaveProperty("operationId");
+  });
+
+  it("preserves candidate estimate and probe backend rejections unchanged", async () => {
+    const rejection = {
+      errorCode: "invalid-request",
+      reasonCode: null,
+      errorMessage: "Candidate request no longer matches the current plan.",
+    };
+    const bridge = {
+      createChannel: () => ({}),
+      invoke: () => Promise.reject(rejection),
+    };
+
+    await expect(
+      invokeDesktopEstimateOptimizerCandidates(
+        {
+          ...optimizerPlanRequest(),
+          inputPath: "C:/media/sticker.gif",
+          sourceRevision: "source-revision-4",
+          sampleSeed: "fedcba9876543210",
+          candidateIds: ["missing-candidate"],
+        },
+        { operationId: "operation-candidate-estimates-rejected" },
+        bridge,
+      ),
+    ).rejects.toBe(rejection);
+    await expect(
+      invokeDesktopProbeOptimizerCandidateSize(
+        {
+          ...optimizerPlanRequest(),
+          inputPath: "C:/media/sticker.gif",
+          sourceRevision: "source-revision-4",
+          candidateId: "missing-candidate",
+        },
+        { operationId: "operation-candidate-probe-rejected" },
+        bridge,
+      ),
+    ).rejects.toBe(rejection);
+  });
+
+  it("reuses the managed AbortSignal cancellation bridge for candidate estimates", async () => {
+    const controller = new AbortController();
+    const estimates = deferred<OutputSizeEstimate[]>();
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const operation = invokeDesktopEstimateOptimizerCandidates(
+      {
+        ...optimizerPlanRequest(),
+        inputPath: "C:/media/sticker.gif",
+        sourceRevision: "source-revision-5",
+        sampleSeed: "0011223344556677",
+        candidateIds: ["candidate-balanced"],
+      },
+      {
+        operationId: "operation-candidate-estimates-aborted",
+        signal: controller.signal,
+      },
+      {
+        createChannel: () => ({}),
+        invoke: <T>(command: string, args?: Record<string, unknown>) => {
+          calls.push({ command, args });
+          return command === "cancel_media_operation"
+            ? Promise.resolve(true as unknown as T)
+            : (estimates.promise as unknown as Promise<T>);
+        },
+      },
+    );
+
+    controller.abort();
+    await Promise.resolve();
+    estimates.resolve([]);
+    await operation;
+
+    expect(
+      calls.filter(({ command }) => command === "cancel_media_operation"),
+    ).toEqual([
+      {
+        command: "cancel_media_operation",
+        args: { operationId: "operation-candidate-estimates-aborted" },
+      },
+    ]);
   });
 
   it("keeps the DTO unchanged and adds operationId plus the Channel at top level", async () => {
@@ -1274,6 +1489,12 @@ describe("web media operation adapter contract", () => {
     ).rejects.toThrow("available only in the desktop app");
     await expect(
       runtime.estimateStaticOutputSize({} as never, options),
+    ).rejects.toThrow("available only in the desktop app");
+    await expect(
+      runtime.estimateOptimizerCandidates({} as never, options),
+    ).rejects.toThrow("available only in the desktop app");
+    await expect(
+      runtime.probeOptimizerCandidateSize({} as never, options),
     ).rejects.toThrow("available only in the desktop app");
     await expect(
       runtime.extractFramePreview({} as never, options),

@@ -151,6 +151,12 @@ export type OptimizerSizeEstimateRequest = OptimizerPlanRequest & {
   candidateIds: string[];
 };
 
+export type CandidateSizeProbeRequest = OptimizerPlanRequest & {
+  inputPath: string;
+  sourceRevision: string;
+  candidateId: string;
+};
+
 export type StaticImageConversionRequest = {
   inputPath: string;
   sourceRevision: string;
@@ -262,6 +268,7 @@ export type OptimizerCandidatePreview = {
   contentScale: number;
   preset: string;
   score: number;
+  relativeSizeFactor: number;
   sourceSimilarityScore: number;
   summary: string;
 };
