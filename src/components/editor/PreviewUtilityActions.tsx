@@ -1,6 +1,13 @@
+import type { ReactNode } from "react";
+
 import type { MessagesForLocale } from "../../locales/messages";
+import type { OperationProgress } from "../../types/workflow";
 import { ExpandIcon } from "../AppIcons";
 import type { EditorDockPanelMode } from "./EditorOverlayPanel";
+import {
+  OperationProgressIndicator,
+  operationProgressMessage,
+} from "./OutputSizeEstimateCard";
 
 type PreviewUtilityActionsProps = {
   activeDockPanel: EditorDockPanelMode | null;
@@ -13,6 +20,10 @@ type PreviewUtilityActionsProps = {
   timelineFrameCount: number;
   supportsDesktopProcessing: boolean;
   hasSearchResult: boolean;
+  estimateCard: ReactNode;
+  operationProgress: OperationProgress | null;
+  operationCancelled: boolean;
+  fallbackWarning: string | null;
   advancedSettingsPanelId: string;
   previewPanelId: string;
   resultsPanelId: string;
@@ -35,6 +46,10 @@ export function PreviewUtilityActions({
   timelineFrameCount,
   supportsDesktopProcessing,
   hasSearchResult,
+  estimateCard,
+  operationProgress,
+  operationCancelled,
+  fallbackWarning,
   advancedSettingsPanelId,
   previewPanelId,
   resultsPanelId,
@@ -60,21 +75,49 @@ export function PreviewUtilityActions({
   if (isStaticImage) {
     return (
       <div className="previewUtilityArea previewUtilityAreaStatic">
-        <button
-          className="primaryAction previewUtilityPrimaryAction"
-          type="button"
-          disabled={!canConvertToPng || conversionLoading}
-          title={staticImageDisabledReason}
-          aria-label={
-            staticImageDisabledReason
-              ? `${copy.convertToPng}. ${staticImageDisabledReason}`
-              : copy.convertToPng
-          }
-          onClick={onConvertToPng}
-        >
-          <span>{conversionLoading ? copy.convertingToPng : copy.convertToPng}</span>
-          <ExpandIcon size={18} className="ctaIcon gapIcon" />
-        </button>
+        <div className="previewUtilityPrimaryStack">
+          {fallbackWarning ? (
+            <section className="noticeCard outputEstimateNotice" role="status">
+              <p>{fallbackWarning}</p>
+            </section>
+          ) : null}
+          {conversionLoading ? (
+            <OperationProgressIndicator
+              label={copy.convertingToPng}
+              message={
+                operationProgress
+                  ? operationProgressMessage(copy, operationProgress)
+                  : copy.mediaOperationQueued
+              }
+              progress={operationProgress}
+            />
+          ) : operationCancelled ? (
+            <p
+              className="summaryText operationCancelledMessage"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {copy.operationCancelled}
+            </p>
+          ) : null}
+          {estimateCard}
+          <button
+            className="primaryAction previewUtilityPrimaryAction"
+            type="button"
+            disabled={!canConvertToPng || conversionLoading}
+            title={staticImageDisabledReason}
+            aria-label={
+              staticImageDisabledReason
+                ? `${copy.convertToPng}. ${staticImageDisabledReason}`
+                : copy.convertToPng
+            }
+            onClick={onConvertToPng}
+          >
+            <span>{conversionLoading ? copy.convertingToPng : copy.convertToPng}</span>
+            <ExpandIcon size={18} className="ctaIcon gapIcon" />
+          </button>
+        </div>
       </div>
     );
   }
@@ -124,26 +167,54 @@ export function PreviewUtilityActions({
         ) : null}
       </div>
 
-      <button
-        className="primaryAction previewUtilityPrimaryAction"
-        type="button"
-        disabled={
-          !searchLoading &&
-          (!supportsDesktopProcessing || timelineFrameCount === 0)
-        }
-        title={searchLoading ? undefined : optimizerDisabledReason}
-        aria-label={
-          searchLoading
-            ? copy.cancelOptimizer
-            : optimizerDisabledReason
-            ? `${copy.runOptimizer}. ${optimizerDisabledReason}`
-            : copy.runOptimizer
-        }
-        onClick={searchLoading ? onCancelOptimizer : onRunOptimizer}
-      >
-        <span>{searchLoading ? copy.cancelOptimizer : copy.runOptimizer}</span>
-        <ExpandIcon size={18} className="ctaIcon gapIcon" />
-      </button>
+      <div className="previewUtilityPrimaryStack">
+        {fallbackWarning ? (
+          <section className="noticeCard outputEstimateNotice" role="status">
+            <p>{fallbackWarning}</p>
+          </section>
+        ) : null}
+        {searchLoading ? (
+          <OperationProgressIndicator
+            label={copy.runningOptimizer}
+            message={
+              operationProgress
+                ? operationProgressMessage(copy, operationProgress)
+                : copy.mediaOperationQueued
+            }
+            progress={operationProgress}
+          />
+        ) : operationCancelled ? (
+          <p
+            className="summaryText operationCancelledMessage"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {copy.operationCancelled}
+          </p>
+        ) : null}
+        {estimateCard}
+        <button
+          className="primaryAction previewUtilityPrimaryAction"
+          type="button"
+          disabled={
+            !searchLoading &&
+            (!supportsDesktopProcessing || timelineFrameCount === 0)
+          }
+          title={searchLoading ? undefined : optimizerDisabledReason}
+          aria-label={
+            searchLoading
+              ? copy.cancelOptimizer
+              : optimizerDisabledReason
+                ? `${copy.runOptimizer}. ${optimizerDisabledReason}`
+                : copy.runOptimizer
+          }
+          onClick={searchLoading ? onCancelOptimizer : onRunOptimizer}
+        >
+          <span>{searchLoading ? copy.cancelOptimizer : copy.runOptimizer}</span>
+          <ExpandIcon size={18} className="ctaIcon gapIcon" />
+        </button>
+      </div>
     </div>
   );
 }

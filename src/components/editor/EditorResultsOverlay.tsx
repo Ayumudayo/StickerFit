@@ -6,6 +6,7 @@ import {
 import type { OptimizerSearchResponse } from "../../types/workflow";
 import {
   formatDuration,
+  formatElapsedTime,
   formatKiB,
   formatSimilarityScore,
   selectionReasonLabel,
@@ -45,10 +46,37 @@ export function EditorResultsOverlay({
   const bestOutputPathLabel = searchResult.bestOutputPath
     ? compactPathLabel(searchResult.bestOutputPath, 72)
     : null;
+  const representativeFailure = searchResult.attempts.find(
+    (attempt) => !attempt.skipped && attempt.errorCode !== null,
+  ) ?? null;
 
   return (
     <section className="editorResultsOverlay" aria-live="polite">
       <p className="summaryText">{searchResult.summary}</p>
+
+      {searchResult.warnings.length > 0 ? (
+        <section className="warningBox">
+          <p className="metaLabel">{copy.warnings}</p>
+          <ul className="warningList">
+            {searchResult.warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {representativeFailure ? (
+        <section className="editorResultsSection resultRepresentativeError" role="alert">
+          <p className="metaLabel">{copy.representativeError}</p>
+          <p className="detailText">
+            {mediaOperationMessage(
+              locale,
+              representativeFailure.errorCode,
+              representativeFailure.reasonCode,
+            )}
+          </p>
+        </section>
+      ) : null}
 
       {selectedAttempt ? (
         <section className="editorResultsSection">
@@ -63,7 +91,7 @@ export function EditorResultsOverlay({
                 <strong>{searchResult.bestWithinLimit ? copy.fits : copy.over}</strong>
               </article>
               <article className="metricPill">
-                <span className="metaLabel">{copy.size}</span>
+                <span className="metaLabel">{copy.actualOutputSize}</span>
                 <strong>{formatKiB(searchResult.bestSizeBytes)}</strong>
               </article>
               <article className="metricPill">
@@ -73,6 +101,10 @@ export function EditorResultsOverlay({
               <article className="metricPill">
                 <span className="metaLabel">{copy.sourceMatch}</span>
                 <strong>{formatSimilarityScore(selectedAttempt.sourceSimilarityScore)}</strong>
+              </article>
+              <article className="metricPill">
+                <span className="metaLabel">{copy.elapsedTime}</span>
+                <strong>{formatElapsedTime(selectedAttempt.elapsedMs, locale)}</strong>
               </article>
             </div>
 
@@ -129,6 +161,10 @@ export function EditorResultsOverlay({
                   <div>
                     <span className="metaLabel">{copy.sourceMatch}</span>
                     <strong>{formatSimilarityScore(attempt.sourceSimilarityScore)}</strong>
+                  </div>
+                  <div>
+                    <span className="metaLabel">{copy.elapsedTime}</span>
+                    <strong>{formatElapsedTime(attempt.elapsedMs, locale)}</strong>
                   </div>
                 </div>
 

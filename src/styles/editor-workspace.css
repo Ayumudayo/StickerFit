@@ -516,6 +516,110 @@
   padding: 24px;
 }
 
+.previewUtilityPrimaryStack {
+  display: grid;
+  gap: 10px;
+  width: min(100%, 440px);
+  margin-left: auto;
+}
+
+.previewUtilityAreaStatic .previewUtilityPrimaryStack {
+  width: min(100%, 520px);
+}
+
+.outputEstimateCard {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid rgba(129, 140, 248, 0.26);
+  border-radius: 14px;
+  background: rgba(30, 32, 43, 0.9);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.18);
+}
+
+.outputEstimateHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.outputEstimateSummary {
+  color: #f4f4f5;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.outputEstimateStateActions,
+.outputEstimateProbe {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+}
+
+.operationProgressBlock {
+  display: grid;
+  gap: 7px;
+}
+
+.operationProgressTrack {
+  position: relative;
+  width: 100%;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.operationProgressFill {
+  display: block;
+  width: var(--operation-progress, 0%);
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #5865f2, #818cf8);
+  transition: width 160ms ease;
+}
+
+.operationProgressTrackIndeterminate .operationProgressFill {
+  width: 34%;
+  animation: operation-progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+.outputEstimateNotice {
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.operationCancelledMessage {
+  margin: 0;
+  color: #a1a1aa;
+}
+
+.estimateSettingsHint {
+  margin: 0;
+  color: #8b8d97;
+}
+
+@keyframes operation-progress-indeterminate {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(310%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .operationProgressFill {
+    transition: none;
+  }
+
+  .operationProgressTrackIndeterminate .operationProgressFill {
+    animation: none;
+    transform: translateX(95%);
+  }
+}
+
 @media (max-width: 940px) {
   .desktopPickerGrid,
   .ctaRow,
@@ -608,6 +712,11 @@
 }
 
 @media (max-width: 760px) {
+
+  .previewUtilityPrimaryStack {
+    width: 100%;
+    margin-left: 0;
+  }
 
   .editorWorkspace,
   .editorWorkspaceStatic {

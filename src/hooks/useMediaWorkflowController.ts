@@ -27,6 +27,7 @@ import {
   buildOptimizerSearchRequest,
   buildStaticImageConversionRequest,
 } from "./mediaWorkflow/mediaRequestBuilders";
+import { normalizeOptimizerStopReason } from "../utils/outputSizeEstimate";
 import {
   isCurrentWorkflowRequest,
   workflowStateFromResult,
@@ -41,7 +42,6 @@ import { useToolHealthReport } from "./mediaWorkflow/useToolHealthReport";
 type UseMediaWorkflowControllerParams = {
   locale: Locale;
   initialLocale: Locale;
-  advancedPreviewCount: number;
   onCommitEditorSession: () => void;
   getCurrentWorkflowFingerprints: () => WorkflowFingerprints;
 };
@@ -52,7 +52,10 @@ type WorkflowRequestContext = {
   fingerprint: string;
 };
 
-type OptimizerBaseRequestContext = Omit<WorkflowRequestContext, "fingerprint"> & {
+export type OptimizerBaseRequestContext = Omit<
+  WorkflowRequestContext,
+  "fingerprint"
+> & {
   inspection: MediaInspection;
   locale: Locale;
   presetStrategy: OptimizerPresetStrategy;
@@ -64,7 +67,7 @@ type OptimizerBaseRequestContext = Omit<WorkflowRequestContext, "fingerprint"> &
 
 type WorkflowFingerprintKind = "planner" | "export";
 
-function buildOptimizerBaseRequest({
+export function buildOptimizerPlanRequest({
   inspection,
   locale,
   presetStrategy,
@@ -95,7 +98,6 @@ function buildOptimizerBaseRequest({
 export function useMediaWorkflowController({
   locale,
   initialLocale,
-  advancedPreviewCount,
   onCommitEditorSession,
   getCurrentWorkflowFingerprints,
 }: UseMediaWorkflowControllerParams) {
@@ -301,7 +303,7 @@ export function useMediaWorkflowController({
           );
         }
 
-        const request = buildOptimizerBaseRequest({
+        const request = buildOptimizerPlanRequest({
           inspection,
           locale,
           presetStrategy: optimizerPresetStrategy,
@@ -336,11 +338,6 @@ export function useMediaWorkflowController({
             );
           },
         });
-        const trimmedResult = {
-          ...result,
-          candidates: result.candidates.slice(0, advancedPreviewCount),
-        };
-
         if (
           !isCurrentOperation(
             "planner",
@@ -352,14 +349,14 @@ export function useMediaWorkflowController({
         }
 
         const nextState = workflowStateFromResult(
-          trimmedResult,
+          result,
           stateRevision,
           fingerprint,
         );
         setPlanState(nextState);
         return nextState.status === "cancelled"
           ? null
-          : { fingerprint, value: trimmedResult };
+          : { fingerprint, value: result };
       } catch (error) {
         if (
           !isCurrentOperation(
@@ -411,7 +408,6 @@ export function useMediaWorkflowController({
       }
     },
     [
-      advancedPreviewCount,
       cropRegion,
       getCurrentWorkflowFingerprints,
       inspection,
@@ -440,7 +436,7 @@ export function useMediaWorkflowController({
       }
 
       const request = buildOptimizerSearchRequest(inspection, {
-        ...buildOptimizerBaseRequest({
+        ...buildOptimizerPlanRequest({
           inspection,
           locale,
           presetStrategy: optimizerPresetStrategy,
@@ -517,15 +513,19 @@ export function useMediaWorkflowController({
           return null;
         }
 
+        const normalizedResult = {
+          ...result,
+          stopReason: normalizeOptimizerStopReason(result.stopReason),
+        };
         const nextState = workflowStateFromResult(
-          result,
+          normalizedResult,
           stateRevision,
           fingerprint,
         );
         setSearchState(nextState);
         return nextState.status === "cancelled"
           ? null
-          : { fingerprint, value: result };
+          : { fingerprint, value: normalizedResult };
       } catch (error) {
         if (
           !isCurrentOperation(

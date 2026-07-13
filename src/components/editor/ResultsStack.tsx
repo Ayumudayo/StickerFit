@@ -5,6 +5,7 @@ import type {
 } from "../../types/workflow";
 import {
   formatDuration,
+  formatElapsedTime,
   formatKiB,
   formatSimilarityScore,
   selectionReasonLabel,
@@ -124,6 +125,26 @@ export function ResultsStack({
           )}
 
           <section className={conversionResult.ok ? "resultCard resultOk resultCardInline" : "resultCard resultError resultCardInline"}>
+            <div className="resultMetaGrid">
+              <article className="metricPill">
+                <span className="metaLabel">{copy.actualOutputSize}</span>
+                <strong>{formatKiB(conversionResult.sizeBytes)}</strong>
+              </article>
+              <article className="metricPill">
+                <span className="metaLabel">{copy.elapsedTime}</span>
+                <strong>{formatElapsedTime(conversionResult.elapsedMs, locale)}</strong>
+              </article>
+            </div>
+            {conversionResult.warnings.length > 0 ? (
+              <div className="warningBox">
+                <p className="metaLabel">{copy.warnings}</p>
+                <ul className="warningList">
+                  {conversionResult.warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             {conversionResult.outputPath ? (
               <div className="outputPathRow">
                 <code className="pathCode" title={conversionResult.outputPath}>

@@ -4,9 +4,13 @@ import {
 	type MessagesForLocale,
 } from "../locales/messages";
 import type {
+	OperationProgress,
+	OutputSizeEstimate,
 	OptimizerPlanResponse,
 	OptimizerSearchResponse,
 } from "../types/workflow";
+import type { VersionedWorkflowState } from "../hooks/mediaWorkflow/workflowFingerprint";
+import type { VersionedProbeState } from "../hooks/outputSizeEstimateCoordinator";
 import {
 	formatDuration,
 	formatSimilarityScore,
@@ -19,12 +23,20 @@ import {
 	stopReasonLabel,
 } from "../utils/formatters";
 import { compactPathLabel } from "../utils/pathLabels";
+import { OutputSizeEstimateCard } from "./editor/OutputSizeEstimateCard";
 
 type AdvancedDetailsPanelProps = {
 	copy: MessagesForLocale;
 	locale: Locale;
 	plan: OptimizerPlanResponse | null;
 	searchResult: OptimizerSearchResponse | null;
+	estimateState: VersionedWorkflowState<OutputSizeEstimate[], OperationProgress>;
+	estimateByCandidateId: ReadonlyMap<string, OutputSizeEstimate>;
+	probeState: VersionedProbeState;
+	desktopAvailable: boolean;
+	onRetryEstimate: () => void;
+	onProbeCandidate: (candidateId: string) => void;
+	onCancelProbe: () => void;
 	variant?: "page" | "dock";
 };
 
@@ -33,6 +45,13 @@ export function AdvancedDetailsPanel({
 	locale,
 	plan,
 	searchResult,
+	estimateState,
+	estimateByCandidateId,
+	probeState,
+	desktopAvailable,
+	onRetryEstimate,
+	onProbeCandidate,
+	onCancelProbe,
 	variant = "page",
 }: AdvancedDetailsPanelProps) {
 	const hasAdvancedContent = Boolean(plan) || Boolean(searchResult);
@@ -89,6 +108,24 @@ export function AdvancedDetailsPanel({
 											FPS
 										</h3>
 										<p>{candidate.summary}</p>
+										<p className="candidateIdLine">
+											<span className="metaLabel">{copy.candidateIdLabel}</span>{" "}
+											<code>{candidate.id}</code>
+										</p>
+										<OutputSizeEstimateCard
+											copy={copy}
+											locale={locale}
+											title={copy.outputSizeEstimate}
+											estimate={estimateByCandidateId.get(candidate.id) ?? null}
+											estimateState={estimateState}
+											candidateId={candidate.id}
+											desktopAvailable={desktopAvailable}
+											probeState={probeState}
+											compact
+											onRetryEstimate={onRetryEstimate}
+											onProbeCandidate={onProbeCandidate}
+											onCancelProbe={onCancelProbe}
+										/>
 										<div className="candidateMetaGrid">
 											<div>
 												<span className="metaLabel">{copy.contentScale}</span>

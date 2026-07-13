@@ -4,11 +4,15 @@ import { EditorResultsOverlay } from "./EditorResultsOverlay";
 import { AdvancedOptimizerSettingsPanel } from "./AdvancedOptimizerSettingsPanel";
 import type { Locale, MessagesForLocale } from "../../locales/messages";
 import type {
+  OperationProgress,
+  OutputSizeEstimate,
   OptimizerGoal,
   OptimizerPlanResponse,
   OptimizerSearchDepth,
   OptimizerSearchResponse,
 } from "../../types/workflow";
+import type { VersionedWorkflowState } from "../../hooks/mediaWorkflow/workflowFingerprint";
+import type { VersionedProbeState } from "../../hooks/outputSizeEstimateCoordinator";
 
 export type EditorDockPanelMode = "preview" | "results" | "settings";
 
@@ -21,6 +25,13 @@ type EditorOverlayPanelProps = {
   resultsPanelId: string;
   plan: OptimizerPlanResponse | null;
   searchResult: OptimizerSearchResponse | null;
+  estimateState: VersionedWorkflowState<OutputSizeEstimate[], OperationProgress>;
+  estimateByCandidateId: ReadonlyMap<string, OutputSizeEstimate>;
+  probeState: VersionedProbeState;
+  desktopAvailable: boolean;
+  onRetryEstimate: () => void;
+  onProbeCandidate: (candidateId: string) => void;
+  onCancelProbe: () => void;
   optimizerGoal: OptimizerGoal;
   qualityFrameDropInterval: number;
   optimizerSearchDepth: OptimizerSearchDepth;
@@ -40,6 +51,13 @@ export function EditorOverlayPanel({
   resultsPanelId,
   plan,
   searchResult,
+  estimateState,
+  estimateByCandidateId,
+  probeState,
+  desktopAvailable,
+  onRetryEstimate,
+  onProbeCandidate,
+  onCancelProbe,
   optimizerGoal,
   qualityFrameDropInterval,
   optimizerSearchDepth,
@@ -114,6 +132,13 @@ export function EditorOverlayPanel({
               locale={locale}
               plan={plan}
               searchResult={null}
+              estimateState={estimateState}
+              estimateByCandidateId={estimateByCandidateId}
+              probeState={probeState}
+              desktopAvailable={desktopAvailable}
+              onRetryEstimate={onRetryEstimate}
+              onProbeCandidate={onProbeCandidate}
+              onCancelProbe={onCancelProbe}
               variant="dock"
             />
           ) : null}

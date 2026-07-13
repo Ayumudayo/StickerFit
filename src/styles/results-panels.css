@@ -7,6 +7,35 @@
   gap: 14px;
 }
 
+.outputEstimateCardCompact {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(9, 9, 11, 0.72);
+  box-shadow: none;
+}
+
+.outputEstimateCardCompact .outputEstimateSummary {
+  font-size: 0.9rem;
+}
+
+.candidateIdLine {
+  min-width: 0;
+  color: #a1a1aa;
+  font-size: 0.78rem;
+}
+
+.candidateIdLine code {
+  overflow-wrap: anywhere;
+  color: #d4d4d8;
+}
+
+.resultRepresentativeError {
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(127, 29, 29, 0.14);
+}
+
 .figmaCandidatesSection {
   display: grid;
   gap: 18px;

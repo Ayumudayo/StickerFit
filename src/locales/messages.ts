@@ -74,6 +74,40 @@ export type MessagesForLocale = {
   mediaOperationEstimating: string;
   mediaOperationEncoding: string;
   mediaOperationFinalizing: string;
+  outputSizeEstimate: string;
+  recommendedCandidateEstimate: string;
+  estimateDesktopOnly: string;
+  estimateWaitingForPlan: string;
+  estimateCalculating: string;
+  estimateRetry: string;
+  estimateExactLabel: string;
+  estimateConfidenceHigh: string;
+  estimateConfidenceMedium: string;
+  estimateConfidenceLow: string;
+  estimateExactSummary: (size: string) => string;
+  estimateRangeSummary: (range: string, confidence: string) => string;
+  estimateWithin: string;
+  estimateOver: string;
+  estimateLikelyWithin: string;
+  estimateNearLimit: string;
+  estimateLikelyOver: string;
+  estimateCompressionBasis: string;
+  checkExactCandidateSize: string;
+  checkingExactCandidateSize: string;
+  cancelExactProbe: string;
+  exactProbeNoOutput: string;
+  estimateCancelled: string;
+  operationCancelled: string;
+  estimateSettingsHint: string;
+  actualOutputSize: string;
+  elapsedTime: string;
+  representativeError: string;
+  candidateIdLabel: string;
+  estimateProgressQueued: string;
+  estimateProgressDecoding: string;
+  estimateProgressEstimating: string;
+  estimateProgressEncoding: string;
+  estimateProgressFinalizing: string;
   nextStep: string;
   nextStepBody: string;
   guidance: string;
@@ -131,11 +165,13 @@ export type MessagesForLocale = {
   selectionReasonNoFitFound: string;
   inspectionFailed: string;
   mediaFoundationFallbackWarning: string;
-  statusFirstFit: string;
+  statusBestRanked: string;
   statusExhausted: string;
   statusNoOutput: string;
   statusPlanInvalid: string;
   statusInvokeFailed: string;
+  statusCancelled: string;
+  statusFailed: string;
   skipped: string;
   fits: string;
   over: string;
@@ -210,6 +246,41 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     mediaOperationEstimating: "Estimating candidates...",
     mediaOperationEncoding: "Encoding output...",
     mediaOperationFinalizing: "Finalizing output...",
+    outputSizeEstimate: "Estimated output size",
+    recommendedCandidateEstimate: "Recommended candidate estimate",
+    estimateDesktopOnly: "Available to calculate in the desktop app.",
+    estimateWaitingForPlan: "Waiting for preview candidates.",
+    estimateCalculating: "Estimating output size...",
+    estimateRetry: "Retry estimate",
+    estimateExactLabel: "Exact",
+    estimateConfidenceHigh: "High confidence",
+    estimateConfidenceMedium: "Medium confidence",
+    estimateConfidenceLow: "Low confidence",
+    estimateExactSummary: (size) => `Estimated size ${size} · Exact`,
+    estimateRangeSummary: (range, confidence) =>
+      `Estimated ${range} · ${confidence}`,
+    estimateWithin: "Within limit",
+    estimateOver: "Over limit",
+    estimateLikelyWithin: "Likely within limit",
+    estimateNearLimit: "Near limit — exact check available",
+    estimateLikelyOver: "Likely over limit",
+    estimateCompressionBasis: "Based on actual compression",
+    checkExactCandidateSize: "Check this candidate's exact size",
+    checkingExactCandidateSize: "Checking exact size...",
+    cancelExactProbe: "Cancel exact size check",
+    exactProbeNoOutput: "This check does not create an output file.",
+    estimateCancelled: "Size estimate cancelled.",
+    operationCancelled: "Operation cancelled.",
+    estimateSettingsHint: "Size estimates update automatically after settings settle.",
+    actualOutputSize: "Actual size",
+    elapsedTime: "Elapsed time",
+    representativeError: "Representative error",
+    candidateIdLabel: "Candidate ID",
+    estimateProgressQueued: "Waiting to calculate size...",
+    estimateProgressDecoding: "Decoding for the size estimate...",
+    estimateProgressEstimating: "Estimating candidate sizes...",
+    estimateProgressEncoding: "Measuring compressed size...",
+    estimateProgressFinalizing: "Finalizing the size result...",
     nextStep: "Next step",
     nextStepBody: "Preview the candidate ladder first, then run the optimizer once the crop and frame selection look right.",
     guidance: "Guidance",
@@ -271,11 +342,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     inspectionFailed: "Inspection failed",
     mediaFoundationFallbackWarning:
       "Windows Media Foundation could not inspect this file, so StickerFit used the bundled FFmpeg decoder.",
-    statusFirstFit: "Stopped at the first result that fit the Discord limit.",
-    statusExhausted: "Checked all ranked candidates.",
+    statusBestRanked: "Selected the best-ranked result within the Discord limit.",
+    statusExhausted: "Checked the full candidate budget.",
     statusNoOutput: "No successful outputs were produced.",
     statusPlanInvalid: "The optimizer plan was invalid.",
     statusInvokeFailed: "The optimizer command failed before search could finish.",
+    statusCancelled: "Optimization cancelled.",
+    statusFailed: "Optimization did not complete.",
     skipped: "Skipped",
     fits: "Fits limit",
     over: "Over limit",
@@ -349,6 +422,41 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     mediaOperationEstimating: "후보를 계산하는 중...",
     mediaOperationEncoding: "출력을 인코딩하는 중...",
     mediaOperationFinalizing: "출력을 마무리하는 중...",
+    outputSizeEstimate: "예상 용량",
+    recommendedCandidateEstimate: "추천 후보 예상",
+    estimateDesktopOnly: "데스크톱 앱에서 계산 가능",
+    estimateWaitingForPlan: "미리보기 후보를 기다리는 중입니다.",
+    estimateCalculating: "예상 용량 계산 중...",
+    estimateRetry: "예상 용량 다시 계산",
+    estimateExactLabel: "정확",
+    estimateConfidenceHigh: "신뢰도 높음",
+    estimateConfidenceMedium: "신뢰도 보통",
+    estimateConfidenceLow: "신뢰도 낮음",
+    estimateExactSummary: (size) => `예상 용량 ${size} · 정확`,
+    estimateRangeSummary: (range, confidence) =>
+      `예상 ${range} · ${confidence}`,
+    estimateWithin: "제한 이내",
+    estimateOver: "제한 초과",
+    estimateLikelyWithin: "제한 이내 가능성 높음",
+    estimateNearLimit: "제한 근처 — 정확히 확인 가능",
+    estimateLikelyOver: "초과 가능성 높음",
+    estimateCompressionBasis: "실제 압축 기준",
+    checkExactCandidateSize: "이 후보의 정확한 용량 확인",
+    checkingExactCandidateSize: "정확한 용량 확인 중...",
+    cancelExactProbe: "정확한 용량 확인 취소",
+    exactProbeNoOutput: "이 확인 작업은 출력 파일을 만들지 않습니다.",
+    estimateCancelled: "용량 계산을 취소했습니다.",
+    operationCancelled: "작업을 취소했습니다.",
+    estimateSettingsHint: "설정 변경이 멈추면 예상 용량이 자동으로 갱신됩니다.",
+    actualOutputSize: "실제 용량",
+    elapsedTime: "소요 시간",
+    representativeError: "대표 오류",
+    candidateIdLabel: "후보 ID",
+    estimateProgressQueued: "용량 계산 시작을 기다리는 중...",
+    estimateProgressDecoding: "용량 계산을 위해 디코딩하는 중...",
+    estimateProgressEstimating: "후보 용량을 계산하는 중...",
+    estimateProgressEncoding: "실제 압축 용량을 측정하는 중...",
+    estimateProgressFinalizing: "용량 계산 결과를 마무리하는 중...",
     nextStep: "다음 단계",
     nextStepBody: "먼저 후보 미리보기를 실행해 정렬된 래더를 확인한 다음, 크롭과 프레임 선택이 괜찮으면 최적화를 실행하세요.",
     guidance: "안내",
@@ -410,11 +518,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     inspectionFailed: "입력 검사 실패",
     mediaFoundationFallbackWarning:
       "Windows Media Foundation에서 이 파일을 검사하지 못해 StickerFit이 번들 FFmpeg 디코더를 사용했습니다.",
-    statusFirstFit: "디스코드 제한을 만족한 첫 결과에서 중단했습니다.",
-    statusExhausted: "정렬된 후보를 끝까지 확인했습니다.",
+    statusBestRanked: "디스코드 제한을 충족한 결과 중 순위가 가장 높은 결과를 선택했습니다.",
+    statusExhausted: "후보 탐색 예산을 모두 확인했습니다.",
     statusNoOutput: "성공적으로 만들어진 출력이 없습니다.",
     statusPlanInvalid: "최적화 계획이 올바르지 않습니다.",
     statusInvokeFailed: "최적화 명령 실행에 실패했습니다.",
+    statusCancelled: "최적화를 취소했습니다.",
+    statusFailed: "최적화를 완료하지 못했습니다.",
     skipped: "건너뜀",
     fits: "제한 충족",
     over: "제한 초과",

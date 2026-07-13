@@ -101,6 +101,7 @@ export function AdvancedOptimizerSettingsPanel({
           </div>
         </label>
       </div>
+      <p className="detailText estimateSettingsHint">{copy.estimateSettingsHint}</p>
     </section>
   );
 }

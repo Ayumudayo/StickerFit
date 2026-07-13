@@ -10,6 +10,7 @@ import {
 import { FolderOpenIcon } from "./components/AppIcons";
 import { DesktopHeader } from "./components/editor/DesktopHeader";
 import { type EditorDockPanelMode } from "./components/editor/EditorOverlayPanel";
+import { OutputSizeEstimateCard } from "./components/editor/OutputSizeEstimateCard";
 import { FrameEditingOverlays } from "./components/editor/FrameEditingOverlays";
 import { EditorWorkspace } from "./components/editor/EditorWorkspace";
 import { PickerGrid } from "./components/editor/PickerGrid";
@@ -29,7 +30,11 @@ import {
   buildEditedTimelineFramesForRequest,
   useEditorWorkflowBridge,
 } from "./hooks/useEditorWorkflowBridge";
-import { useMediaWorkflowController } from "./hooks/useMediaWorkflowController";
+import {
+  buildOptimizerPlanRequest,
+  useMediaWorkflowController,
+} from "./hooks/useMediaWorkflowController";
+import { useOutputSizeEstimate } from "./hooks/useOutputSizeEstimate";
 import {
   buildWorkflowFingerprints,
   currentWorkflowState,
@@ -142,7 +147,6 @@ export default function App() {
   const mediaWorkflow = useMediaWorkflowController({
     locale,
     initialLocale: initialLocaleRef.current,
-    advancedPreviewCount: ADVANCED_PREVIEW_COUNT,
     onCommitEditorSession: () => {
       setEditorSessionKey((current) => current + 1);
     },
@@ -310,8 +314,80 @@ export default function App() {
     conversionState,
     workflowFingerprints.export,
   );
-  const plan =
+  const fullPlan =
     currentPlanState?.status === "ready" ? currentPlanState.value : null;
+  const plan = useMemo(
+    () =>
+      fullPlan
+        ? {
+            ...fullPlan,
+            candidates: fullPlan.candidates.slice(0, ADVANCED_PREVIEW_COUNT),
+          }
+        : null,
+    [fullPlan],
+  );
+  const optimizerPlanRequest = useMemo(
+    () =>
+      inspection?.ok && !inspection.isStaticImage
+        ? buildOptimizerPlanRequest({
+            inspection,
+            locale,
+            presetStrategy: optimizerPresetStrategy,
+            optimizerGoal,
+            qualityFrameDropInterval,
+            searchDepth: optimizerSearchDepth,
+            cropRegion,
+            baseFrameCount: sourceFrames.length,
+            editedTimelineFramesForRequest,
+          })
+        : null,
+    [
+      cropRegion,
+      editedTimelineFramesForRequest,
+      inspection,
+      locale,
+      optimizerGoal,
+      optimizerPresetStrategy,
+      optimizerSearchDepth,
+      qualityFrameDropInterval,
+      sourceFrames.length,
+    ],
+  );
+  const outputSizeEstimate = useOutputSizeEstimate({
+    runtime,
+    inspection,
+    plan: fullPlan,
+    optimizerPlanRequest,
+    encodingFingerprint: workflowFingerprints.encoding,
+    cropRegion,
+    locale,
+  });
+  const currentEstimateState =
+    outputSizeEstimate.state.estimate.fingerprint === workflowFingerprints.encoding
+      ? outputSizeEstimate.state.estimate
+      : {
+          status: "idle" as const,
+          revision: outputSizeEstimate.state.estimate.revision,
+          fingerprint: workflowFingerprints.encoding,
+        };
+  const currentProbeState =
+    outputSizeEstimate.state.probe.fingerprint === workflowFingerprints.encoding
+      ? outputSizeEstimate.state.probe
+      : {
+          status: "idle" as const,
+          revision: outputSizeEstimate.state.probe.revision,
+          fingerprint: workflowFingerprints.encoding,
+        };
+  const recommendedCandidateId =
+    fullPlan?.candidates.find((candidate) => candidate.rank === 1)?.id ??
+    outputSizeEstimate.estimates.find((estimate) => estimate.candidateId !== null)
+      ?.candidateId ??
+    null;
+  const primarySizeEstimate = inspection?.isStaticImage
+    ? outputSizeEstimate.estimates[0] ?? null
+    : recommendedCandidateId
+      ? outputSizeEstimate.estimateByCandidateId.get(recommendedCandidateId) ?? null
+      : null;
   const searchResult =
     currentSearchState?.status === "ready" ? currentSearchState.value : null;
   const conversionResult =
@@ -321,6 +397,14 @@ export default function App() {
   const planLoading = currentPlanState?.status === "loading";
   const searchLoading = currentSearchState?.status === "loading";
   const conversionLoading = currentConversionState?.status === "loading";
+  const primaryOperationState = inspection?.isStaticImage
+    ? currentConversionState
+    : currentSearchState;
+  const primaryOperationProgress =
+    primaryOperationState?.status === "loading"
+      ? primaryOperationState.progress
+      : null;
+  const primaryOperationCancelled = primaryOperationState?.status === "cancelled";
   const latestWorkflowState = latestActiveWorkflowState([
     currentPlanState,
     currentSearchState,
@@ -838,6 +922,30 @@ export default function App() {
           variant: "page" as const,
         }
       : null;
+  const fallbackWarning =
+    inspection?.fallbackReasonCode === "media-foundation-failed"
+      ? copy.mediaFoundationFallbackWarning
+      : null;
+  const primaryEstimateCard = inspection?.ok ? (
+    <OutputSizeEstimateCard
+      copy={copy}
+      locale={locale}
+      title={
+        inspection.isStaticImage
+          ? copy.outputSizeEstimate
+          : copy.recommendedCandidateEstimate
+      }
+      estimate={primarySizeEstimate}
+      estimateState={currentEstimateState}
+      candidateId={inspection.isStaticImage ? null : recommendedCandidateId}
+      desktopAvailable={supportsDesktopProcessing}
+      waitingForPlan={!inspection.isStaticImage && fullPlan === null}
+      probeState={currentProbeState}
+      onRetryEstimate={outputSizeEstimate.retryEstimate}
+      onProbeCandidate={outputSizeEstimate.probeCandidate}
+      onCancelProbe={outputSizeEstimate.cancelProbe}
+    />
+  ) : null;
 
   return (
     <>
@@ -959,6 +1067,13 @@ export default function App() {
                 resultsPanelId: EDITOR_RESULTS_PANEL_ID,
                 plan,
                 searchResult,
+                estimateState: currentEstimateState,
+                estimateByCandidateId: outputSizeEstimate.estimateByCandidateId,
+                probeState: currentProbeState,
+                desktopAvailable: supportsDesktopProcessing,
+                onRetryEstimate: outputSizeEstimate.retryEstimate,
+                onProbeCandidate: outputSizeEstimate.probeCandidate,
+                onCancelProbe: outputSizeEstimate.cancelProbe,
                 optimizerGoal,
                 qualityFrameDropInterval,
                 optimizerSearchDepth,
@@ -1004,6 +1119,10 @@ export default function App() {
                 timelineFrameCount: timelineFrames.length,
                 supportsDesktopProcessing,
                 hasSearchResult: searchResult !== null,
+                estimateCard: primaryEstimateCard,
+                operationProgress: primaryOperationProgress,
+                operationCancelled: primaryOperationCancelled,
+                fallbackWarning,
                 advancedSettingsPanelId: ADVANCED_SETTINGS_PANEL_ID,
                 previewPanelId: EDITOR_PREVIEW_PANEL_ID,
                 resultsPanelId: EDITOR_RESULTS_PANEL_ID,
