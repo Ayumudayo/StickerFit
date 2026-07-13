@@ -11,6 +11,7 @@ import type {
 } from "../types/workflow";
 import type { VersionedWorkflowState } from "../hooks/mediaWorkflow/workflowFingerprint";
 import type { VersionedProbeState } from "../hooks/outputSizeEstimateCoordinator";
+import { useCspDiagnostics } from "../platform/cspDiagnostics";
 import {
 	formatDuration,
 	formatSimilarityScore,
@@ -54,6 +55,7 @@ export function AdvancedDetailsPanel({
 	onCancelProbe,
 	variant = "page",
 }: AdvancedDetailsPanelProps) {
+	const { violationCount } = useCspDiagnostics();
 	const hasAdvancedContent = Boolean(plan) || Boolean(searchResult);
 	const selectedResultCandidateId =
 		searchResult?.winningCandidateId ?? searchResult?.closestCandidateId ?? null;
@@ -63,6 +65,15 @@ export function AdvancedDetailsPanel({
 	return (
 		<section className={panelClassName}>
 			{variant === "page" ? <p className="panelLabel">{copy.advancedDetails}</p> : null}
+			<section
+				className="detailsCard detailsCardWide"
+				aria-live="polite"
+				aria-atomic="true"
+			>
+				<p className="summaryText">
+					{copy.cspViolationCount(violationCount)}
+				</p>
+			</section>
 			{!hasAdvancedContent ? (
 				<section className="detailsCard detailsCardWide">
 					<p className="summaryText">{copy.noPlanYet}</p>

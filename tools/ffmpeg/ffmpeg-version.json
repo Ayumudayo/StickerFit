@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "version": "7.1.3",
+  "releaseKeyFingerprint": "FCF986EA15E6E293A5644F10B4322F04D67658D8",
+  "sourceArchiveSha256": "f0bf043299db9e3caacb435a712fc541fbb07df613c4b893e8b77e67baf3adbe",
+  "expectedExeSha256": "3abac413f2b5f8f653c6de0f37320fb75da3a3cd0f6cb74d864f239d8f5cbcc1",
+  "vendorUpdateRunId": null,
+  "targetTriple": "x86_64-pc-windows-msvc",
+  "release": {
+    "archiveName": "ffmpeg-7.1.3.tar.xz",
+    "archiveUrl": "https://ffmpeg.org/releases/ffmpeg-7.1.3.tar.xz",
+    "signatureUrl": "https://ffmpeg.org/releases/ffmpeg-7.1.3.tar.xz.asc",
+    "archiveSha256": "f0bf043299db9e3caacb435a712fc541fbb07df613c4b893e8b77e67baf3adbe",
+    "archiveBytes": 11032252,
+    "expectedTopLevelDirectory": "ffmpeg-7.1.3",
+    "signingKeyPath": "tools/ffmpeg/ffmpeg-release-signing-key.asc",
+    "signingKeySha256": "397b3becedcd5a98769967ff1ff8501ddc89f8368b8f766e4701377d7dbaabe5",
+    "primaryFingerprint": "FCF986EA15E6E293A5644F10B4322F04D67658D8"
+  },
+  "vendor": {
+    "executablePath": "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe",
+    "provenancePath": "src-tauri/binaries/ffmpeg-provenance.json",
+    "legacyBootstrapAllowedForRoutineVerification": true,
+    "expectedRuntimeDependencies": [
+      "libwinpthread-1.dll"
+    ],
+    "trackedCompanionFiles": [
+      "LICENSE-ffmpeg.txt",
+      "LICENSE-ffmpeg-BtbN.txt",
+      "LICENSE-libwinpthread.txt"
+    ]
+  },
+  "configure": {
+    "baseArguments": [
+      "--disable-autodetect",
+      "--disable-debug",
+      "--disable-doc",
+      "--disable-everything",
+      "--disable-network",
+      "--disable-programs",
+      "--disable-sdl2",
+      "--disable-shared",
+      "--enable-ffmpeg",
+      "--enable-small",
+      "--arch=x86_64",
+      "--target-os=mingw32"
+    ],
+    "newBuildRequiredArguments": [
+      "--enable-static",
+      "--disable-pthreads",
+      "--enable-w32threads",
+      "--pkg-config-flags=--static",
+      "--extra-ldflags=-static",
+      "--extra-ldflags=-static-libgcc",
+      "--extra-ldflags=-Wl,--no-insert-timestamp"
+    ],
+    "capabilities": {
+      "demuxers": [
+        "matroska",
+        "mov"
+      ],
+      "decoders": [
+        "h264",
+        "mjpeg",
+        "mpeg4",
+        "vp8",
+        "vp9"
+      ],
+      "muxers": [
+        "null",
+        "rawvideo"
+      ],
+      "encoders": [
+        "rawvideo"
+      ],
+      "parsers": [
+        "h264",
+        "mjpeg",
+        "mpeg4video",
+        "vp8",
+        "vp9"
+      ],
+      "protocols": [
+        "file",
+        "pipe"
+      ],
+      "filters": [
+        "crop",
+        "scale",
+        "pad",
+        "fps",
+        "format",
+        "setpts",
+        "setsar",
+        "select"
+      ]
+    },
+    "legacyParserAliases": {
+      "mpeg4video": "mpeg4"
+    }
+  }
+}

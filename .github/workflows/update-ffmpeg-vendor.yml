@@ -1,0 +1,363 @@
+name: Protected FFmpeg 8.1.2 Vendor Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      expectedSourceSha256:
+        description: Optional independently verified FFmpeg 8.1.2 source archive SHA-256
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+concurrency:
+  group: ffmpeg-vendor-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Build staged FFmpeg vendor artifact
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'Ayumudayo/StickerFit'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    environment: ffmpeg-vendor-update
+    env:
+      FFMPEG_TARGET_VERSION: "8.1.2"
+      FFMPEG_SOURCE_DATE_EPOCH: "1781654400"
+      STICKERFIT_PROTECTED_FFMPEG_UPDATE: "1"
+    steps:
+      - name: Checkout protected main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove workflow revision is current protected main
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          $mainSha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($mainSha, $env:WORKFLOW_SHA, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Vendor update must run from the current protected main commit."
+          }
+          $workflowAtHead = git rev-parse "$env:WORKFLOW_SHA`:.github/workflows/update-ffmpeg-vendor.yml"
+          $workflowAtMain = git rev-parse "HEAD:.github/workflows/update-ffmpeg-vendor.yml"
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($workflowAtHead, $workflowAtMain, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Vendor update workflow blob is not the protected main blob."
+          }
+      - name: Validate update inputs
+        env:
+          EXPECTED_SOURCE_SHA256: ${{ inputs.expectedSourceSha256 }}
+        run: |
+          if ($env:FFMPEG_TARGET_VERSION -ne "8.1.2" -or $env:FFMPEG_SOURCE_DATE_EPOCH -ne "1781654400") {
+            throw "This protected workflow is bound only to FFmpeg 8.1.2 with SOURCE_DATE_EPOCH=1781654400."
+          }
+          if ($env:EXPECTED_SOURCE_SHA256 -and $env:EXPECTED_SOURCE_SHA256 -notmatch "\A[0-9a-f]{64}\z") {
+            throw "expectedSourceSha256 must be empty or exactly 64 lowercase hexadecimal characters."
+          }
+      - name: Set up fully updated MSYS2 build prerequisites
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          update: true
+          install: >-
+            base-devel
+            binutils
+            diffutils
+            make
+            nasm
+            pkgconf
+            gnupg
+            tar
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+      - name: Resolve and record exact toolchain inputs
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_PATH: .github/workflows/update-ffmpeg-vendor.yml
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_BRANCH: ${{ github.ref_name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          $tools = [ordered]@{
+            STICKERFIT_BASH_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\bash.exe"
+            STICKERFIT_GPG_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\gpg.exe"
+            STICKERFIT_GPGV_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\gpgv.exe"
+            STICKERFIT_TAR_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\tar.exe"
+          }
+          foreach ($entry in $tools.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) { throw "Missing $($entry.Value)." }
+            & $entry.Value --version | Select-Object -First 1
+            if ($LASTEXITCODE -ne 0) { throw "$($entry.Key) version check failed." }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)"
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw "vswhere.exe is unavailable." }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VSWHERE_PATH=$vswhere"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_MSYS2_LOCATION=$env:MSYS2_LOCATION"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SOURCE_DATE_EPOCH=$env:FFMPEG_SOURCE_DATE_EPOCH"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VENDOR_RUN_ID=$env:RUN_ID"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VENDOR_REPOSITORY=$env:REPOSITORY"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VENDOR_WORKFLOW_PATH=$env:WORKFLOW_PATH"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VENDOR_EVENT=$env:EVENT_NAME"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VENDOR_HEAD_BRANCH=$env:HEAD_BRANCH"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VENDOR_HEAD_SHA=$env:HEAD_SHA"
+      - name: Capture checked toolchain versions for provenance
+        run: |
+          function Get-CheckedVersionLine {
+            param(
+              [Parameter(Mandatory = $true)][string]$Command,
+              [Parameter(Mandatory = $true)][string[]]$Arguments
+            )
+            if ($Command.Contains("\") -and -not (Test-Path -LiteralPath $Command -PathType Leaf)) {
+              throw "Required tool is missing: $Command"
+            }
+            $output = & $Command @Arguments 2>&1
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0) { throw "Version command failed with exit code ${exitCode}: $Command $($Arguments -join ' ')" }
+            $line = @($output | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -First 1)
+            if ($line.Count -ne 1) { throw "Version command returned no usable line: $Command" }
+            return [string]$line[0]
+          }
+
+          $versions = [ordered]@{
+            STICKERFIT_VENDOR_PACMAN_VERSION = Get-CheckedVersionLine -Command (Join-Path $env:STICKERFIT_MSYS2_LOCATION "usr\bin\pacman.exe") -Arguments @("-Q", "pacman")
+            STICKERFIT_VENDOR_BASH_VERSION = Get-CheckedVersionLine -Command $env:STICKERFIT_BASH_PATH -Arguments @("--version")
+            STICKERFIT_VENDOR_GCC_VERSION = Get-CheckedVersionLine -Command (Join-Path $env:STICKERFIT_MSYS2_LOCATION "mingw64\bin\gcc.exe") -Arguments @("--version")
+            STICKERFIT_VENDOR_BINUTILS_VERSION = Get-CheckedVersionLine -Command (Join-Path $env:STICKERFIT_MSYS2_LOCATION "mingw64\bin\ld.exe") -Arguments @("--version")
+            STICKERFIT_VENDOR_MAKE_VERSION = Get-CheckedVersionLine -Command (Join-Path $env:STICKERFIT_MSYS2_LOCATION "usr\bin\make.exe") -Arguments @("--version")
+            STICKERFIT_VENDOR_NASM_VERSION = Get-CheckedVersionLine -Command (Join-Path $env:STICKERFIT_MSYS2_LOCATION "usr\bin\nasm.exe") -Arguments @("-v")
+            STICKERFIT_VENDOR_PKGCONF_VERSION = Get-CheckedVersionLine -Command (Join-Path $env:STICKERFIT_MSYS2_LOCATION "mingw64\bin\pkgconf.exe") -Arguments @("--version")
+            STICKERFIT_VENDOR_GPG_VERSION = Get-CheckedVersionLine -Command $env:STICKERFIT_GPG_PATH -Arguments @("--version")
+            STICKERFIT_VENDOR_GPGV_VERSION = Get-CheckedVersionLine -Command $env:STICKERFIT_GPGV_PATH -Arguments @("--version")
+          }
+          foreach ($entry in $versions.GetEnumerator()) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)"
+          }
+      - name: Assert repository starts clean
+        run: |
+          git diff --exit-code -- package-lock.json src-tauri/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw "Lockfiles changed before vendor staging." }
+          $repositoryState = git status --porcelain=v1 --untracked-files=all
+          if ($LASTEXITCODE -ne 0 -or $repositoryState) { throw "Repository is dirty before vendor staging: $repositoryState" }
+      - name: Build verified update into staging only
+        env:
+          EXPECTED_SOURCE_SHA256: ${{ inputs.expectedSourceSha256 }}
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP "ffmpeg-vendor"
+          $parameters = @{
+            UpdateVendorArtifacts = $true
+            TargetVersion = $env:FFMPEG_TARGET_VERSION
+            OutputDirectory = $staging
+            SourceDateEpoch = [long]$env:FFMPEG_SOURCE_DATE_EPOCH
+            BashPath = $env:STICKERFIT_BASH_PATH
+            GpgPath = $env:STICKERFIT_GPG_PATH
+            GpgvPath = $env:STICKERFIT_GPGV_PATH
+            TarPath = $env:STICKERFIT_TAR_PATH
+          }
+          if ($env:EXPECTED_SOURCE_SHA256) { $parameters.ExpectedSourceSha256 = $env:EXPECTED_SOURCE_SHA256 }
+          & .\tools\ffmpeg\build-minimal-ffmpeg.ps1 @parameters
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VENDOR_STAGING=$staging"
+      - name: Validate staged artifact contract
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          $required = @(
+            "ffmpeg-x86_64-pc-windows-msvc.exe",
+            "ffmpeg-version.json",
+            "ffmpeg-provenance.json",
+            "LICENSE-ffmpeg.txt",
+            "tauri.conf.json",
+            "update-fragment.json",
+            "SHA256SUMS.txt"
+          )
+          $stagedChildren = @(Get-ChildItem -LiteralPath $env:STICKERFIT_VENDOR_STAGING -Force)
+          if (@($stagedChildren | Where-Object {
+                $_.PSIsContainer -or
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+              }).Count -ne 0) {
+            throw "Staging must contain only regular top-level files."
+          }
+          $actual = @($stagedChildren | Select-Object -ExpandProperty Name | Sort-Object)
+          $expected = @($required | Sort-Object)
+          if ($actual.Count -ne $expected.Count -or
+              $null -ne (Compare-Object -CaseSensitive -ReferenceObject $expected -DifferenceObject $actual)) {
+            throw "Staging contains missing, unexpected, or case-variant files."
+          }
+
+          $checksumEntries = [System.Collections.Generic.Dictionary[string, string]]::new(
+            [System.StringComparer]::Ordinal
+          )
+          foreach ($line in @(Get-Content -LiteralPath (Join-Path $env:STICKERFIT_VENDOR_STAGING "SHA256SUMS.txt"))) {
+            if ($line -notmatch "\A([0-9a-f]{64})  ([A-Za-z0-9._-]+)\z" -or $checksumEntries.ContainsKey($Matches[2])) {
+              throw "SHA256SUMS.txt contains an invalid or duplicate entry."
+            }
+            $checksumEntries[$Matches[2]] = $Matches[1]
+          }
+          $hashedFiles = @($required | Where-Object { $_ -ne "SHA256SUMS.txt" })
+          if ($checksumEntries.Count -ne $hashedFiles.Count) { throw "SHA256SUMS.txt has an unexpected entry count." }
+          foreach ($name in $hashedFiles) {
+            $path = Join-Path $env:STICKERFIT_VENDOR_STAGING $name
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            if (-not $checksumEntries.ContainsKey($name) -or
+                -not [string]::Equals([string]$checksumEntries[$name], $hash, [System.StringComparison]::Ordinal)) {
+              throw "SHA256SUMS.txt does not match '$name'."
+            }
+          }
+
+          $currentManifest = Get-Content -Raw -LiteralPath "tools/ffmpeg/ffmpeg-version.json" | ConvertFrom-Json
+          $manifest = Get-Content -Raw -LiteralPath (Join-Path $env:STICKERFIT_VENDOR_STAGING "ffmpeg-version.json") | ConvertFrom-Json
+          $provenance = Get-Content -Raw -LiteralPath (Join-Path $env:STICKERFIT_VENDOR_STAGING "ffmpeg-provenance.json") | ConvertFrom-Json
+          $tauriConfigPath = Join-Path $env:STICKERFIT_VENDOR_STAGING "tauri.conf.json"
+          $tauriConfig = Get-Content -Raw -LiteralPath $tauriConfigPath | ConvertFrom-Json
+          $fragment = Get-Content -Raw -LiteralPath (Join-Path $env:STICKERFIT_VENDOR_STAGING "update-fragment.json") | ConvertFrom-Json
+          $expectedReplacementMap = [ordered]@{
+            "ffmpeg-x86_64-pc-windows-msvc.exe" = "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
+            "LICENSE-ffmpeg.txt" = "src-tauri/binaries/LICENSE-ffmpeg.txt"
+            "ffmpeg-provenance.json" = "src-tauri/binaries/ffmpeg-provenance.json"
+            "ffmpeg-version.json" = "tools/ffmpeg/ffmpeg-version.json"
+            "tauri.conf.json" = "src-tauri/tauri.conf.json"
+          }
+          if ($fragment.replacements -isnot [System.Array]) { throw "Staged update fragment replacements must be a JSON array." }
+          $replacements = @($fragment.replacements)
+          if ($replacements.Count -ne $expectedReplacementMap.Count) { throw "Staged update fragment has an unexpected replacement count." }
+          $seenReplacements = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+          foreach ($replacement in $replacements) {
+            if ($replacement.source -isnot [string] -or $replacement.destination -isnot [string]) {
+              throw "Staged update fragment replacement source/destination must be strings."
+            }
+            $source = [string]$replacement.source
+            $property = $expectedReplacementMap.GetEnumerator() | Where-Object {
+              [string]::Equals([string]$_.Key, $source, [System.StringComparison]::Ordinal)
+            }
+            $sourcePath = Join-Path $env:STICKERFIT_VENDOR_STAGING $source
+            if (-not $seenReplacements.Add($source) -or @($property).Count -ne 1 -or
+                -not [string]::Equals([string]$replacement.destination, [string]$property.Value, [System.StringComparison]::Ordinal) -or
+                $replacement.sha256 -isnot [string] -or
+                ($replacement.bytes -isnot [int] -and $replacement.bytes -isnot [long]) -or
+                -not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or
+                -not [string]::Equals([string]$replacement.sha256, (Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePath).Hash.ToLowerInvariant(), [System.StringComparison]::Ordinal) -or
+                [long]$replacement.bytes -ne (Get-Item -LiteralPath $sourcePath).Length) {
+              throw "Staged update fragment replacement identity is invalid for '$source'."
+            }
+          }
+          $expectedDeletions = @(
+            "src-tauri/binaries/LICENSE-ffmpeg-BtbN.txt",
+            "src-tauri/binaries/LICENSE-libwinpthread.txt",
+            "src-tauri/binaries/libwinpthread-1.dll"
+          ) | Sort-Object
+          if ($fragment.deletions -isnot [System.Array] -or
+              @($fragment.deletions | Where-Object { $_ -isnot [string] }).Count -ne 0) {
+            throw "Staged update fragment deletions must be a JSON string array."
+          }
+          $actualDeletions = @($fragment.deletions | Sort-Object)
+          if ($actualDeletions.Count -ne $expectedDeletions.Count -or
+              $null -ne (Compare-Object -CaseSensitive -ReferenceObject $expectedDeletions -DifferenceObject $actualDeletions)) {
+            throw "Staged update fragment has an unexpected deletion set."
+          }
+          $expectedWorkflowRef = "Ayumudayo/StickerFit/.github/workflows/update-ffmpeg-vendor.yml@refs/heads/main"
+          if (-not [string]::Equals($env:GITHUB_WORKFLOW_REF, $expectedWorkflowRef, [System.StringComparison]::Ordinal)) {
+            throw "Vendor update is not running from the canonical protected workflow reference."
+          }
+          if ($provenance.legacyBootstrap -isnot [bool] -or
+              $provenance.legacyBootstrap -ne $false -or
+              $manifest.vendor.legacyBootstrapAllowedForRoutineVerification -isnot [bool] -or
+              $manifest.vendor.legacyBootstrapAllowedForRoutineVerification -ne $false -or
+              [string]$manifest.version -ne $env:FFMPEG_TARGET_VERSION) {
+            throw "Staged manifest is not the approved FFmpeg 8.1.2 non-legacy vendor update."
+          }
+          if ([string]$manifest.vendorUpdateRunId -ne $env:RUN_ID -or [string]$provenance.vendorUpdateRunId -ne $env:RUN_ID) { throw "Staged provenance has the wrong workflow run ID." }
+          if (($fragment.schemaVersion -isnot [int] -and $fragment.schemaVersion -isnot [long]) -or
+              [long]$fragment.schemaVersion -ne 1 -or
+              $fragment.applyOnlyAfterProtectedReview -isnot [bool] -or
+              $fragment.applyOnlyAfterProtectedReview -ne $true -or
+              ($fragment.sourceWorkflow.runId -isnot [int] -and $fragment.sourceWorkflow.runId -isnot [long]) -or
+              $fragment.sourceWorkflow.sourceCommit -isnot [string] -or
+              $fragment.sourceWorkflow.workflowRef -isnot [string] -or
+              [string]$fragment.sourceWorkflow.runId -ne $env:RUN_ID -or
+              -not [string]::Equals([string]$fragment.sourceWorkflow.sourceCommit, $env:STICKERFIT_VENDOR_HEAD_SHA, [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals([string]$fragment.sourceWorkflow.workflowRef, $expectedWorkflowRef, [System.StringComparison]::Ordinal)) {
+            throw "Staged update fragment does not identify this protected workflow run."
+          }
+          if ($fragment.preconditions.currentVersion -isnot [string] -or
+              $fragment.preconditions.currentSourceSha256 -isnot [string] -or
+              $fragment.preconditions.replacementVersion -isnot [string] -or
+              $fragment.preconditions.replacementSourceSha256 -isnot [string] -or
+              -not [string]::Equals([string]$fragment.preconditions.currentVersion, [string]$currentManifest.version, [System.StringComparison]::Ordinal) -or
+              -not [string]::Equals([string]$fragment.preconditions.currentSourceSha256, [string]$currentManifest.sourceArchiveSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Staged update fragment does not target the checked-out vendor state."
+          }
+          if (-not [string]::Equals([string]$manifest.version, [string]$fragment.preconditions.replacementVersion, [System.StringComparison]::Ordinal) -or
+              -not [string]::Equals([string]$manifest.sourceArchiveSha256, [string]$provenance.sourceArchiveSha256, [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals([string]$manifest.sourceArchiveSha256, [string]$fragment.preconditions.replacementSourceSha256, [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals([string]$manifest.releaseKeyFingerprint, [string]$provenance.signingPrimaryFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Staged source identity fields do not match."
+          }
+          $exe = Join-Path $env:STICKERFIT_VENDOR_STAGING "ffmpeg-x86_64-pc-windows-msvc.exe"
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          if (-not [string]::Equals($exeHash, [string]$manifest.expectedExeSha256, [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals($exeHash, [string]$provenance.exeSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Staged executable hash does not match manifest/provenance."
+          }
+          if ($null -eq $provenance.toolchainVersions -or [string]$provenance.sourceDateEpoch -ne $env:FFMPEG_SOURCE_DATE_EPOCH) {
+            throw "Staged provenance is incomplete or is not bound to SOURCE_DATE_EPOCH=1781654400."
+          }
+
+          $expectedResources = [ordered]@{
+            "binaries/LICENSE-ffmpeg.txt" = "LICENSE-ffmpeg.txt"
+            "binaries/ffmpeg-provenance.json" = "ffmpeg-provenance.json"
+          }
+          $resourceProperties = @($tauriConfig.bundle.resources.PSObject.Properties | Where-Object {
+              $_.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty
+            })
+          if ($resourceProperties.Count -ne $expectedResources.Count) { throw "Staged Tauri resource map is not the exact non-legacy map." }
+          foreach ($entry in $expectedResources.GetEnumerator()) {
+            $matchingProperties = @($resourceProperties | Where-Object {
+                [string]::Equals([string]$_.Name, [string]$entry.Key, [System.StringComparison]::Ordinal)
+              })
+            if ($matchingProperties.Count -ne 1 -or
+                $matchingProperties[0].Value -isnot [string] -or
+                -not [string]::Equals([string]$matchingProperties[0].Value, [string]$entry.Value, [System.StringComparison]::Ordinal)) {
+              throw "Staged Tauri resource map is missing '$($entry.Key)'."
+            }
+          }
+          if ($tauriConfig.bundle.externalBin -isnot [System.Array]) {
+            throw "Staged Tauri externalBin must be an exact JSON array."
+          }
+          $externalBins = @($tauriConfig.bundle.externalBin)
+          if ($externalBins.Count -ne 1 -or
+              $externalBins[0] -isnot [string] -or
+              -not [string]::Equals([string]$externalBins[0], "binaries/ffmpeg", [System.StringComparison]::Ordinal)) {
+            throw "Staged Tauri externalBin contract changed."
+          }
+          $tauriReplacement = @($fragment.replacements | Where-Object {
+              [string]::Equals([string]$_.source, "tauri.conf.json", [System.StringComparison]::Ordinal)
+            })
+          $tauriConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $tauriConfigPath).Hash.ToLowerInvariant()
+          if ($tauriReplacement.Count -ne 1 -or
+              -not [string]::Equals([string]$tauriReplacement[0].destination, "src-tauri/tauri.conf.json", [System.StringComparison]::Ordinal) -or
+              -not [string]::Equals([string]$tauriReplacement[0].sha256, $tauriConfigSha256, [System.StringComparison]::Ordinal) -or
+              [long]$tauriReplacement[0].bytes -ne (Get-Item -LiteralPath $tauriConfigPath).Length) {
+            throw "Staged update fragment does not bind the exact Tauri resource-map replacement."
+          }
+      - name: Prove repository remained unchanged
+        run: |
+          git diff --exit-code -- package-lock.json src-tauri/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw "Vendor staging changed a lockfile." }
+          $repositoryState = git status --porcelain=v1 --untracked-files=all
+          if ($LASTEXITCODE -ne 0 -or $repositoryState) { throw "Vendor update workflow changed repository files: $repositoryState" }
+      - name: Upload staged vendor payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ffmpeg-vendor-8.1.2-${{ github.run_id }}
+          path: ${{ runner.temp }}/ffmpeg-vendor/*
+          if-no-files-found: error
+          retention-days: 30

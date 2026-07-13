@@ -1,0 +1,1804 @@
+name: Protected Beta Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commitSha:
+        description: Exact 40-hex commit on protected main to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+concurrency:
+  group: beta-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build approved beta artifact
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'Ayumudayo/StickerFit'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: beta-release
+    outputs:
+      source_commit: ${{ steps.stage_release.outputs.source_commit }}
+      transfer_artifact_name: ${{ steps.stage_release.outputs.transfer_artifact_name }}
+      transfer_run_attempt: ${{ steps.stage_release.outputs.transfer_run_attempt }}
+      owner_token: ${{ steps.stage_release.outputs.owner_token }}
+      marker_sha256: ${{ steps.stage_release.outputs.marker_sha256 }}
+      marker_bytes: ${{ steps.stage_release.outputs.marker_bytes }}
+      installer_sha256: ${{ steps.stage_release.outputs.installer_sha256 }}
+      installer_bytes: ${{ steps.stage_release.outputs.installer_bytes }}
+      desktop_sha256: ${{ steps.stage_release.outputs.desktop_sha256 }}
+      desktop_bytes: ${{ steps.stage_release.outputs.desktop_bytes }}
+      ffmpeg_sha256: ${{ steps.stage_release.outputs.ffmpeg_sha256 }}
+      ffmpeg_bytes: ${{ steps.stage_release.outputs.ffmpeg_bytes }}
+      license_sha256: ${{ steps.stage_release.outputs.license_sha256 }}
+      license_bytes: ${{ steps.stage_release.outputs.license_bytes }}
+      provenance_sha256: ${{ steps.stage_release.outputs.provenance_sha256 }}
+      provenance_bytes: ${{ steps.stage_release.outputs.provenance_bytes }}
+      report_sha256: ${{ steps.stage_release.outputs.report_sha256 }}
+      report_bytes: ${{ steps.stage_release.outputs.report_bytes }}
+      manifest_sha256: ${{ steps.stage_release.outputs.manifest_sha256 }}
+      manifest_bytes: ${{ steps.stage_release.outputs.manifest_bytes }}
+    steps:
+      - name: Checkout protected main for commit validation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate and detach exact release commit
+        env:
+          COMMIT_SHA: ${{ inputs.commitSha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          if ($env:COMMIT_SHA -notmatch "\A[0-9a-fA-F]{40}\z") { throw "commitSha must be exactly 40 hexadecimal characters." }
+          $checkedOutPolicy = ((git rev-parse --verify HEAD) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              -not [string]::Equals($checkedOutPolicy, $env:WORKFLOW_SHA, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "The checkout does not match the immutable workflow revision."
+          }
+          git cat-file -e "$env:COMMIT_SHA^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw "commitSha does not identify a fetched commit." }
+          git merge-base --is-ancestor $env:COMMIT_SHA $env:WORKFLOW_SHA
+          if ($LASTEXITCODE -ne 0) { throw "commitSha is not an ancestor of the immutable protected policy revision." }
+          git checkout --detach $env:COMMIT_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Could not detach the approved release commit." }
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($actual, $env:COMMIT_SHA, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Detached checkout does not match commitSha."
+          }
+      - name: Reject legacy vendor provenance
+        run: |
+          $manifest = Get-Content -Raw -LiteralPath .\tools\ffmpeg\ffmpeg-version.json | ConvertFrom-Json
+          $provenance = Get-Content -Raw -LiteralPath .\src-tauri\binaries\ffmpeg-provenance.json | ConvertFrom-Json
+          if ($provenance.legacyBootstrap -isnot [bool] -or
+              $provenance.legacyBootstrap -ne $false -or
+              $manifest.vendor.legacyBootstrapAllowedForRoutineVerification -isnot [bool] -or
+              $manifest.vendor.legacyBootstrapAllowedForRoutineVerification -ne $false) {
+            throw "Beta release rejects legacy or mistyped FFmpeg provenance."
+          }
+          foreach ($value in @($manifest.vendorUpdateRunId, $provenance.vendorUpdateRunId, $provenance.toolchainVersions, $provenance.sourceDateEpoch)) {
+            if ($null -eq $value) { throw "Beta release requires complete FFmpeg provenance." }
+          }
+          if (($manifest.vendorUpdateRunId -isnot [int] -and $manifest.vendorUpdateRunId -isnot [long]) -or
+              ($provenance.vendorUpdateRunId -isnot [int] -and $provenance.vendorUpdateRunId -isnot [long]) -or
+              ($provenance.sourceDateEpoch -isnot [int] -and $provenance.sourceDateEpoch -isnot [long]) -or
+              [long]$provenance.sourceDateEpoch -le 0 -or
+              [string]$manifest.vendorUpdateRunId -ne [string]$provenance.vendorUpdateRunId -or
+              -not [string]::Equals([string]$manifest.sourceArchiveSha256, [string]$provenance.sourceArchiveSha256, [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals([string]$manifest.expectedExeSha256, [string]$provenance.exeSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Beta release requires exact manifest/provenance identity."
+          }
+      - name: Set up Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+      - name: Set up Rust 1.96.1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.96.1"
+          components: rustfmt, clippy
+          cache: false
+      - name: Set up MSYS2 GnuPG
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          update: true
+          install: >-
+            gnupg
+            tar
+      - name: Resolve independent prerequisites
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $tools = [ordered]@{
+            STICKERFIT_BASH_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\bash.exe"
+            STICKERFIT_GPG_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\gpg.exe"
+            STICKERFIT_GPGV_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\gpgv.exe"
+            STICKERFIT_TAR_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\tar.exe"
+          }
+          foreach ($entry in $tools.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) { throw "Missing $($entry.Value)." }
+            & $entry.Value --version | Select-Object -First 1
+            if ($LASTEXITCODE -ne 0) { throw "$($entry.Key) version check failed." }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)"
+          }
+          $edge = Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"
+          if (-not (Test-Path -LiteralPath $edge -PathType Leaf)) { throw "Microsoft Edge is unavailable." }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw "vswhere.exe is unavailable." }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VSWHERE_PATH=$vswhere"
+      - name: Install exact cargo-audit
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or
+              -not (Test-Path -LiteralPath $env:RUNNER_TEMP -PathType Container)) {
+            throw "RUNNER_TEMP is required for isolated cargo-audit installation."
+          }
+          $installId = [System.Guid]::NewGuid().ToString("N")
+          $installRoot = Join-Path $env:RUNNER_TEMP "stickerfit-cargo-audit-$installId"
+          if (Test-Path -LiteralPath $installRoot) {
+            throw "Fresh cargo-audit installation root unexpectedly exists: $installRoot"
+          }
+          $cargoHome = Join-Path $installRoot "cargo-home"
+          $cargoTarget = Join-Path $installRoot "cargo-target"
+          [void][System.IO.Directory]::CreateDirectory($cargoHome)
+          [void][System.IO.Directory]::CreateDirectory($cargoTarget)
+          $env:CARGO_HOME = $cargoHome
+          $env:CARGO_TARGET_DIR = $cargoTarget
+          Push-Location $installRoot
+          try {
+            & cargo install cargo-audit --version 0.22.2 --locked --root $cargoHome
+            if ($LASTEXITCODE -ne 0) { throw "cargo-audit installation failed." }
+            $auditExecutable = Join-Path $cargoHome "bin\cargo-audit.exe"
+            if (-not (Test-Path -LiteralPath $auditExecutable -PathType Leaf) -or
+                ((Get-Item -LiteralPath $auditExecutable -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "The isolated cargo-audit executable is missing or unsafe."
+            }
+            $version = (& $auditExecutable --version)
+            if ($LASTEXITCODE -ne 0 -or $version -ne "cargo-audit 0.22.2") {
+              throw "Expected cargo-audit 0.22.2, got '$version'."
+            }
+          }
+          finally {
+            Pop-Location
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_CARGO_AUDIT_PATH=$auditExecutable"
+      - name: Install JavaScript dependencies
+        run: npm ci --ignore-scripts
+      - name: Assert lockfiles start clean
+        run: |
+          git diff --exit-code -- package-lock.json src-tauri/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw "Lockfiles changed before release gates." }
+          $tracked = git status --short --untracked-files=no
+          if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Tracked files are dirty before release gates: $tracked" }
+      - name: Verify official FFmpeg source
+        run: |
+          & .\tools\ffmpeg\build-minimal-ffmpeg.ps1 `
+            -VerifySourceOnly `
+            -GpgPath $env:STICKERFIT_GPG_PATH `
+            -GpgvPath $env:STICKERFIT_GPGV_PATH `
+            -TarPath $env:STICKERFIT_TAR_PATH
+      - name: Verify tracked FFmpeg vendor
+        run: npm run ffmpeg:verify-vendor
+      - name: Run complete quality gate
+        run: npm run check:quality
+      - name: Build desktop installer
+        run: npm run build:desktop
+      - name: Generate fail-closed size report
+        run: |
+          & .\tools\size-report.ps1 `
+            -JsonOutput src-tauri/target/release/size-report.json `
+            -ExcludeWebDist
+      - name: Verify loose and NSIS non-legacy payloads and stage exact artifacts
+        id: stage_release
+        env:
+          COMMIT_SHA: ${{ inputs.commitSha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          function Assert-RegularDirectoryChain {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd(
+              [System.IO.Path]::DirectorySeparatorChar,
+              [System.IO.Path]::AltDirectorySeparatorChar
+            )
+            $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+            if ([string]::IsNullOrWhiteSpace($volumeRoot)) {
+              throw "$Label does not have an absolute volume root: $fullPath"
+            }
+
+            $rootItem = Get-Item -LiteralPath $volumeRoot -Force
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "$Label volume root is not a regular directory: $volumeRoot"
+            }
+
+            $relativePath = $fullPath.Substring($volumeRoot.Length)
+            $cursor = $volumeRoot
+            foreach ($segment in @($relativePath -split '[\\/]' | Where-Object { $_.Length -gt 0 })) {
+              $cursor = Join-Path $cursor $segment
+              if (-not (Test-Path -LiteralPath $cursor -PathType Container)) {
+                throw "$Label contains a missing or non-directory path segment: $cursor"
+              }
+              $item = Get-Item -LiteralPath $cursor -Force
+              if (-not $item.PSIsContainer -or
+                  ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  -not [string]::Equals($item.Name, $segment, [System.StringComparison]::Ordinal)) {
+                throw "$Label contains a reparse point or case-variant directory: $cursor"
+              }
+            }
+
+            return $fullPath
+          }
+
+          function Assert-RegularStagedFile {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string]$Root,
+              [Parameter(Mandatory = $true)][string]$ExpectedName,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $fullPath = [System.IO.Path]::GetFullPath($Path)
+            if (-not [string]::Equals(
+                [System.IO.Path]::GetDirectoryName($fullPath),
+                $Root,
+                [System.StringComparison]::OrdinalIgnoreCase
+              ) -or
+                -not [string]::Equals(
+                  [System.IO.Path]::GetFileName($fullPath),
+                  $ExpectedName,
+                  [System.StringComparison]::Ordinal
+                )) {
+              throw "$Label is outside the exact verified staging root."
+            }
+            if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+              throw "$Label is missing: $fullPath"
+            }
+            $item = Get-Item -LiteralPath $fullPath -Force
+            if ($item.PSIsContainer -or
+                ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                -not [string]::Equals($item.Name, $ExpectedName, [System.StringComparison]::Ordinal)) {
+              throw "$Label is not the exact regular staged file."
+            }
+            return $item
+          }
+
+          function Write-NewUtf8File {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string]$Content
+            )
+
+            $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Content)
+            $stream = [System.IO.FileStream]::new(
+              $Path,
+              [System.IO.FileMode]::CreateNew,
+              [System.IO.FileAccess]::Write,
+              [System.IO.FileShare]::None,
+              4096,
+              [System.IO.FileOptions]::WriteThrough
+            )
+            try {
+              $stream.Write($bytes, 0, $bytes.Length)
+              $stream.Flush($true)
+            }
+            finally {
+              $stream.Dispose()
+            }
+          }
+
+          $nsisRoot = Assert-RegularDirectoryChain `
+            -Path ([System.IO.Path]::GetFullPath("src-tauri/target/release/bundle/nsis")) `
+            -Label "NSIS bundle directory"
+          $nsisChildren = @(Get-ChildItem -LiteralPath $nsisRoot -Force)
+          $installers = @($nsisChildren | Where-Object {
+              -not $_.PSIsContainer -and
+              [string]::Equals($_.Extension, ".exe", [System.StringComparison]::OrdinalIgnoreCase)
+            })
+          if ($nsisChildren.Count -ne 1 -or $installers.Count -ne 1 -or
+              ($installers[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Release requires exactly one regular NSIS installer and no sibling entries."
+          }
+          $installer = $installers[0]
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+            throw "Canonical 7-Zip is unavailable for static NSIS inspection."
+          }
+
+          $sizeReportPath = [System.IO.Path]::GetFullPath("src-tauri/target/release/size-report.json")
+          [void](Assert-RegularDirectoryChain `
+            -Path ([System.IO.Path]::GetDirectoryName($sizeReportPath)) `
+            -Label "release output directory")
+          $sizeReport = Get-Content -Raw -LiteralPath $sizeReportPath | ConvertFrom-Json
+          $installerRecords = @($sizeReport.artifacts | Where-Object {
+              $_.kind -is [string] -and
+              [string]::Equals([string]$_.kind, "installer", [System.StringComparison]::Ordinal)
+            })
+          $sourceInstallerBytes = [long](Get-Item -LiteralPath $installer.FullName -Force).Length
+          $sourceInstallerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
+          $sourceReportBytes = [long](Get-Item -LiteralPath $sizeReportPath -Force).Length
+          $sourceReportHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sizeReportPath).Hash.ToLowerInvariant()
+          if (($sizeReport.schemaVersion -isnot [int] -and $sizeReport.schemaVersion -isnot [long]) -or
+              [long]$sizeReport.schemaVersion -ne 1 -or
+              $sizeReport.commitSha -isnot [string] -or
+              -not [string]::Equals([string]$sizeReport.commitSha, $env:COMMIT_SHA, [System.StringComparison]::OrdinalIgnoreCase) -or
+              $installerRecords.Count -ne 1 -or
+              $installerRecords[0].path -isnot [string] -or
+              -not [string]::Equals([System.IO.Path]::GetFullPath([string]$installerRecords[0].path), $installer.FullName, [System.StringComparison]::OrdinalIgnoreCase) -or
+              $installerRecords[0].sha256 -isnot [string] -or
+              -not [string]::Equals([string]$installerRecords[0].sha256, $sourceInstallerHash, [System.StringComparison]::Ordinal) -or
+              ($installerRecords[0].bytes -isnot [int] -and $installerRecords[0].bytes -isnot [long]) -or
+              [long]$installerRecords[0].bytes -ne $sourceInstallerBytes) {
+            throw "Size report does not bind the exact verified NSIS installer and release commit."
+          }
+
+          $githubOutputPath = $env:GITHUB_OUTPUT
+          $githubEnvPath = $env:GITHUB_ENV
+          try {
+            Remove-Item Env:GITHUB_OUTPUT -ErrorAction SilentlyContinue
+            Remove-Item Env:GITHUB_ENV -ErrorAction SilentlyContinue
+            & .\tools\test-release-sidecar.ps1 `
+              -RequireNonLegacyProvenance `
+              -InstallerPath $installer.FullName `
+              -SevenZipPath $sevenZip
+          }
+          finally {
+            $env:GITHUB_OUTPUT = $githubOutputPath
+            $env:GITHUB_ENV = $githubEnvPath
+          }
+
+          $postInspectionInstallerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
+          $postInspectionReportHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sizeReportPath).Hash.ToLowerInvariant()
+          if (-not [string]::Equals($postInspectionInstallerHash, $sourceInstallerHash, [System.StringComparison]::Ordinal) -or
+              [long](Get-Item -LiteralPath $installer.FullName -Force).Length -ne $sourceInstallerBytes -or
+              -not [string]::Equals($postInspectionReportHash, $sourceReportHash, [System.StringComparison]::Ordinal) -or
+              [long](Get-Item -LiteralPath $sizeReportPath -Force).Length -ne $sourceReportBytes) {
+            throw "Installer or size report changed during static NSIS inspection."
+          }
+
+          $releaseOutputRoot = [System.IO.Path]::GetDirectoryName($sizeReportPath)
+          $sourceDesktop = Join-Path $releaseOutputRoot "desktop.exe"
+          $sourceFfmpeg = Join-Path $releaseOutputRoot "ffmpeg.exe"
+          $sourceLicense = Join-Path $releaseOutputRoot "LICENSE-ffmpeg.txt"
+          $sourceProvenance = Join-Path $releaseOutputRoot "ffmpeg-provenance.json"
+          $sourceDesktopItem = Assert-RegularStagedFile `
+            -Path $sourceDesktop `
+            -Root $releaseOutputRoot `
+            -ExpectedName "desktop.exe" `
+            -Label "verified loose desktop executable"
+          $sourceFfmpegItem = Assert-RegularStagedFile `
+            -Path $sourceFfmpeg `
+            -Root $releaseOutputRoot `
+            -ExpectedName "ffmpeg.exe" `
+            -Label "verified loose FFmpeg"
+          $sourceLicenseItem = Assert-RegularStagedFile `
+            -Path $sourceLicense `
+            -Root $releaseOutputRoot `
+            -ExpectedName "LICENSE-ffmpeg.txt" `
+            -Label "verified loose FFmpeg license"
+          $sourceProvenanceItem = Assert-RegularStagedFile `
+            -Path $sourceProvenance `
+            -Root $releaseOutputRoot `
+            -ExpectedName "ffmpeg-provenance.json" `
+            -Label "verified loose FFmpeg provenance"
+          $sourceDesktopHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceDesktopItem.FullName).Hash.ToLowerInvariant()
+          $sourceFfmpegHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceFfmpegItem.FullName).Hash.ToLowerInvariant()
+          $sourceLicenseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceLicenseItem.FullName).Hash.ToLowerInvariant()
+          $sourceProvenanceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceProvenanceItem.FullName).Hash.ToLowerInvariant()
+
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+            throw "RUNNER_TEMP is required for verified release staging."
+          }
+          foreach ($numericContext in @($env:RUN_ID, $env:RUN_ATTEMPT)) {
+            if ($numericContext -notmatch '\A[1-9][0-9]*\z') {
+              throw "Release staging requires numeric run and attempt identifiers."
+            }
+          }
+          $runnerTemp = Assert-RegularDirectoryChain -Path $env:RUNNER_TEMP -Label "runner temporary directory"
+          $verifiedRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $runnerTemp ".release-transfer-$env:RUN_ID-$env:RUN_ATTEMPT")
+          ).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+          if (-not [string]::Equals(
+              [System.IO.Path]::GetDirectoryName($verifiedRoot),
+              $runnerTemp,
+              [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "Verified release staging root escaped RUNNER_TEMP."
+          }
+          $verifiedRootName = [System.IO.Path]::GetFileName($verifiedRoot)
+          $rootCollisions = @(Get-ChildItem -LiteralPath $runnerTemp -Force | Where-Object {
+              [string]::Equals($_.Name, $verifiedRootName, [System.StringComparison]::OrdinalIgnoreCase)
+            })
+          if ($rootCollisions.Count -ne 0) {
+            throw "Verified release staging root unexpectedly already exists: $verifiedRoot"
+          }
+          [void][System.IO.Directory]::CreateDirectory($verifiedRoot)
+          $verifiedRoot = Assert-RegularDirectoryChain -Path $verifiedRoot -Label "verified release staging root"
+
+          $ownerBytes = [byte[]]::new(32)
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($ownerBytes)
+          $ownerToken = [System.Convert]::ToHexString($ownerBytes).ToLowerInvariant()
+          $ownerMarkerName = ".stickerfit-release-owner"
+          $ownerMarker = Join-Path $verifiedRoot $ownerMarkerName
+          Write-NewUtf8File -Path $ownerMarker -Content "stickerfit-release-v1:$ownerToken"
+          [void](Assert-RegularDirectoryChain -Path $verifiedRoot -Label "verified release staging root")
+          $ownerMarkerItem = Assert-RegularStagedFile `
+            -Path $ownerMarker `
+            -Root $verifiedRoot `
+            -ExpectedName $ownerMarkerName `
+            -Label "verified release owner marker"
+          $ownerMarkerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ownerMarkerItem.FullName).Hash.ToLowerInvariant()
+
+          $stagedInstaller = Join-Path $verifiedRoot "StickerFit-beta-installer.exe"
+          $stagedDesktop = Join-Path $verifiedRoot "desktop.exe"
+          $stagedFfmpeg = Join-Path $verifiedRoot "ffmpeg.exe"
+          $stagedLicense = Join-Path $verifiedRoot "LICENSE-ffmpeg.txt"
+          $stagedProvenance = Join-Path $verifiedRoot "ffmpeg-provenance.json"
+          $stagedSizeReport = Join-Path $verifiedRoot "size-report.json"
+          [System.IO.File]::Copy($installer.FullName, $stagedInstaller, $false)
+          [System.IO.File]::Copy($sourceDesktopItem.FullName, $stagedDesktop, $false)
+          [System.IO.File]::Copy($sourceFfmpegItem.FullName, $stagedFfmpeg, $false)
+          [System.IO.File]::Copy($sourceLicenseItem.FullName, $stagedLicense, $false)
+          [System.IO.File]::Copy($sourceProvenanceItem.FullName, $stagedProvenance, $false)
+          [System.IO.File]::Copy($sizeReportPath, $stagedSizeReport, $false)
+          $stagedInstallerItem = Assert-RegularStagedFile `
+            -Path $stagedInstaller `
+            -Root $verifiedRoot `
+            -ExpectedName "StickerFit-beta-installer.exe" `
+            -Label "verified staged installer"
+          $stagedReportItem = Assert-RegularStagedFile `
+            -Path $stagedSizeReport `
+            -Root $verifiedRoot `
+            -ExpectedName "size-report.json" `
+            -Label "verified staged size report"
+          $stagedDesktopItem = Assert-RegularStagedFile `
+            -Path $stagedDesktop `
+            -Root $verifiedRoot `
+            -ExpectedName "desktop.exe" `
+            -Label "verified staged desktop executable"
+          $stagedFfmpegItem = Assert-RegularStagedFile `
+            -Path $stagedFfmpeg `
+            -Root $verifiedRoot `
+            -ExpectedName "ffmpeg.exe" `
+            -Label "verified staged FFmpeg"
+          $stagedLicenseItem = Assert-RegularStagedFile `
+            -Path $stagedLicense `
+            -Root $verifiedRoot `
+            -ExpectedName "LICENSE-ffmpeg.txt" `
+            -Label "verified staged FFmpeg license"
+          $stagedProvenanceItem = Assert-RegularStagedFile `
+            -Path $stagedProvenance `
+            -Root $verifiedRoot `
+            -ExpectedName "ffmpeg-provenance.json" `
+            -Label "verified staged FFmpeg provenance"
+          $stagedInstallerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedInstaller).Hash.ToLowerInvariant()
+          $stagedDesktopHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedDesktop).Hash.ToLowerInvariant()
+          $stagedFfmpegHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedFfmpeg).Hash.ToLowerInvariant()
+          $stagedLicenseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedLicense).Hash.ToLowerInvariant()
+          $stagedProvenanceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedProvenance).Hash.ToLowerInvariant()
+          $stagedReportHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedSizeReport).Hash.ToLowerInvariant()
+          $postCopyInstallerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
+          $postCopyReportHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sizeReportPath).Hash.ToLowerInvariant()
+          if (-not [string]::Equals($stagedInstallerHash, $sourceInstallerHash, [System.StringComparison]::Ordinal) -or
+              [long]$stagedInstallerItem.Length -ne $sourceInstallerBytes -or
+              -not [string]::Equals($stagedDesktopHash, $sourceDesktopHash, [System.StringComparison]::Ordinal) -or
+              [long]$stagedDesktopItem.Length -ne [long]$sourceDesktopItem.Length -or
+              -not [string]::Equals($stagedFfmpegHash, $sourceFfmpegHash, [System.StringComparison]::Ordinal) -or
+              [long]$stagedFfmpegItem.Length -ne [long]$sourceFfmpegItem.Length -or
+              -not [string]::Equals($stagedLicenseHash, $sourceLicenseHash, [System.StringComparison]::Ordinal) -or
+              [long]$stagedLicenseItem.Length -ne [long]$sourceLicenseItem.Length -or
+              -not [string]::Equals($stagedProvenanceHash, $sourceProvenanceHash, [System.StringComparison]::Ordinal) -or
+              [long]$stagedProvenanceItem.Length -ne [long]$sourceProvenanceItem.Length -or
+              -not [string]::Equals($stagedReportHash, $sourceReportHash, [System.StringComparison]::Ordinal) -or
+              [long]$stagedReportItem.Length -ne $sourceReportBytes -or
+              -not [string]::Equals($postCopyInstallerHash, $sourceInstallerHash, [System.StringComparison]::Ordinal) -or
+              [long](Get-Item -LiteralPath $installer.FullName -Force).Length -ne $sourceInstallerBytes -or
+              -not [string]::Equals($postCopyReportHash, $sourceReportHash, [System.StringComparison]::Ordinal) -or
+              [long](Get-Item -LiteralPath $sizeReportPath -Force).Length -ne $sourceReportBytes) {
+            throw "Verified installer or size-report source/copy bytes changed during staging."
+          }
+          $verification = [ordered]@{
+            schemaVersion = 1
+            sourceCommit = $env:COMMIT_SHA.ToLowerInvariant()
+            sourceInstallerName = $installer.Name
+            installer = [ordered]@{
+              file = "StickerFit-beta-installer.exe"
+              sha256 = $stagedInstallerHash
+              bytes = [long]$stagedInstallerItem.Length
+            }
+            sizeReport = [ordered]@{
+              file = "size-report.json"
+              sha256 = $stagedReportHash
+              bytes = [long]$stagedReportItem.Length
+            }
+          }
+          $verificationPath = Join-Path $verifiedRoot "release-verification.json"
+          Write-NewUtf8File -Path $verificationPath -Content ($verification | ConvertTo-Json -Depth 8)
+          $verificationItem = Assert-RegularStagedFile `
+            -Path $verificationPath `
+            -Root $verifiedRoot `
+            -ExpectedName "release-verification.json" `
+            -Label "descriptive release verification manifest"
+          $verificationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $verificationItem.FullName).Hash.ToLowerInvariant()
+
+          $expectedNames = @(
+            $ownerMarkerName,
+            "StickerFit-beta-installer.exe",
+            "desktop.exe",
+            "ffmpeg.exe",
+            "ffmpeg-provenance.json",
+            "LICENSE-ffmpeg.txt",
+            "release-verification.json",
+            "size-report.json"
+          ) | Sort-Object
+          $stagedChildren = @(Get-ChildItem -LiteralPath $verifiedRoot -Force)
+          if (@($stagedChildren | Where-Object {
+                $_.PSIsContainer -or
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+              }).Count -ne 0 -or
+              $null -ne (Compare-Object `
+                -CaseSensitive `
+                -ReferenceObject $expectedNames `
+                -DifferenceObject @($stagedChildren.Name | Sort-Object))) {
+            throw "Verified release staging membership is not the exact regular-file set."
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "source_commit=$($env:COMMIT_SHA.ToLowerInvariant())"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "transfer_artifact_name=stickerfit-INTERNAL-UNVERIFIED-$env:RUN_ID-$env:RUN_ATTEMPT"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "transfer_run_attempt=$env:RUN_ATTEMPT"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "owner_token=$ownerToken"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "marker_sha256=$ownerMarkerHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "marker_bytes=$([long]$ownerMarkerItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "installer_sha256=$stagedInstallerHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "installer_bytes=$([long]$stagedInstallerItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "desktop_sha256=$stagedDesktopHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "desktop_bytes=$([long]$stagedDesktopItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "ffmpeg_sha256=$stagedFfmpegHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "ffmpeg_bytes=$([long]$stagedFfmpegItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "license_sha256=$stagedLicenseHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "license_bytes=$([long]$stagedLicenseItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "provenance_sha256=$stagedProvenanceHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "provenance_bytes=$([long]$stagedProvenanceItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "report_sha256=$stagedReportHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "report_bytes=$([long]$stagedReportItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "manifest_sha256=$verificationHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "manifest_bytes=$([long]$verificationItem.Length)"
+      - name: Reverify exact internal transfer before handoff
+        env:
+          COMMIT_SHA: ${{ inputs.commitSha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPECTED_SOURCE_COMMIT: ${{ steps.stage_release.outputs.source_commit }}
+          EXPECTED_OWNER_TOKEN: ${{ steps.stage_release.outputs.owner_token }}
+          EXPECTED_MARKER_SHA256: ${{ steps.stage_release.outputs.marker_sha256 }}
+          EXPECTED_MARKER_BYTES: ${{ steps.stage_release.outputs.marker_bytes }}
+          EXPECTED_INSTALLER_SHA256: ${{ steps.stage_release.outputs.installer_sha256 }}
+          EXPECTED_INSTALLER_BYTES: ${{ steps.stage_release.outputs.installer_bytes }}
+          EXPECTED_DESKTOP_SHA256: ${{ steps.stage_release.outputs.desktop_sha256 }}
+          EXPECTED_DESKTOP_BYTES: ${{ steps.stage_release.outputs.desktop_bytes }}
+          EXPECTED_FFMPEG_SHA256: ${{ steps.stage_release.outputs.ffmpeg_sha256 }}
+          EXPECTED_FFMPEG_BYTES: ${{ steps.stage_release.outputs.ffmpeg_bytes }}
+          EXPECTED_LICENSE_SHA256: ${{ steps.stage_release.outputs.license_sha256 }}
+          EXPECTED_LICENSE_BYTES: ${{ steps.stage_release.outputs.license_bytes }}
+          EXPECTED_PROVENANCE_SHA256: ${{ steps.stage_release.outputs.provenance_sha256 }}
+          EXPECTED_PROVENANCE_BYTES: ${{ steps.stage_release.outputs.provenance_bytes }}
+          EXPECTED_REPORT_SHA256: ${{ steps.stage_release.outputs.report_sha256 }}
+          EXPECTED_REPORT_BYTES: ${{ steps.stage_release.outputs.report_bytes }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.stage_release.outputs.manifest_sha256 }}
+          EXPECTED_MANIFEST_BYTES: ${{ steps.stage_release.outputs.manifest_bytes }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          function Assert-RegularDirectoryChain {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd(
+              [System.IO.Path]::DirectorySeparatorChar,
+              [System.IO.Path]::AltDirectorySeparatorChar
+            )
+            $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+            if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Path has no absolute volume root." }
+            $rootItem = Get-Item -LiteralPath $volumeRoot -Force
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Volume root is not a regular directory: $volumeRoot"
+            }
+            $relativePath = $fullPath.Substring($volumeRoot.Length)
+            $cursor = $volumeRoot
+            foreach ($segment in @($relativePath -split '[\\/]' | Where-Object { $_.Length -gt 0 })) {
+              $cursor = Join-Path $cursor $segment
+              if (-not (Test-Path -LiteralPath $cursor -PathType Container)) {
+                throw "Path contains a missing or non-directory segment: $cursor"
+              }
+              $item = Get-Item -LiteralPath $cursor -Force
+              if (-not $item.PSIsContainer -or
+                  ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  -not [string]::Equals($item.Name, $segment, [System.StringComparison]::Ordinal)) {
+                throw "Path contains a reparse point or case-variant directory: $cursor"
+              }
+            }
+            return $fullPath
+          }
+
+          function Get-RegularTransferFile {
+            param(
+              [Parameter(Mandatory = $true)][string]$Root,
+              [Parameter(Mandatory = $true)][string]$Name
+            )
+
+            $path = [System.IO.Path]::GetFullPath((Join-Path $Root $Name))
+            if (-not [string]::Equals([System.IO.Path]::GetDirectoryName($path), $Root, [System.StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Transfer file is missing or outside the exact root: $Name"
+            }
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.PSIsContainer -or
+                ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                -not [string]::Equals($item.Name, $Name, [System.StringComparison]::Ordinal)) {
+              throw "Transfer entry is not the exact regular file: $Name"
+            }
+            return $item
+          }
+
+          $anchors = @(
+            [pscustomobject]@{ Name = ".stickerfit-release-owner"; Sha256 = $env:EXPECTED_MARKER_SHA256; Bytes = $env:EXPECTED_MARKER_BYTES },
+            [pscustomobject]@{ Name = "StickerFit-beta-installer.exe"; Sha256 = $env:EXPECTED_INSTALLER_SHA256; Bytes = $env:EXPECTED_INSTALLER_BYTES },
+            [pscustomobject]@{ Name = "desktop.exe"; Sha256 = $env:EXPECTED_DESKTOP_SHA256; Bytes = $env:EXPECTED_DESKTOP_BYTES },
+            [pscustomobject]@{ Name = "ffmpeg.exe"; Sha256 = $env:EXPECTED_FFMPEG_SHA256; Bytes = $env:EXPECTED_FFMPEG_BYTES },
+            [pscustomobject]@{ Name = "LICENSE-ffmpeg.txt"; Sha256 = $env:EXPECTED_LICENSE_SHA256; Bytes = $env:EXPECTED_LICENSE_BYTES },
+            [pscustomobject]@{ Name = "ffmpeg-provenance.json"; Sha256 = $env:EXPECTED_PROVENANCE_SHA256; Bytes = $env:EXPECTED_PROVENANCE_BYTES },
+            [pscustomobject]@{ Name = "size-report.json"; Sha256 = $env:EXPECTED_REPORT_SHA256; Bytes = $env:EXPECTED_REPORT_BYTES },
+            [pscustomobject]@{ Name = "release-verification.json"; Sha256 = $env:EXPECTED_MANIFEST_SHA256; Bytes = $env:EXPECTED_MANIFEST_BYTES }
+          )
+          if ($env:COMMIT_SHA -notmatch '\A[0-9a-fA-F]{40}\z' -or
+              $env:EXPECTED_SOURCE_COMMIT -notmatch '\A[0-9a-f]{40}\z' -or
+              -not [string]::Equals($env:COMMIT_SHA, $env:EXPECTED_SOURCE_COMMIT, [System.StringComparison]::OrdinalIgnoreCase) -or
+              $env:EXPECTED_OWNER_TOKEN -notmatch '\A[0-9a-f]{64}\z') {
+            throw "Internal transfer identity anchors are invalid."
+          }
+          $maximumBytes = @{
+            ".stickerfit-release-owner" = 128L
+            "StickerFit-beta-installer.exe" = 1GB
+            "desktop.exe" = 512MB
+            "ffmpeg.exe" = 512MB
+            "LICENSE-ffmpeg.txt" = 4MB
+            "ffmpeg-provenance.json" = 4MB
+            "size-report.json" = 4MB
+            "release-verification.json" = 1MB
+          }
+          foreach ($anchor in $anchors) {
+            [long]$parsedBytes = 0
+            if ($anchor.Sha256 -notmatch '\A[0-9a-f]{64}\z' -or
+                $anchor.Bytes -notmatch '\A[1-9][0-9]*\z' -or
+                -not [long]::TryParse([string]$anchor.Bytes, [ref]$parsedBytes) -or
+                $parsedBytes -gt [long]$maximumBytes[$anchor.Name]) {
+              throw "Internal transfer anchor is missing or malformed: $($anchor.Name)"
+            }
+          }
+
+          git diff --exit-code -- package-lock.json src-tauri/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw "Release gates changed a lockfile." }
+          $tracked = git status --short --untracked-files=no
+          if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Release gates changed tracked files: $tracked" }
+
+          $runnerTemp = Assert-RegularDirectoryChain -Path $env:RUNNER_TEMP
+          $transferRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $runnerTemp ".release-transfer-$env:RUN_ID-$env:RUN_ATTEMPT")
+          ).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+          if (-not [string]::Equals([System.IO.Path]::GetDirectoryName($transferRoot), $runnerTemp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Internal transfer root escaped RUNNER_TEMP."
+          }
+          $transferRoot = Assert-RegularDirectoryChain -Path $transferRoot
+          $children = @(Get-ChildItem -LiteralPath $transferRoot -Force)
+          $expectedNames = @($anchors.Name | Sort-Object)
+          if (@($children | Where-Object {
+                $_.PSIsContainer -or
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+              }).Count -ne 0 -or
+              $null -ne (Compare-Object -CaseSensitive -ReferenceObject $expectedNames -DifferenceObject @($children.Name | Sort-Object))) {
+            throw "Internal release transfer membership is invalid."
+          }
+          foreach ($anchor in $anchors) {
+            $file = Get-RegularTransferFile -Root $transferRoot -Name $anchor.Name
+            $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            if (-not [string]::Equals($actualSha256, $anchor.Sha256, [System.StringComparison]::Ordinal) -or
+                [long]$file.Length -ne [long]$anchor.Bytes) {
+              throw "Internal transfer differs from its staging hint: $($anchor.Name)"
+            }
+          }
+          $markerFile = Get-RegularTransferFile -Root $transferRoot -Name ".stickerfit-release-owner"
+          if ((Get-Content -Raw -LiteralPath $markerFile.FullName) -ne "stickerfit-release-v1:$env:EXPECTED_OWNER_TOKEN") {
+            throw "Internal transfer ownership marker changed."
+          }
+          [void](Assert-RegularDirectoryChain -Path $transferRoot)
+      - name: Upload internal unverified release transfer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.stage_release.outputs.transfer_artifact_name }}
+          path: |
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/.stickerfit-release-owner
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/StickerFit-beta-installer.exe
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/desktop.exe
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/ffmpeg.exe
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/LICENSE-ffmpeg.txt
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/ffmpeg-provenance.json
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/size-report.json
+            ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}/release-verification.json
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: false
+          compression-level: 0
+          retention-days: 1
+
+  finalize:
+    name: Independently verify and publish beta artifact
+    needs: release
+    if: needs.release.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'Ayumudayo/StickerFit'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout current protected verification policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          path: policy
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout exact candidate commit as data
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.commitSha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate clean finalizer and fresh transfer destination
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commitSha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.release.outputs.source_commit }}
+          EXPECTED_TRANSFER_NAME: ${{ needs.release.outputs.transfer_artifact_name }}
+          EXPECTED_TRANSFER_ATTEMPT: ${{ needs.release.outputs.transfer_run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          function Assert-RegularDirectoryChain {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd(
+              [System.IO.Path]::DirectorySeparatorChar,
+              [System.IO.Path]::AltDirectorySeparatorChar
+            )
+            $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+            if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Path has no volume root." }
+            $rootItem = Get-Item -LiteralPath $volumeRoot -Force
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Volume root is not a regular directory."
+            }
+            $relativePath = $fullPath.Substring($volumeRoot.Length)
+            $cursor = $volumeRoot
+            foreach ($segment in @($relativePath -split '[\\/]' | Where-Object { $_.Length -gt 0 })) {
+              $cursor = Join-Path $cursor $segment
+              if (-not (Test-Path -LiteralPath $cursor -PathType Container)) { throw "Missing path segment: $cursor" }
+              $item = Get-Item -LiteralPath $cursor -Force
+              if (-not $item.PSIsContainer -or
+                  ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  -not [string]::Equals($item.Name, $segment, [System.StringComparison]::Ordinal)) {
+                throw "Unsafe or case-variant path segment: $cursor"
+              }
+            }
+            return $fullPath
+          }
+
+          if ($env:REQUESTED_COMMIT -notmatch '\A[0-9a-fA-F]{40}\z' -or
+              $env:WORKFLOW_SHA -notmatch '\A[0-9a-fA-F]{40}\z' -or
+              $env:EXPECTED_SOURCE_COMMIT -notmatch '\A[0-9a-f]{40}\z' -or
+              -not [string]::Equals($env:REQUESTED_COMMIT, $env:EXPECTED_SOURCE_COMMIT, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Finalizer commit anchors are invalid."
+          }
+          if ($env:RUN_ID -notmatch '\A[1-9][0-9]*\z' -or
+              $env:RUN_ATTEMPT -notmatch '\A[1-9][0-9]*\z' -or
+              $env:EXPECTED_TRANSFER_ATTEMPT -notmatch '\A[1-9][0-9]*\z') {
+            throw "Finalizer run and transfer attempt identifiers are invalid."
+          }
+          $expectedTransferName = "stickerfit-INTERNAL-UNVERIFIED-$env:RUN_ID-$env:EXPECTED_TRANSFER_ATTEMPT"
+          if (-not [string]::Equals(
+              $env:EXPECTED_TRANSFER_NAME,
+              $expectedTransferName,
+              [System.StringComparison]::Ordinal
+            )) {
+            throw "Internal transfer artifact name is invalid."
+          }
+          $policyCommit = (& git -C policy rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($policyCommit, $env:WORKFLOW_SHA, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Policy checkout does not match the protected workflow revision."
+          }
+          $candidateCommit = (& git -C candidate rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($candidateCommit, $env:REQUESTED_COMMIT, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Candidate checkout does not match the requested release commit."
+          }
+          & git -C policy cat-file -e "$env:REQUESTED_COMMIT^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw "Candidate commit is absent from the immutable policy history." }
+          & git -C policy merge-base --is-ancestor $env:REQUESTED_COMMIT $env:WORKFLOW_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Candidate commit is not an ancestor of the immutable policy revision." }
+          foreach ($checkout in @("policy", "candidate")) {
+            $tracked = (& git -C $checkout status --short --untracked-files=no)
+            if ($LASTEXITCODE -ne 0 -or $tracked) { throw "$checkout checkout is not clean: $tracked" }
+          }
+
+          $runnerTemp = Assert-RegularDirectoryChain -Path $env:RUNNER_TEMP
+          $transferRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $runnerTemp ".release-transfer-$env:RUN_ID-$env:RUN_ATTEMPT")
+          ).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+          if (-not [string]::Equals([System.IO.Path]::GetDirectoryName($transferRoot), $runnerTemp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Finalizer transfer root escaped RUNNER_TEMP."
+          }
+          $transferName = [System.IO.Path]::GetFileName($transferRoot)
+          $collisions = @(Get-ChildItem -LiteralPath $runnerTemp -Force | Where-Object {
+              [string]::Equals($_.Name, $transferName, [System.StringComparison]::OrdinalIgnoreCase)
+            })
+          if ($collisions.Count -ne 0) { throw "Fresh finalizer transfer root already exists." }
+      - name: Download exact internal release transfer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.release.outputs.transfer_artifact_name }}
+          path: ${{ runner.temp }}/.release-transfer-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Verify with current protected static policy and restage
+        id: finalize_release
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commitSha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.release.outputs.source_commit }}
+          EXPECTED_OWNER_TOKEN: ${{ needs.release.outputs.owner_token }}
+          EXPECTED_MARKER_SHA256: ${{ needs.release.outputs.marker_sha256 }}
+          EXPECTED_MARKER_BYTES: ${{ needs.release.outputs.marker_bytes }}
+          EXPECTED_INSTALLER_SHA256: ${{ needs.release.outputs.installer_sha256 }}
+          EXPECTED_INSTALLER_BYTES: ${{ needs.release.outputs.installer_bytes }}
+          EXPECTED_DESKTOP_SHA256: ${{ needs.release.outputs.desktop_sha256 }}
+          EXPECTED_DESKTOP_BYTES: ${{ needs.release.outputs.desktop_bytes }}
+          EXPECTED_FFMPEG_SHA256: ${{ needs.release.outputs.ffmpeg_sha256 }}
+          EXPECTED_FFMPEG_BYTES: ${{ needs.release.outputs.ffmpeg_bytes }}
+          EXPECTED_LICENSE_SHA256: ${{ needs.release.outputs.license_sha256 }}
+          EXPECTED_LICENSE_BYTES: ${{ needs.release.outputs.license_bytes }}
+          EXPECTED_PROVENANCE_SHA256: ${{ needs.release.outputs.provenance_sha256 }}
+          EXPECTED_PROVENANCE_BYTES: ${{ needs.release.outputs.provenance_bytes }}
+          EXPECTED_REPORT_SHA256: ${{ needs.release.outputs.report_sha256 }}
+          EXPECTED_REPORT_BYTES: ${{ needs.release.outputs.report_bytes }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.release.outputs.manifest_sha256 }}
+          EXPECTED_MANIFEST_BYTES: ${{ needs.release.outputs.manifest_bytes }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          function Assert-RegularDirectoryChain {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd(
+              [System.IO.Path]::DirectorySeparatorChar,
+              [System.IO.Path]::AltDirectorySeparatorChar
+            )
+            $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+            if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Path has no volume root." }
+            $rootItem = Get-Item -LiteralPath $volumeRoot -Force
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Volume root is not a regular directory."
+            }
+            $relativePath = $fullPath.Substring($volumeRoot.Length)
+            $cursor = $volumeRoot
+            foreach ($segment in @($relativePath -split '[\\/]' | Where-Object { $_.Length -gt 0 })) {
+              $cursor = Join-Path $cursor $segment
+              if (-not (Test-Path -LiteralPath $cursor -PathType Container)) { throw "Missing path segment: $cursor" }
+              $item = Get-Item -LiteralPath $cursor -Force
+              if (-not $item.PSIsContainer -or
+                  ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  -not [string]::Equals($item.Name, $segment, [System.StringComparison]::Ordinal)) {
+                throw "Unsafe or case-variant path segment: $cursor"
+              }
+            }
+            return $fullPath
+          }
+
+          function Get-RegularFlatFile {
+            param(
+              [Parameter(Mandatory = $true)][string]$Root,
+              [Parameter(Mandatory = $true)][string]$Name
+            )
+
+            $path = [System.IO.Path]::GetFullPath((Join-Path $Root $Name))
+            if (-not [string]::Equals([System.IO.Path]::GetDirectoryName($path), $Root, [System.StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "File is missing or outside the exact flat root: $Name"
+            }
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.PSIsContainer -or
+                ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                -not [string]::Equals($item.Name, $Name, [System.StringComparison]::Ordinal)) {
+              throw "Entry is not the exact regular file: $Name"
+            }
+            return $item
+          }
+
+          function Get-ExactJsonProperty {
+            param(
+              [Parameter(Mandatory = $true)]$Object,
+              [Parameter(Mandatory = $true)][string]$Name,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $matches = @($Object.PSObject.Properties | Where-Object {
+                $_.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty -and
+                [string]::Equals($_.Name, $Name, [System.StringComparison]::Ordinal)
+              })
+            if ($matches.Count -ne 1) {
+              throw "$Label must contain exactly one case-sensitive '$Name' property."
+            }
+            Write-Output -NoEnumerate $matches[0].Value
+          }
+
+          function Assert-ExactJsonProperties {
+            param(
+              [Parameter(Mandatory = $true)]$Object,
+              [Parameter(Mandatory = $true)][string[]]$Names,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $actualNames = @($Object.PSObject.Properties | Where-Object {
+                $_.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty
+              } | ForEach-Object { $_.Name })
+            if ($actualNames.Count -ne $Names.Count) {
+              throw "$Label property membership is invalid."
+            }
+            foreach ($name in $Names) {
+              $matches = @($actualNames | Where-Object {
+                  [string]::Equals($_, $name, [System.StringComparison]::Ordinal)
+                })
+              if ($matches.Count -ne 1) {
+                throw "$Label property membership is invalid."
+              }
+            }
+          }
+
+          function Assert-StrictJsonElement {
+            param(
+              [Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            switch ($Element.ValueKind) {
+              ([System.Text.Json.JsonValueKind]::Object) {
+                $names = [System.Collections.Generic.HashSet[string]]::new(
+                  [System.StringComparer]::Ordinal
+                )
+                foreach ($property in $Element.EnumerateObject()) {
+                  if (-not $names.Add($property.Name)) {
+                    throw "$Label contains a duplicate JSON property: $($property.Name)"
+                  }
+                  Assert-StrictJsonElement `
+                    -Element $property.Value `
+                    -Label "$Label.$($property.Name)"
+                }
+                break
+              }
+              ([System.Text.Json.JsonValueKind]::Array) {
+                $index = 0
+                foreach ($item in $Element.EnumerateArray()) {
+                  Assert-StrictJsonElement -Element $item -Label "$Label[$index]"
+                  $index += 1
+                }
+                break
+              }
+              ([System.Text.Json.JsonValueKind]::Number) {
+                [long]$integerValue = 0
+                if (-not $Element.TryGetInt64([ref]$integerValue)) {
+                  [double]$floatingValue = 0
+                  try {
+                    $floatingValue = $Element.GetDouble()
+                  }
+                  catch {
+                    throw "$Label contains an out-of-range JSON number."
+                  }
+                  if (-not [double]::IsFinite($floatingValue)) {
+                    throw "$Label contains a non-finite JSON number."
+                  }
+                }
+                break
+              }
+              ([System.Text.Json.JsonValueKind]::String) { break }
+              ([System.Text.Json.JsonValueKind]::True) { break }
+              ([System.Text.Json.JsonValueKind]::False) { break }
+              ([System.Text.Json.JsonValueKind]::Null) { break }
+              default { throw "$Label contains an unsupported JSON token." }
+            }
+          }
+
+          function Assert-StrictJsonText {
+            param(
+              [Parameter(Mandatory = $true)][string]$Json,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $document = $null
+            try {
+              $document = [System.Text.Json.JsonDocument]::Parse($Json)
+              if ($document.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                throw "$Label root must be a JSON object."
+              }
+              Assert-StrictJsonElement -Element $document.RootElement -Label $Label
+            }
+            finally {
+              if ($null -ne $document) { $document.Dispose() }
+            }
+          }
+
+          function Assert-CheckoutIntegrity {
+            param(
+              [Parameter(Mandatory = $true)][string]$Root,
+              [Parameter(Mandatory = $true)][string]$ExpectedCommit,
+              [Parameter(Mandatory = $true)][string[]]$CriticalPaths,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $head = ((& git -C $Root rev-parse --verify HEAD) | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or
+                -not [string]::Equals($head, $ExpectedCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+              throw "$Label checkout identity is invalid."
+            }
+
+            $status = @(& git -C $Root status --porcelain=v1 --untracked-files=all)
+            if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) {
+              throw "$Label checkout is not exactly clean: $($status -join '; ')"
+            }
+            & git -C $Root --no-pager diff --quiet --no-ext-diff --ignore-submodules=none HEAD --
+            if ($LASTEXITCODE -ne 0) { throw "$Label checkout has a tracked worktree or index difference." }
+            & git -C $Root --no-pager diff-files --quiet --ignore-submodules=none --
+            if ($LASTEXITCODE -ne 0) { throw "$Label checkout has a tracked worktree difference." }
+            & git -C $Root --no-pager diff-index --cached --quiet --ignore-submodules=none HEAD --
+            if ($LASTEXITCODE -ne 0) { throw "$Label checkout has a tracked index difference." }
+
+            foreach ($relativePath in $CriticalPaths) {
+              if ([string]::IsNullOrWhiteSpace($relativePath) -or
+                  [System.IO.Path]::IsPathRooted($relativePath) -or
+                  $relativePath -match '(^|[\\/])\.\.([\\/]|$)') {
+                throw "$Label critical path is invalid: $relativePath"
+              }
+              $gitPath = $relativePath.Replace([System.IO.Path]::DirectorySeparatorChar, '/')
+              $treeEntry = @(& git -C $Root ls-tree $ExpectedCommit -- $gitPath)
+              if ($LASTEXITCODE -ne 0 -or $treeEntry.Count -ne 1) {
+                throw "$Label critical path is not uniquely tracked: $gitPath"
+              }
+              $treeParts = $treeEntry[0] -split "`t", 2
+              $treeMetadata = @($treeParts[0] -split ' ' | Where-Object { $_.Length -gt 0 })
+              if ($treeParts.Count -ne 2 -or
+                  $treeMetadata.Count -ne 3 -or
+                  -not [string]::Equals($treeMetadata[0], "100644", [System.StringComparison]::Ordinal) -or
+                  -not [string]::Equals($treeMetadata[1], "blob", [System.StringComparison]::Ordinal) -or
+                  $treeMetadata[2] -notmatch '\A[0-9a-f]{40}\z' -or
+                  -not [string]::Equals($treeParts[1], $gitPath, [System.StringComparison]::Ordinal)) {
+                throw "$Label critical path mode or tree identity is invalid: $gitPath"
+              }
+
+              $fullPath = [System.IO.Path]::GetFullPath((Join-Path $Root $relativePath))
+              $rootPrefix = $Root.TrimEnd(
+                [System.IO.Path]::DirectorySeparatorChar,
+                [System.IO.Path]::AltDirectorySeparatorChar
+              ) + [System.IO.Path]::DirectorySeparatorChar
+              if (-not $fullPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "$Label critical path escaped its checkout: $gitPath"
+              }
+              $parent = Assert-RegularDirectoryChain -Path ([System.IO.Path]::GetDirectoryName($fullPath))
+              $file = Get-Item -LiteralPath $fullPath -Force
+              if ($file.PSIsContainer -or
+                  ($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  -not [string]::Equals($file.DirectoryName, $parent, [System.StringComparison]::OrdinalIgnoreCase) -or
+                  -not [string]::Equals($file.Name, [System.IO.Path]::GetFileName($relativePath), [System.StringComparison]::Ordinal)) {
+                throw "$Label critical path is not an exact regular file: $gitPath"
+              }
+              $worktreeHash = ((& git -C $Root hash-object --no-filters -- $fullPath) | Out-String).Trim()
+              if ($LASTEXITCODE -ne 0 -or
+                  -not [string]::Equals($worktreeHash, $treeMetadata[2], [System.StringComparison]::Ordinal)) {
+                throw "$Label critical path bytes do not match the protected commit: $gitPath"
+              }
+            }
+          }
+
+          function Assert-MatchingAuthorityBlob {
+            param(
+              [Parameter(Mandatory = $true)][string]$PolicyRoot,
+              [Parameter(Mandatory = $true)][string]$PolicyCommit,
+              [Parameter(Mandatory = $true)][string]$CandidateRoot,
+              [Parameter(Mandatory = $true)][string]$CandidateCommit,
+              [Parameter(Mandatory = $true)][string]$RelativePath
+            )
+
+            $policyEntry = @(& git -C $PolicyRoot ls-tree $PolicyCommit -- $RelativePath)
+            if ($LASTEXITCODE -ne 0 -or $policyEntry.Count -ne 1) {
+              throw "Protected authority file is not uniquely tracked: $RelativePath"
+            }
+            $candidateEntry = @(& git -C $CandidateRoot ls-tree $CandidateCommit -- $RelativePath)
+            if ($LASTEXITCODE -ne 0 -or $candidateEntry.Count -ne 1) {
+              throw "Candidate authority file is not uniquely tracked: $RelativePath"
+            }
+            if (-not [string]::Equals($policyEntry[0], $candidateEntry[0], [System.StringComparison]::Ordinal)) {
+              throw "Candidate FFmpeg authority differs from the current protected policy: $RelativePath"
+            }
+          }
+
+          function Assert-FileIdentity {
+            param(
+              [Parameter(Mandatory = $true)][System.IO.FileInfo]$File,
+              [Parameter(Mandatory = $true)][string]$Sha256,
+              [Parameter(Mandatory = $true)][long]$Bytes,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+
+            $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $File.FullName).Hash.ToLowerInvariant()
+            if (-not [string]::Equals($actualSha256, $Sha256, [System.StringComparison]::Ordinal) -or
+                [long]$File.Length -ne $Bytes) {
+              throw "$Label byte identity is invalid."
+            }
+          }
+
+          function Write-NewUtf8File {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string]$Content
+            )
+
+            $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Content)
+            $stream = [System.IO.FileStream]::new(
+              $Path,
+              [System.IO.FileMode]::CreateNew,
+              [System.IO.FileAccess]::Write,
+              [System.IO.FileShare]::None,
+              4096,
+              [System.IO.FileOptions]::WriteThrough
+            )
+            try {
+              $stream.Write($bytes, 0, $bytes.Length)
+              $stream.Flush($true)
+            }
+            finally {
+              $stream.Dispose()
+            }
+          }
+
+          if ($env:REQUESTED_COMMIT -notmatch '\A[0-9a-fA-F]{40}\z' -or
+              $env:WORKFLOW_SHA -notmatch '\A[0-9a-fA-F]{40}\z' -or
+              $env:EXPECTED_SOURCE_COMMIT -notmatch '\A[0-9a-f]{40}\z' -or
+              -not [string]::Equals($env:REQUESTED_COMMIT, $env:EXPECTED_SOURCE_COMMIT, [System.StringComparison]::OrdinalIgnoreCase) -or
+              $env:EXPECTED_OWNER_TOKEN -notmatch '\A[0-9a-f]{64}\z') {
+            throw "Finalizer identity hints are invalid."
+          }
+          $anchors = @(
+            [pscustomobject]@{ Name = ".stickerfit-release-owner"; Sha256 = $env:EXPECTED_MARKER_SHA256; Bytes = $env:EXPECTED_MARKER_BYTES },
+            [pscustomobject]@{ Name = "StickerFit-beta-installer.exe"; Sha256 = $env:EXPECTED_INSTALLER_SHA256; Bytes = $env:EXPECTED_INSTALLER_BYTES },
+            [pscustomobject]@{ Name = "desktop.exe"; Sha256 = $env:EXPECTED_DESKTOP_SHA256; Bytes = $env:EXPECTED_DESKTOP_BYTES },
+            [pscustomobject]@{ Name = "ffmpeg.exe"; Sha256 = $env:EXPECTED_FFMPEG_SHA256; Bytes = $env:EXPECTED_FFMPEG_BYTES },
+            [pscustomobject]@{ Name = "LICENSE-ffmpeg.txt"; Sha256 = $env:EXPECTED_LICENSE_SHA256; Bytes = $env:EXPECTED_LICENSE_BYTES },
+            [pscustomobject]@{ Name = "ffmpeg-provenance.json"; Sha256 = $env:EXPECTED_PROVENANCE_SHA256; Bytes = $env:EXPECTED_PROVENANCE_BYTES },
+            [pscustomobject]@{ Name = "size-report.json"; Sha256 = $env:EXPECTED_REPORT_SHA256; Bytes = $env:EXPECTED_REPORT_BYTES },
+            [pscustomobject]@{ Name = "release-verification.json"; Sha256 = $env:EXPECTED_MANIFEST_SHA256; Bytes = $env:EXPECTED_MANIFEST_BYTES }
+          )
+          $maximumBytes = @{
+            ".stickerfit-release-owner" = 128L
+            "StickerFit-beta-installer.exe" = 1GB
+            "desktop.exe" = 512MB
+            "ffmpeg.exe" = 512MB
+            "LICENSE-ffmpeg.txt" = 4MB
+            "ffmpeg-provenance.json" = 4MB
+            "size-report.json" = 4MB
+            "release-verification.json" = 1MB
+          }
+          foreach ($anchor in $anchors) {
+            [long]$parsedBytes = 0
+            if ($anchor.Sha256 -notmatch '\A[0-9a-f]{64}\z' -or
+                $anchor.Bytes -notmatch '\A[1-9][0-9]*\z' -or
+                -not [long]::TryParse([string]$anchor.Bytes, [ref]$parsedBytes) -or
+                $parsedBytes -gt [long]$maximumBytes[$anchor.Name]) {
+              throw "Build transfer hint is invalid: $($anchor.Name)"
+            }
+          }
+
+          $runnerTemp = Assert-RegularDirectoryChain -Path $env:RUNNER_TEMP
+          $transferRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $runnerTemp ".release-transfer-$env:RUN_ID-$env:RUN_ATTEMPT")
+          ).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+          if (-not [string]::Equals([System.IO.Path]::GetDirectoryName($transferRoot), $runnerTemp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Downloaded transfer root escaped RUNNER_TEMP."
+          }
+          $transferRoot = Assert-RegularDirectoryChain -Path $transferRoot
+          $children = @(Get-ChildItem -LiteralPath $transferRoot -Force)
+          $expectedNames = @($anchors.Name | Sort-Object)
+          if (@($children | Where-Object {
+                $_.PSIsContainer -or
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+              }).Count -ne 0 -or
+              $null -ne (Compare-Object -CaseSensitive -ReferenceObject $expectedNames -DifferenceObject @($children.Name | Sort-Object))) {
+            throw "Downloaded transfer membership is invalid."
+          }
+          foreach ($anchor in $anchors) {
+            $file = Get-RegularFlatFile -Root $transferRoot -Name $anchor.Name
+            Assert-FileIdentity -File $file -Sha256 $anchor.Sha256 -Bytes ([long]$anchor.Bytes) -Label $anchor.Name
+          }
+          $ownerMarker = Get-RegularFlatFile -Root $transferRoot -Name ".stickerfit-release-owner"
+          if ((Get-Content -Raw -LiteralPath $ownerMarker.FullName) -ne "stickerfit-release-v1:$env:EXPECTED_OWNER_TOKEN") {
+            throw "Downloaded transfer ownership hint is invalid."
+          }
+
+          $policyRoot = Assert-RegularDirectoryChain -Path ([System.IO.Path]::GetFullPath("policy"))
+          $candidateRoot = Assert-RegularDirectoryChain -Path ([System.IO.Path]::GetFullPath("candidate"))
+          Assert-CheckoutIntegrity `
+            -Root $policyRoot `
+            -ExpectedCommit $env:WORKFLOW_SHA `
+            -Label "Policy" `
+            -CriticalPaths @(
+              ".gitattributes",
+              "src-tauri/Cargo.toml",
+              "src-tauri/tauri.conf.json",
+              "tools/test-release-sidecar.ps1",
+              "tools/ffmpeg/FfmpegSourceVerification.psm1",
+              "tools/ffmpeg/ffmpeg-release-signing-key.asc",
+              "tools/ffmpeg/ffmpeg-version.json"
+            )
+          Assert-CheckoutIntegrity `
+            -Root $candidateRoot `
+            -ExpectedCommit $env:REQUESTED_COMMIT `
+            -Label "Candidate" `
+            -CriticalPaths @(
+              ".gitattributes",
+              "src-tauri/Cargo.toml",
+              "src-tauri/tauri.conf.json",
+              "src-tauri/binaries/LICENSE-ffmpeg.txt",
+              "src-tauri/binaries/ffmpeg-provenance.json",
+              "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe",
+              "tools/ffmpeg/ffmpeg-release-signing-key.asc",
+              "tools/ffmpeg/ffmpeg-version.json"
+            )
+          foreach ($authorityPath in @(
+              "tools/ffmpeg/ffmpeg-release-signing-key.asc",
+              "tools/ffmpeg/ffmpeg-version.json"
+            )) {
+            Assert-MatchingAuthorityBlob `
+              -PolicyRoot $policyRoot `
+              -PolicyCommit $env:WORKFLOW_SHA `
+              -CandidateRoot $candidateRoot `
+              -CandidateCommit $env:REQUESTED_COMMIT `
+              -RelativePath $authorityPath
+          }
+
+          $candidateConfigPath = Join-Path $candidateRoot "src-tauri\tauri.conf.json"
+          $candidateConfig = Get-Content -Raw -LiteralPath $candidateConfigPath | ConvertFrom-Json
+          $candidateBundle = Get-ExactJsonProperty `
+            -Object $candidateConfig `
+            -Name "bundle" `
+            -Label "Candidate Tauri configuration"
+          $candidateResources = Get-ExactJsonProperty `
+            -Object $candidateBundle `
+            -Name "resources" `
+            -Label "Candidate Tauri bundle"
+          if ($candidateResources -isnot [pscustomobject]) {
+            throw "Candidate Tauri resources must be an exact JSON object."
+          }
+          $candidateResourceProperties = @($candidateResources.PSObject.Properties | Where-Object {
+              $_.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty
+            })
+          if ($candidateResourceProperties.Count -eq 0) {
+            throw "Candidate Tauri resources must not be empty."
+          }
+          $candidateResourceDestinations = New-Object 'System.Collections.Generic.List[string]'
+          $seenResourceDestinations = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+          foreach ($resourceProperty in $candidateResourceProperties) {
+            if ($resourceProperty.Value -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$resourceProperty.Value)) {
+              throw "Candidate Tauri resource destination is invalid: $($resourceProperty.Name)"
+            }
+            $destination = [string]$resourceProperty.Value
+            $normalizedDestination = $destination.Replace('/', '\')
+            if ([System.IO.Path]::IsPathRooted($normalizedDestination) -or
+                $normalizedDestination.StartsWith('\', [System.StringComparison]::Ordinal) -or
+                $normalizedDestination.Contains(':') -or
+                @($normalizedDestination.Split([char]'\') | Where-Object {
+                    [string]::IsNullOrWhiteSpace($_) -or $_ -eq '.' -or $_ -eq '..'
+                  }).Count -ne 0 -or
+                -not $seenResourceDestinations.Add($normalizedDestination)) {
+              throw "Candidate Tauri resource destination is unsafe or duplicated: $destination"
+            }
+            $candidateResourceDestinations.Add($destination)
+          }
+          $expectedArtifactCount = 3 + $candidateResourceDestinations.Count
+
+          $installerFile = Get-RegularFlatFile -Root $transferRoot -Name "StickerFit-beta-installer.exe"
+          $desktopFile = Get-RegularFlatFile -Root $transferRoot -Name "desktop.exe"
+          $ffmpegFile = Get-RegularFlatFile -Root $transferRoot -Name "ffmpeg.exe"
+          $licenseFile = Get-RegularFlatFile -Root $transferRoot -Name "LICENSE-ffmpeg.txt"
+          $provenanceFile = Get-RegularFlatFile -Root $transferRoot -Name "ffmpeg-provenance.json"
+          $reportFile = Get-RegularFlatFile -Root $transferRoot -Name "size-report.json"
+          $installerSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerFile.FullName).Hash.ToLowerInvariant()
+          $reportSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $reportFile.FullName).Hash.ToLowerInvariant()
+          $sizeReportJson = Get-Content -Raw -LiteralPath $reportFile.FullName
+          Assert-StrictJsonText -Json $sizeReportJson -Label "Size report"
+          $sizeReport = $sizeReportJson | ConvertFrom-Json
+          Assert-ExactJsonProperties `
+            -Object $sizeReport `
+            -Names @("schemaVersion", "generatedAtUtc", "commitSha", "installedFootprintBytes", "installedFootprintMiB", "artifacts", "webDist") `
+            -Label "Size report"
+          $reportSchemaVersion = Get-ExactJsonProperty -Object $sizeReport -Name "schemaVersion" -Label "Size report"
+          $reportGeneratedAtUtc = Get-ExactJsonProperty -Object $sizeReport -Name "generatedAtUtc" -Label "Size report"
+          $reportCommit = Get-ExactJsonProperty -Object $sizeReport -Name "commitSha" -Label "Size report"
+          $reportInstalledBytes = Get-ExactJsonProperty -Object $sizeReport -Name "installedFootprintBytes" -Label "Size report"
+          $reportInstalledMiB = Get-ExactJsonProperty -Object $sizeReport -Name "installedFootprintMiB" -Label "Size report"
+          $reportArtifacts = Get-ExactJsonProperty -Object $sizeReport -Name "artifacts" -Label "Size report"
+          $reportWebDist = Get-ExactJsonProperty -Object $sizeReport -Name "webDist" -Label "Size report"
+          [datetime]$generatedAt = [datetime]::MinValue
+          $generatedAtText = if ($reportGeneratedAtUtc -is [datetime]) {
+            ([datetime]$reportGeneratedAtUtc).ToUniversalTime().ToString("o")
+          }
+          elseif ($reportGeneratedAtUtc -is [string]) {
+            [string]$reportGeneratedAtUtc
+          }
+          else {
+            ""
+          }
+          $generatedAtValid = $generatedAtText -match '\A\d{4}-\d{2}-\d{2}T.*Z\z' -and
+            [datetime]::TryParseExact(
+              $generatedAtText,
+              "o",
+              [System.Globalization.CultureInfo]::InvariantCulture,
+              [System.Globalization.DateTimeStyles]::RoundtripKind,
+              [ref]$generatedAt
+            )
+          if (($reportSchemaVersion -isnot [int] -and $reportSchemaVersion -isnot [long]) -or
+              [long]$reportSchemaVersion -ne 1 -or
+              -not $generatedAtValid -or
+              $reportCommit -isnot [string] -or
+              $reportCommit -notmatch '\A[0-9a-f]{40}\z' -or
+              -not [string]::Equals([string]$reportCommit, $env:REQUESTED_COMMIT.ToLowerInvariant(), [System.StringComparison]::Ordinal) -or
+              ($reportInstalledBytes -isnot [int] -and $reportInstalledBytes -isnot [long]) -or
+              [long]$reportInstalledBytes -le 0 -or
+              ($reportInstalledMiB -isnot [double] -and $reportInstalledMiB -isnot [decimal] -and $reportInstalledMiB -isnot [int] -and $reportInstalledMiB -isnot [long]) -or
+              -not [double]::IsFinite([double]$reportInstalledMiB) -or
+              [double]$reportInstalledMiB -lt 0 -or
+              $reportArtifacts -isnot [System.Array] -or
+              $reportArtifacts.Count -ne $expectedArtifactCount -or
+              $null -ne $reportWebDist) {
+            throw "Size report does not independently bind the downloaded installer and commit."
+          }
+
+          $artifactRecords = New-Object System.Collections.Generic.List[object]
+          foreach ($artifact in $reportArtifacts) {
+            Assert-ExactJsonProperties `
+              -Object $artifact `
+              -Names @("label", "kind", "path", "bytes", "sizeMiB", "sha256") `
+              -Label "Size report artifact"
+            $record = [pscustomobject]@{
+              label = Get-ExactJsonProperty -Object $artifact -Name "label" -Label "Size report artifact"
+              kind = Get-ExactJsonProperty -Object $artifact -Name "kind" -Label "Size report artifact"
+              path = Get-ExactJsonProperty -Object $artifact -Name "path" -Label "Size report artifact"
+              bytes = Get-ExactJsonProperty -Object $artifact -Name "bytes" -Label "Size report artifact"
+              sizeMiB = Get-ExactJsonProperty -Object $artifact -Name "sizeMiB" -Label "Size report artifact"
+              sha256 = Get-ExactJsonProperty -Object $artifact -Name "sha256" -Label "Size report artifact"
+            }
+            if ($record.label -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$record.label) -or
+                $record.kind -isnot [string] -or
+                $record.kind -notin @("desktop", "sidecar", "resource", "installer") -or
+                $record.path -isnot [string] -or
+                -not [System.IO.Path]::IsPathRooted([string]$record.path) -or
+                ($record.bytes -isnot [int] -and $record.bytes -isnot [long]) -or
+                [long]$record.bytes -le 0 -or
+                ($record.sizeMiB -isnot [double] -and $record.sizeMiB -isnot [decimal] -and $record.sizeMiB -isnot [int] -and $record.sizeMiB -isnot [long]) -or
+                -not [double]::IsFinite([double]$record.sizeMiB) -or
+                [double]$record.sizeMiB -lt 0 -or
+                $record.sha256 -isnot [string] -or
+                $record.sha256 -notmatch '\A[0-9a-f]{64}\z' -or
+                [math]::Abs(
+                  [double]$record.sizeMiB - [math]::Round(([long]$record.bytes / 1MB), 2)
+                ) -gt 0.000000001) {
+              throw "Size report artifact schema or value is invalid."
+            }
+            $artifactRecords.Add($record)
+          }
+          $expectedKindCounts = [ordered]@{
+            desktop = 1
+            sidecar = 1
+            resource = $candidateResourceDestinations.Count
+            installer = 1
+          }
+          foreach ($expectedKind in $expectedKindCounts.Keys) {
+            if (@($artifactRecords | Where-Object {
+                  [string]::Equals($_.kind, $expectedKind, [System.StringComparison]::Ordinal)
+                }).Count -ne $expectedKindCounts[$expectedKind]) {
+              throw "Size report artifact kind membership is invalid."
+            }
+          }
+
+          [long]$computedInstalledBytes = 0
+          foreach ($runtimeRecord in @($artifactRecords | Where-Object {
+                -not [string]::Equals($_.kind, "installer", [System.StringComparison]::Ordinal)
+              })) {
+            if ([long]$runtimeRecord.bytes -gt ([long]::MaxValue - $computedInstalledBytes)) {
+              throw "Size report installed footprint overflows Int64."
+            }
+            $computedInstalledBytes += [long]$runtimeRecord.bytes
+          }
+          $computedInstalledMiB = [math]::Round(($computedInstalledBytes / 1MB), 2)
+          if ([long]$reportInstalledBytes -ne $computedInstalledBytes -or
+              [math]::Abs([double]$reportInstalledMiB - [double]$computedInstalledMiB) -gt 0.000000001) {
+            throw "Size report installed footprint totals are inconsistent."
+          }
+
+          $separator = [System.IO.Path]::DirectorySeparatorChar
+          $releaseSuffix = "${separator}src-tauri${separator}target${separator}release"
+          $desktopRecords = @($artifactRecords | Where-Object {
+              [string]::Equals($_.kind, "desktop", [System.StringComparison]::Ordinal)
+            })
+          if ($desktopRecords.Count -ne 1 -or
+              -not [string]::Equals([string]$desktopRecords[0].label, "desktop.exe", [System.StringComparison]::Ordinal) -or
+              -not ([string]$desktopRecords[0].path).EndsWith("$releaseSuffix${separator}desktop.exe", [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals(
+                [string]$desktopRecords[0].sha256,
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $desktopFile.FullName).Hash.ToLowerInvariant(),
+                [System.StringComparison]::Ordinal
+              ) -or
+              [long]$desktopRecords[0].bytes -ne [long]$desktopFile.Length) {
+            throw "Size report desktop identity is invalid."
+          }
+
+          $sidecarRecords = @($artifactRecords | Where-Object {
+              [string]::Equals($_.kind, "sidecar", [System.StringComparison]::Ordinal)
+            })
+          if ($sidecarRecords.Count -ne 1 -or
+              -not [string]::Equals([string]$sidecarRecords[0].label, "packaged ffmpeg sidecar", [System.StringComparison]::Ordinal) -or
+              -not ([string]$sidecarRecords[0].path).EndsWith("$releaseSuffix${separator}ffmpeg.exe", [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals(
+                [string]$sidecarRecords[0].sha256,
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $ffmpegFile.FullName).Hash.ToLowerInvariant(),
+                [System.StringComparison]::Ordinal
+              ) -or
+              [long]$sidecarRecords[0].bytes -ne [long]$ffmpegFile.Length) {
+            throw "Size report FFmpeg sidecar identity is invalid."
+          }
+
+          $resourceRecords = @($artifactRecords | Where-Object {
+              [string]::Equals($_.kind, "resource", [System.StringComparison]::Ordinal)
+            })
+          foreach ($destination in $candidateResourceDestinations) {
+            $normalizedDestination = $destination.Replace('/', $separator)
+            $expectedLabel = "packaged resource: $destination"
+            $expectedSuffix = "$releaseSuffix$separator$normalizedDestination"
+            $matchingRecords = @($resourceRecords | Where-Object {
+                [string]::Equals([string]$_.label, $expectedLabel, [System.StringComparison]::Ordinal) -and
+                ([string]$_.path).EndsWith($expectedSuffix, [System.StringComparison]::OrdinalIgnoreCase)
+              })
+            if ($matchingRecords.Count -ne 1) {
+              throw "Size report resource membership is invalid: $destination"
+            }
+            $transferredResource = if ([string]::Equals($destination, "LICENSE-ffmpeg.txt", [System.StringComparison]::Ordinal)) {
+              $licenseFile
+            }
+            elseif ([string]::Equals($destination, "ffmpeg-provenance.json", [System.StringComparison]::Ordinal)) {
+              $provenanceFile
+            }
+            else {
+              throw "Release size report contains an untransferred resource: $destination"
+            }
+            $transferredResourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $transferredResource.FullName).Hash.ToLowerInvariant()
+            if (-not [string]::Equals([string]$matchingRecords[0].sha256, $transferredResourceHash, [System.StringComparison]::Ordinal) -or
+                [long]$matchingRecords[0].bytes -ne [long]$transferredResource.Length) {
+              throw "Size report resource identity is invalid: $destination"
+            }
+          }
+
+          $installerRecords = @($artifactRecords | Where-Object {
+              [string]::Equals($_.kind, "installer", [System.StringComparison]::Ordinal)
+            })
+          $reportedInstallerPath = [string]$installerRecords[0].path
+          $reportedInstallerName = [System.IO.Path]::GetFileName($reportedInstallerPath)
+          $reportedInstallerSuffix = "$releaseSuffix${separator}bundle${separator}nsis${separator}$reportedInstallerName"
+          if ($installerRecords.Count -ne 1 -or
+              -not [string]::Equals([string]$installerRecords[0].label, "NSIS bundle", [System.StringComparison]::Ordinal) -or
+              $reportedInstallerName -notmatch '\AStickerFit_[0-9A-Za-z._+-]+_x64-setup\.exe\z' -or
+              -not $reportedInstallerPath.EndsWith($reportedInstallerSuffix, [System.StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals([string]$installerRecords[0].sha256, $installerSha256, [System.StringComparison]::Ordinal) -or
+              [long]$installerRecords[0].bytes -ne [long]$installerFile.Length) {
+            throw "Size report installer identity is invalid."
+          }
+
+          # The transferred manifest is descriptive only. Compare it against
+          # independently computed identities; never use it as an authority.
+          $transferManifestFile = Get-RegularFlatFile -Root $transferRoot -Name "release-verification.json"
+          $transferManifestJson = Get-Content -Raw -LiteralPath $transferManifestFile.FullName
+          Assert-StrictJsonText -Json $transferManifestJson -Label "Transferred descriptive manifest"
+          $transferManifest = $transferManifestJson | ConvertFrom-Json
+          if (($transferManifest.schemaVersion -isnot [int] -and $transferManifest.schemaVersion -isnot [long]) -or
+              [long]$transferManifest.schemaVersion -ne 1 -or
+              $transferManifest.sourceCommit -isnot [string] -or
+              -not [string]::Equals([string]$transferManifest.sourceCommit, $env:REQUESTED_COMMIT, [System.StringComparison]::OrdinalIgnoreCase) -or
+              $transferManifest.sourceInstallerName -isnot [string] -or
+              [string]::IsNullOrWhiteSpace([string]$transferManifest.sourceInstallerName)) {
+            throw "Transferred descriptive manifest identity is invalid."
+          }
+          if (-not [string]::Equals(
+              [System.IO.Path]::GetFileName([string]$installerRecords[0].path),
+              [string]$transferManifest.sourceInstallerName,
+              [System.StringComparison]::Ordinal
+            )) {
+            throw "Size-report installer path disagrees with the descriptive source installer name."
+          }
+          foreach ($recordName in @("installer", "sizeReport")) {
+            $record = $transferManifest.$recordName
+            $expectedFile = if ($recordName -eq "installer") { "StickerFit-beta-installer.exe" } else { "size-report.json" }
+            $expectedSha256 = if ($recordName -eq "installer") { $installerSha256 } else { $reportSha256 }
+            $expectedBytes = if ($recordName -eq "installer") { [long]$installerFile.Length } else { [long]$reportFile.Length }
+            if ($record.file -isnot [string] -or
+                -not [string]::Equals([string]$record.file, $expectedFile, [System.StringComparison]::Ordinal) -or
+                $record.sha256 -isnot [string] -or
+                -not [string]::Equals([string]$record.sha256, $expectedSha256, [System.StringComparison]::Ordinal) -or
+                ($record.bytes -isnot [int] -and $record.bytes -isnot [long]) -or
+                [long]$record.bytes -ne $expectedBytes) {
+              throw "Transferred descriptive manifest disagrees with independent $recordName identity."
+            }
+          }
+
+          $srcTauriRoot = Assert-RegularDirectoryChain -Path (Join-Path $candidateRoot "src-tauri")
+          $targetCollisions = @(Get-ChildItem -LiteralPath $srcTauriRoot -Force | Where-Object {
+              [string]::Equals($_.Name, "target", [System.StringComparison]::OrdinalIgnoreCase)
+            })
+          if ($targetCollisions.Count -ne 0) { throw "Fresh candidate checkout unexpectedly contains src-tauri/target." }
+          $canonicalReleaseRoot = Join-Path $srcTauriRoot "target\release"
+          $canonicalNsisRoot = Join-Path $canonicalReleaseRoot "bundle\nsis"
+          [void][System.IO.Directory]::CreateDirectory($canonicalNsisRoot)
+          [void](Assert-RegularDirectoryChain -Path $canonicalNsisRoot)
+
+          $copyMap = @(
+            [pscustomobject]@{ Name = "StickerFit-beta-installer.exe"; Destination = (Join-Path $canonicalNsisRoot "StickerFit-beta-installer.exe") },
+            [pscustomobject]@{ Name = "desktop.exe"; Destination = (Join-Path $canonicalReleaseRoot "desktop.exe") },
+            [pscustomobject]@{ Name = "ffmpeg.exe"; Destination = (Join-Path $canonicalReleaseRoot "ffmpeg.exe") },
+            [pscustomobject]@{ Name = "LICENSE-ffmpeg.txt"; Destination = (Join-Path $canonicalReleaseRoot "LICENSE-ffmpeg.txt") },
+            [pscustomobject]@{ Name = "ffmpeg-provenance.json"; Destination = (Join-Path $canonicalReleaseRoot "ffmpeg-provenance.json") }
+          )
+          foreach ($copy in $copyMap) {
+            $source = Get-RegularFlatFile -Root $transferRoot -Name $copy.Name
+            [System.IO.File]::Copy($source.FullName, $copy.Destination, $false)
+            $destination = Get-Item -LiteralPath $copy.Destination -Force
+            if ($destination.PSIsContainer -or ($destination.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Canonical candidate copy is not a regular file: $($copy.Name)"
+            }
+            $sourceSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $source.FullName).Hash.ToLowerInvariant()
+            Assert-FileIdentity -File $destination -Sha256 $sourceSha256 -Bytes ([long]$source.Length) -Label $copy.Name
+          }
+
+          $policyScript = Join-Path $policyRoot "tools\test-release-sidecar.ps1"
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path -LiteralPath $policyScript -PathType Leaf) -or
+              ((Get-Item -LiteralPath $policyScript -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+              -not (Test-Path -LiteralPath $sevenZip -PathType Leaf) -or
+              ((Get-Item -LiteralPath $sevenZip -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Current protected verifier or canonical 7-Zip is unavailable."
+          }
+          $policyArguments = @{
+            WorkspaceRoot = $candidateRoot
+            PolicyRoot = $policyRoot
+            StaticOnly = $true
+            RequireNonLegacyProvenance = $true
+            InstallerPath = (Join-Path $canonicalNsisRoot "StickerFit-beta-installer.exe")
+            SevenZipPath = $sevenZip
+          }
+          $githubOutputPath = $env:GITHUB_OUTPUT
+          $githubEnvPath = $env:GITHUB_ENV
+          try {
+            Remove-Item Env:GITHUB_OUTPUT -ErrorAction SilentlyContinue
+            Remove-Item Env:GITHUB_ENV -ErrorAction SilentlyContinue
+            & $policyScript @policyArguments
+          }
+          finally {
+            $env:GITHUB_OUTPUT = $githubOutputPath
+            $env:GITHUB_ENV = $githubEnvPath
+          }
+
+          foreach ($anchor in $anchors) {
+            $file = Get-RegularFlatFile -Root $transferRoot -Name $anchor.Name
+            Assert-FileIdentity -File $file -Sha256 $anchor.Sha256 -Bytes ([long]$anchor.Bytes) -Label $anchor.Name
+          }
+          foreach ($copy in $copyMap) {
+            $source = Get-RegularFlatFile -Root $transferRoot -Name $copy.Name
+            $destination = Get-Item -LiteralPath $copy.Destination -Force
+            if ($destination.PSIsContainer -or
+                ($destination.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Canonical candidate copy changed type: $($copy.Name)"
+            }
+            $sourceSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $source.FullName).Hash.ToLowerInvariant()
+            Assert-FileIdentity -File $destination -Sha256 $sourceSha256 -Bytes ([long]$source.Length) -Label $copy.Name
+          }
+          foreach ($checkout in @($policyRoot, $candidateRoot)) {
+            $tracked = (& git -C $checkout status --short --untracked-files=no)
+            if ($LASTEXITCODE -ne 0 -or $tracked) { throw "Static finalizer changed tracked files: $tracked" }
+          }
+
+          $finalRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $runnerTemp ".verified-final-$env:RUN_ID-$env:RUN_ATTEMPT")
+          ).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+          if (-not [string]::Equals([System.IO.Path]::GetDirectoryName($finalRoot), $runnerTemp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Final publication root escaped RUNNER_TEMP."
+          }
+          $finalName = [System.IO.Path]::GetFileName($finalRoot)
+          if (@(Get-ChildItem -LiteralPath $runnerTemp -Force | Where-Object {
+                [string]::Equals($_.Name, $finalName, [System.StringComparison]::OrdinalIgnoreCase)
+              }).Count -ne 0) {
+            throw "Fresh final publication root already exists."
+          }
+          [void][System.IO.Directory]::CreateDirectory($finalRoot)
+          $finalRoot = Assert-RegularDirectoryChain -Path $finalRoot
+
+          $finalOwnerBytes = [byte[]]::new(32)
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($finalOwnerBytes)
+          $finalOwnerToken = [System.Convert]::ToHexString($finalOwnerBytes).ToLowerInvariant()
+          Write-NewUtf8File -Path (Join-Path $finalRoot ".stickerfit-final-owner") -Content "stickerfit-final-v1:$finalOwnerToken"
+          [System.IO.File]::Copy($installerFile.FullName, (Join-Path $finalRoot "StickerFit-beta-installer.exe"), $false)
+          [System.IO.File]::Copy($reportFile.FullName, (Join-Path $finalRoot "size-report.json"), $false)
+          $finalInstaller = Get-RegularFlatFile -Root $finalRoot -Name "StickerFit-beta-installer.exe"
+          $finalReport = Get-RegularFlatFile -Root $finalRoot -Name "size-report.json"
+          Assert-FileIdentity -File $finalInstaller -Sha256 $installerSha256 -Bytes ([long]$installerFile.Length) -Label "final installer"
+          Assert-FileIdentity -File $finalReport -Sha256 $reportSha256 -Bytes ([long]$reportFile.Length) -Label "final size report"
+
+          $finalManifest = [ordered]@{
+            schemaVersion = 1
+            sourceCommit = $env:REQUESTED_COMMIT.ToLowerInvariant()
+            policyCommit = $env:WORKFLOW_SHA.ToLowerInvariant()
+            installer = [ordered]@{
+              file = "StickerFit-beta-installer.exe"
+              sha256 = $installerSha256
+              bytes = [long]$finalInstaller.Length
+            }
+            sizeReport = [ordered]@{
+              file = "size-report.json"
+              sha256 = $reportSha256
+              bytes = [long]$finalReport.Length
+            }
+          }
+          $finalManifestPath = Join-Path $finalRoot "release-verification.json"
+          Write-NewUtf8File -Path $finalManifestPath -Content ($finalManifest | ConvertTo-Json -Depth 8)
+          $finalManifestFile = Get-RegularFlatFile -Root $finalRoot -Name "release-verification.json"
+          $finalManifestSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $finalManifestFile.FullName).Hash.ToLowerInvariant()
+
+          $finalExpectedNames = @(
+            ".stickerfit-final-owner",
+            "StickerFit-beta-installer.exe",
+            "release-verification.json",
+            "size-report.json"
+          ) | Sort-Object
+          $finalChildren = @(Get-ChildItem -LiteralPath $finalRoot -Force)
+          if (@($finalChildren | Where-Object {
+                $_.PSIsContainer -or
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+              }).Count -ne 0 -or
+              $null -ne (Compare-Object -CaseSensitive -ReferenceObject $finalExpectedNames -DifferenceObject @($finalChildren.Name | Sort-Object))) {
+            throw "Final publication staging membership is invalid."
+          }
+          [void](Assert-RegularDirectoryChain -Path $finalRoot)
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "owner_token=$finalOwnerToken"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "installer_sha256=$installerSha256"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "installer_bytes=$([long]$finalInstaller.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "report_sha256=$reportSha256"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "report_bytes=$([long]$finalReport.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "manifest_sha256=$finalManifestSha256"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "manifest_bytes=$([long]$finalManifestFile.Length)"
+      - name: Reverify finalizer-owned publication staging
+        env:
+          EXPECTED_OWNER_TOKEN: ${{ steps.finalize_release.outputs.owner_token }}
+          EXPECTED_INSTALLER_SHA256: ${{ steps.finalize_release.outputs.installer_sha256 }}
+          EXPECTED_INSTALLER_BYTES: ${{ steps.finalize_release.outputs.installer_bytes }}
+          EXPECTED_REPORT_SHA256: ${{ steps.finalize_release.outputs.report_sha256 }}
+          EXPECTED_REPORT_BYTES: ${{ steps.finalize_release.outputs.report_bytes }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.finalize_release.outputs.manifest_sha256 }}
+          EXPECTED_MANIFEST_BYTES: ${{ steps.finalize_release.outputs.manifest_bytes }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          function Assert-RegularDirectoryChain {
+            param([Parameter(Mandatory = $true)][string]$Path)
+
+            $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd(
+              [System.IO.Path]::DirectorySeparatorChar,
+              [System.IO.Path]::AltDirectorySeparatorChar
+            )
+            $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+            if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Final publication path has no volume root." }
+            $rootItem = Get-Item -LiteralPath $volumeRoot -Force
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Final publication volume root is unsafe."
+            }
+            $relativePath = $fullPath.Substring($volumeRoot.Length)
+            $cursor = $volumeRoot
+            foreach ($segment in @($relativePath -split '[\\/]' | Where-Object { $_.Length -gt 0 })) {
+              $cursor = Join-Path $cursor $segment
+              $item = Get-Item -LiteralPath $cursor -Force
+              if (-not $item.PSIsContainer -or
+                  ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  -not [string]::Equals($item.Name, $segment, [System.StringComparison]::Ordinal)) {
+                throw "Final publication path is unsafe: $cursor"
+              }
+            }
+            return $fullPath
+          }
+
+          if ($env:EXPECTED_OWNER_TOKEN -notmatch '\A[0-9a-f]{64}\z') { throw "Final owner token is invalid." }
+          $runnerTemp = Assert-RegularDirectoryChain -Path $env:RUNNER_TEMP
+          $finalRoot = Assert-RegularDirectoryChain -Path (Join-Path $runnerTemp ".verified-final-$env:RUN_ID-$env:RUN_ATTEMPT")
+          $definitions = @(
+            [pscustomobject]@{ Name = "StickerFit-beta-installer.exe"; Sha256 = $env:EXPECTED_INSTALLER_SHA256; Bytes = $env:EXPECTED_INSTALLER_BYTES },
+            [pscustomobject]@{ Name = "size-report.json"; Sha256 = $env:EXPECTED_REPORT_SHA256; Bytes = $env:EXPECTED_REPORT_BYTES },
+            [pscustomobject]@{ Name = "release-verification.json"; Sha256 = $env:EXPECTED_MANIFEST_SHA256; Bytes = $env:EXPECTED_MANIFEST_BYTES }
+          )
+          foreach ($definition in $definitions) {
+            if ($definition.Sha256 -notmatch '\A[0-9a-f]{64}\z' -or $definition.Bytes -notmatch '\A[1-9][0-9]*\z') {
+              throw "Final publication anchor is invalid: $($definition.Name)"
+            }
+            $file = Get-Item -LiteralPath (Join-Path $finalRoot $definition.Name) -Force
+            $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            if ($file.PSIsContainer -or
+                ($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                -not [string]::Equals($file.Name, $definition.Name, [System.StringComparison]::Ordinal) -or
+                -not [string]::Equals($sha256, $definition.Sha256, [System.StringComparison]::Ordinal) -or
+                [long]$file.Length -ne [long]$definition.Bytes) {
+              throw "Final publication file identity changed: $($definition.Name)"
+            }
+          }
+          $marker = Get-Item -LiteralPath (Join-Path $finalRoot ".stickerfit-final-owner") -Force
+          if ($marker.PSIsContainer -or
+              ($marker.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+              -not [string]::Equals($marker.Name, ".stickerfit-final-owner", [System.StringComparison]::Ordinal) -or
+              (Get-Content -Raw -LiteralPath $marker.FullName) -ne "stickerfit-final-v1:$env:EXPECTED_OWNER_TOKEN") {
+            throw "Final publication ownership changed."
+          }
+          $expectedNames = @(".stickerfit-final-owner", "StickerFit-beta-installer.exe", "release-verification.json", "size-report.json") | Sort-Object
+          $children = @(Get-ChildItem -LiteralPath $finalRoot -Force)
+          if (@($children | Where-Object {
+                $_.PSIsContainer -or
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+              }).Count -ne 0 -or
+              $null -ne (Compare-Object -CaseSensitive -ReferenceObject $expectedNames -DifferenceObject @($children.Name | Sort-Object))) {
+            throw "Final publication staging membership changed."
+          }
+          [void](Assert-RegularDirectoryChain -Path $finalRoot)
+      - name: Upload independently verified beta bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stickerfit-beta-${{ inputs.commitSha }}
+          path: |
+            ${{ runner.temp }}/.verified-final-${{ github.run_id }}-${{ github.run_attempt }}/StickerFit-beta-installer.exe
+            ${{ runner.temp }}/.verified-final-${{ github.run_id }}-${{ github.run_attempt }}/release-verification.json
+            ${{ runner.temp }}/.verified-final-${{ github.run_id }}-${{ github.run_attempt }}/size-report.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 14

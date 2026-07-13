@@ -147,6 +147,7 @@ export type MessagesForLocale = {
   searchDepthStandard: string;
   searchDepthThorough: string;
   advancedDetails: string;
+  cspViolationCount: (count: number) => string;
   topPreviewCandidates: string;
   previewBudgetNote: (budget: number, shown: number) => string;
   noPlanYet: string;
@@ -320,6 +321,7 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     searchDepthStandard: "Standard",
     searchDepthThorough: "Thorough",
     advancedDetails: "Advanced details",
+    cspViolationCount: (count) => `CSP violations: ${count}`,
     topPreviewCandidates: "Top preview candidates",
     previewBudgetNote: (budget, shown) => `Showing only the top ${shown} preview candidates out of ${budget} candidates.`,
     noPlanYet: "Run preview candidates to show the ranked candidates here.",
@@ -496,6 +498,7 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     searchDepthStandard: "기본",
     searchDepthThorough: "꼼꼼하게",
     advancedDetails: "고급 정보",
+    cspViolationCount: (count) => `CSP 위반: ${count}건`,
     topPreviewCandidates: "상위 미리보기 후보",
     previewBudgetNote: (budget, shown) => `${budget}개 후보 중 상위 ${shown}개 미리보기 후보만 보여줍니다.`,
     noPlanYet: "후보 미리보기를 실행하면 이곳에 정렬된 후보들이 표시됩니다.",

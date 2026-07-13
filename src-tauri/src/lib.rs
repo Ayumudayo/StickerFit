@@ -1,5 +1,7 @@
 mod estimation;
 mod frame_source;
+#[cfg(test)]
+mod generated_media_tests;
 mod locale;
 mod media_error;
 mod media_limits;

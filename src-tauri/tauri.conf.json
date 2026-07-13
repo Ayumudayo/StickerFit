@@ -20,7 +20,8 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; script-src 'self'",
+      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420 http://127.0.0.1:1420 ws://localhost:1420 ws://127.0.0.1:1420; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; script-src 'self'",
       "assetProtocol": {
         "enable": true,
         "scope": []
@@ -38,7 +39,10 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "binaries/libwinpthread-1.dll": "libwinpthread-1.dll"
+      "binaries/libwinpthread-1.dll": "libwinpthread-1.dll",
+      "binaries/LICENSE-ffmpeg.txt": "LICENSE-ffmpeg.txt",
+      "binaries/LICENSE-libwinpthread.txt": "LICENSE-libwinpthread.txt",
+      "binaries/ffmpeg-provenance.json": "ffmpeg-provenance.json"
     },
     "externalBin": [
       "binaries/ffmpeg"
