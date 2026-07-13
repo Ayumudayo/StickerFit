@@ -1,10 +1,31 @@
 [CmdletBinding()]
 param(
-    [string]$WorkspaceRoot = (Join-Path $PSScriptRoot '..')
+    [string]$WorkspaceRoot
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+function Get-Sha256Hex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath
+    )
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey('WorkspaceRoot')) {
+    $WorkspaceRoot = Join-Path $PSScriptRoot '..'
+}
 
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
 $fixtureDirectory = Join-Path $WorkspaceRoot 'src-tauri\tests\fixtures'
@@ -61,7 +82,7 @@ $license = Get-Item -LiteralPath $licensePath
 if ($license.Length -ne 1458L) {
     throw "Generated-media fixture license size mismatch: expected 1458, got $($license.Length)."
 }
-$licenseHash = (Get-FileHash -LiteralPath $licensePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$licenseHash = Get-Sha256Hex -LiteralPath $licensePath
 if ($licenseHash -ne '8c19aaf4ec1d6a59bb2c946461110cc5aac2bdc5b9d2d79336e46354fc9f1d8a') {
     throw 'Generated-media fixture license SHA-256 mismatch.'
 }
@@ -111,7 +132,7 @@ foreach ($entry in $entries) {
     if ($item.Length -ne $contract.SizeBytes) {
         throw "Generated-media fixture size mismatch for ${name}: expected $($contract.SizeBytes), got $($item.Length)."
     }
-    $actualHash = (Get-FileHash -LiteralPath $fixturePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = Get-Sha256Hex -LiteralPath $fixturePath
     if ($actualHash -ne $contract.Sha256) {
         throw "Generated-media fixture SHA-256 mismatch for $name."
     }

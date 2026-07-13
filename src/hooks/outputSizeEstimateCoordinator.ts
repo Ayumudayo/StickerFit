@@ -13,6 +13,7 @@ import type {
 import type { VersionedWorkflowState } from "./mediaWorkflow/workflowFingerprint";
 
 const DEFAULT_ESTIMATE_DEBOUNCE_MS = 400;
+const MAX_EXACT_ESTIMATE_CACHE_ENTRIES = 20;
 
 export type VersionedProbeState =
   | { status: "idle"; fingerprint: string; revision: number }
@@ -51,22 +52,19 @@ export type VersionedProbeState =
 export type OutputEstimateCoordinatorState = {
   estimate: VersionedWorkflowState<OutputSizeEstimate[], OperationProgress>;
   probe: VersionedProbeState;
+  exactEstimateCache: ReadonlyMap<string, ExactCandidateSizeEstimate>;
 };
 
 export type EstimateSchedule = Readonly<{
   fingerprint: string;
   requestKey: string;
-  run: (
-    options: MediaOperationOptions,
-  ) => Promise<OutputSizeEstimate[]>;
+  run: (options: MediaOperationOptions) => Promise<OutputSizeEstimate[]>;
 }>;
 
 export type ProbeSchedule = Readonly<{
   fingerprint: string;
   candidateId: string;
-  run: (
-    options: MediaOperationOptions,
-  ) => Promise<ExactCandidateSizeEstimate>;
+  run: (options: MediaOperationOptions) => Promise<ExactCandidateSizeEstimate>;
 }>;
 
 export type OutputSizeEstimateCoordinator = {
@@ -102,6 +100,7 @@ function initialState(fingerprint: string): OutputEstimateCoordinatorState {
       revision: 0,
       fingerprint,
     },
+    exactEstimateCache: new Map(),
   };
 }
 
@@ -128,7 +127,10 @@ export function selectCandidatesForEstimate(
   const selected: OptimizerCandidatePreview[] = [];
   const selectedIds = new Set<string>();
 
-  for (const candidate of [...byRank.slice(0, 3), ...byRelativeSize.slice(0, 2)]) {
+  for (const candidate of [
+    ...byRank.slice(0, 3),
+    ...byRelativeSize.slice(0, 2),
+  ]) {
     if (selectedIds.has(candidate.id)) continue;
     selectedIds.add(candidate.id);
     selected.push(candidate);
@@ -145,6 +147,29 @@ export function sampleSeedFromFingerprint(fingerprint: string) {
     hash = BigInt.asUintN(64, hash * 0x100000001b3n);
   }
   return hash.toString(16).padStart(16, "0");
+}
+
+export function exactEstimateCacheKey(
+  fingerprint: string,
+  candidateId: string,
+) {
+  return JSON.stringify([fingerprint, candidateId]);
+}
+
+function cacheExactEstimate(
+  cache: ReadonlyMap<string, ExactCandidateSizeEstimate>,
+  key: string,
+  value: ExactCandidateSizeEstimate,
+) {
+  const next = new Map(cache);
+  next.delete(key);
+  next.set(key, value);
+  while (next.size > MAX_EXACT_ESTIMATE_CACHE_ENTRIES) {
+    const oldestKey = next.keys().next().value;
+    if (oldestKey === undefined) break;
+    next.delete(oldestKey);
+  }
+  return next;
 }
 
 export function createOutputSizeEstimateCoordinator({
@@ -242,75 +267,90 @@ export function createOutputSizeEstimateCoordinator({
       progress: null,
     });
 
-    estimateTimer = globalThis.setTimeout(() => {
-      estimateTimer = null;
-      if (!estimateIsCurrent(fingerprint, requestKey, revision)) return;
+    estimateTimer = globalThis.setTimeout(
+      () => {
+        estimateTimer = null;
+        if (!estimateIsCurrent(fingerprint, requestKey, revision)) return;
 
-      const currentSchedule = lastEstimateSchedule;
-      if (
-        currentSchedule === null ||
-        currentSchedule.fingerprint !== fingerprint ||
-        currentSchedule.requestKey !== requestKey
-      ) {
-        return;
-      }
+        const currentSchedule = lastEstimateSchedule;
+        if (
+          currentSchedule === null ||
+          currentSchedule.fingerprint !== fingerprint ||
+          currentSchedule.requestKey !== requestKey
+        ) {
+          return;
+        }
 
-      const controller = new AbortController();
-      estimateController = controller;
-      const options: MediaOperationOptions = {
-        operationId: createOperationId(),
-        signal: controller.signal,
-        onProgress: (progress) => {
-          if (!estimateIsCurrent(fingerprint, requestKey, revision, controller)) return;
-          const current = state.estimate;
-          if (
-            current.status !== "loading" ||
-            current.revision !== revision ||
-            current.fingerprint !== fingerprint
-          ) {
-            return;
-          }
-          setEstimate({ ...current, progress });
-        },
-      };
+        const controller = new AbortController();
+        estimateController = controller;
+        const options: MediaOperationOptions = {
+          operationId: createOperationId(),
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (
+              !estimateIsCurrent(fingerprint, requestKey, revision, controller)
+            )
+              return;
+            const current = state.estimate;
+            if (
+              current.status !== "loading" ||
+              current.revision !== revision ||
+              current.fingerprint !== fingerprint
+            ) {
+              return;
+            }
+            setEstimate({ ...current, progress });
+          },
+        };
 
-      void Promise.resolve()
-        .then(() => currentSchedule.run(options))
-        .then((value) => {
-          if (!estimateIsCurrent(fingerprint, requestKey, revision, controller)) return;
-          setEstimate({
-            status: "ready",
-            revision,
-            fingerprint,
-            value,
-          });
-        })
-        .catch((error: unknown) => {
-          if (!estimateIsCurrent(fingerprint, requestKey, revision, controller)) return;
-          const normalized = normalizeError(error);
-          if (controller.signal.aborted || normalized.errorCode === "cancelled") {
+        void Promise.resolve()
+          .then(() => currentSchedule.run(options))
+          .then((value) => {
+            if (
+              !estimateIsCurrent(fingerprint, requestKey, revision, controller)
+            )
+              return;
             setEstimate({
-              status: "cancelled",
+              status: "ready",
               revision,
               fingerprint,
+              value,
             });
-            return;
-          }
-          setEstimate({
-            status: "error",
-            revision,
-            fingerprint,
-            code: normalizedErrorCode(normalized),
-            reasonCode: normalized.reasonCode,
-            message: normalized.diagnostics ?? "",
+          })
+          .catch((error: unknown) => {
+            if (
+              !estimateIsCurrent(fingerprint, requestKey, revision, controller)
+            )
+              return;
+            const normalized = normalizeError(error);
+            if (
+              controller.signal.aborted ||
+              normalized.errorCode === "cancelled"
+            ) {
+              setEstimate({
+                status: "cancelled",
+                revision,
+                fingerprint,
+              });
+              return;
+            }
+            setEstimate({
+              status: "error",
+              revision,
+              fingerprint,
+              code: normalizedErrorCode(normalized),
+              reasonCode: normalized.reasonCode,
+              message: normalized.diagnostics ?? "",
+            });
+          })
+          .finally(() => {
+            if (estimateController === controller) {
+              estimateController = null;
+            }
           });
-        })
-        .finally(() => {
-          if (estimateController === controller) {
-            estimateController = null;
-          }
-        });
-    }, Math.max(0, debounceMs));
+      },
+      Math.max(0, debounceMs),
+    );
   }
 
   function scheduleEstimate(
@@ -358,7 +398,8 @@ export function createOutputSizeEstimateCoordinator({
       operationId: createOperationId(),
       signal: controller.signal,
       onProgress: (progress) => {
-        if (!probeIsCurrent(fingerprint, candidateId, revision, controller)) return;
+        if (!probeIsCurrent(fingerprint, candidateId, revision, controller))
+          return;
         const current = state.probe;
         if (current.status !== "loading") return;
         setProbe({ ...current, progress });
@@ -368,20 +409,33 @@ export function createOutputSizeEstimateCoordinator({
     void Promise.resolve()
       .then(() => schedule.run(options))
       .then((value) => {
-        if (!probeIsCurrent(fingerprint, candidateId, revision, controller)) return;
+        if (!probeIsCurrent(fingerprint, candidateId, revision, controller))
+          return;
         if (value.candidateId !== candidateId) {
-          throw new Error("Candidate probe returned a mismatched candidate ID.");
+          throw new Error(
+            "Candidate probe returned a mismatched candidate ID.",
+          );
         }
-        setProbe({
-          status: "ready",
-          fingerprint,
-          revision,
-          candidateId,
+        const exactEstimateCache = cacheExactEstimate(
+          state.exactEstimateCache,
+          exactEstimateCacheKey(fingerprint, candidateId),
           value,
+        );
+        setState({
+          ...state,
+          exactEstimateCache,
+          probe: {
+            status: "ready",
+            fingerprint,
+            revision,
+            candidateId,
+            value,
+          },
         });
       })
       .catch((error: unknown) => {
-        if (!probeIsCurrent(fingerprint, candidateId, revision, controller)) return;
+        if (!probeIsCurrent(fingerprint, candidateId, revision, controller))
+          return;
         const current = state.probe;
         const progress = current.status === "loading" ? current.progress : null;
         const normalized = normalizeError(error);
@@ -447,6 +501,7 @@ export function createOutputSizeEstimateCoordinator({
         revision: probeRevision,
         fingerprint,
       },
+      exactEstimateCache: state.exactEstimateCache,
     });
   }
 

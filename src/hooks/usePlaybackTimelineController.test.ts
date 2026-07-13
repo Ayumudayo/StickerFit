@@ -51,9 +51,8 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackTick = (
-      playbackModule as Record<string, unknown>
-    ).resolvePlaybackTick;
+    const resolvePlaybackTick = (playbackModule as Record<string, unknown>)
+      .resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
     expect(resolvePlaybackTick).toBeTypeOf("function");
@@ -85,9 +84,8 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackTick = (
-      playbackModule as Record<string, unknown>
-    ).resolvePlaybackTick;
+    const resolvePlaybackTick = (playbackModule as Record<string, unknown>)
+      .resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
     expect(resolvePlaybackTick).toBeTypeOf("function");
@@ -119,9 +117,8 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackTick = (
-      playbackModule as Record<string, unknown>
-    ).resolvePlaybackTick;
+    const resolvePlaybackTick = (playbackModule as Record<string, unknown>)
+      .resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
     expect(resolvePlaybackTick).toBeTypeOf("function");
@@ -149,9 +146,8 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackTick = (
-      playbackModule as Record<string, unknown>
-    ).resolvePlaybackTick;
+    const resolvePlaybackTick = (playbackModule as Record<string, unknown>)
+      .resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
     expect(resolvePlaybackTick).toBeTypeOf("function");
@@ -172,9 +168,8 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackTick = (
-      playbackModule as Record<string, unknown>
-    ).resolvePlaybackTick;
+    const resolvePlaybackTick = (playbackModule as Record<string, unknown>)
+      .resolvePlaybackTick;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
     expect(resolvePlaybackTick).toBeTypeOf("function");
@@ -215,9 +210,8 @@ describe("usePlaybackTimelineController timeline lookup helpers", () => {
     const createPlaybackTimelineLookup = (
       playbackModule as Record<string, unknown>
     ).createPlaybackTimelineLookup;
-    const resolvePlaybackStartTime = (
-      playbackModule as Record<string, unknown>
-    ).resolvePlaybackStartTime;
+    const resolvePlaybackStartTime = (playbackModule as Record<string, unknown>)
+      .resolvePlaybackStartTime;
 
     expect(createPlaybackTimelineLookup).toBeTypeOf("function");
     expect(resolvePlaybackStartTime).toBeTypeOf("function");

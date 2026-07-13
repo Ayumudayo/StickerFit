@@ -17,11 +17,7 @@ type RevealIndexParams = {
   index: number;
 };
 
-export type FrameRailNavigationKey =
-  | "ArrowUp"
-  | "ArrowDown"
-  | "Home"
-  | "End";
+export type FrameRailNavigationKey = "ArrowUp" | "ArrowDown" | "Home" | "End";
 
 type RovingFrameIndexParams = {
   activeIndex: number;
@@ -105,11 +101,7 @@ export function computeRovingFrameIndex({
   }
 
   const currentIndex = normalizeRovingFrameIndex(activeIndex, count);
-  return clamp(
-    currentIndex + (key === "ArrowDown" ? 1 : -1),
-    0,
-    count - 1,
-  );
+  return clamp(currentIndex + (key === "ArrowDown" ? 1 : -1), 0, count - 1);
 }
 
 export function computeVirtualWindow({
@@ -136,9 +128,19 @@ export function computeVirtualWindow({
   const maximumScrollTop = Math.max(0, totalHeight - viewportHeight);
   const effectiveScrollTop = clamp(scrollTop, 0, maximumScrollTop);
   const visibleStart = Math.floor(effectiveScrollTop / rowHeight);
-  const visibleEnd = Math.ceil((effectiveScrollTop + viewportHeight) / rowHeight);
-  const start = clamp(visibleStart - normalizedOverscan, 0, normalizedItemCount);
-  const end = clamp(visibleEnd + normalizedOverscan, start, normalizedItemCount);
+  const visibleEnd = Math.ceil(
+    (effectiveScrollTop + viewportHeight) / rowHeight,
+  );
+  const start = clamp(
+    visibleStart - normalizedOverscan,
+    0,
+    normalizedItemCount,
+  );
+  const end = clamp(
+    visibleEnd + normalizedOverscan,
+    start,
+    normalizedItemCount,
+  );
 
   return {
     start,

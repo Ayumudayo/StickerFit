@@ -14,7 +14,9 @@ export function FrameEditingOverlays({
 }: FrameEditingOverlaysProps) {
   return (
     <>
-      {frameContextMenuProps ? <FrameContextMenu {...frameContextMenuProps} /> : null}
+      {frameContextMenuProps ? (
+        <FrameContextMenu {...frameContextMenuProps} />
+      ) : null}
       <FrameDialogs {...frameDialogsProps} />
     </>
   );

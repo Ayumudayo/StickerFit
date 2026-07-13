@@ -1,5 +1,26 @@
 Set-StrictMode -Version Latest
 
+function Get-FfmpegFileSha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+      $sha256.Dispose()
+    }
+  }
+  finally {
+    $stream.Dispose()
+  }
+}
+
 function Resolve-RepositoryPath {
   param(
     [Parameter(Mandatory = $true)]
@@ -69,28 +90,46 @@ function Invoke-StrictNativeCommand {
   }
 
   $previousLocation = $null
+  $previousErrorActionPreference = $ErrorActionPreference
+  $output = @()
+  $exitCode = $null
+  $invocationSucceeded = $false
   try {
     if ($WorkingDirectory) {
       $previousLocation = Get-Location
       Set-Location -LiteralPath $WorkingDirectory
     }
 
-    $output = @(& $Executable @Arguments 2>&1 | ForEach-Object { "$_" })
-    $exitCode = $LASTEXITCODE
+    # Windows PowerShell 5.1 promotes ordinary native stderr to a
+    # NativeCommandError when the caller uses Stop. Capture it and decide
+    # success exclusively from the native exit code instead.
+    $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = $null
+    try {
+      $output = @(& $Executable @Arguments 2>&1 | ForEach-Object { "$_" })
+      $invocationSucceeded = $?
+    }
+    catch {
+      $output = @("$($_.Exception.Message)")
+      $invocationSucceeded = $false
+    }
+    $exitCode = $global:LASTEXITCODE
   }
   finally {
+    $ErrorActionPreference = $previousErrorActionPreference
     if ($null -ne $previousLocation) {
       Set-Location -LiteralPath $previousLocation.Path
     }
   }
 
-  if ($exitCode -ne 0) {
+  if (-not $invocationSucceeded -or $null -eq $exitCode -or $exitCode -ne 0) {
     $detail = ($output -join [Environment]::NewLine).Trim()
+    $status = if ($null -eq $exitCode) { "unavailable" } else { "$exitCode" }
     if ($detail) {
-      throw "$FailureMessage Exit code: $exitCode. $detail"
+      throw "$FailureMessage Exit code: $status. $detail"
     }
 
-    throw "$FailureMessage Exit code: $exitCode."
+    throw "$FailureMessage Exit code: $status."
   }
 
   return [pscustomobject]@{
@@ -341,7 +380,7 @@ function Assert-FfmpegFileSha256 {
     throw "Required $Label was not found: $Path"
   }
 
-  $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+  $actualSha256 = Get-FfmpegFileSha256 -Path $Path
   if (-not [string]::Equals(
       $actualSha256,
       $ExpectedSha256,
@@ -384,7 +423,7 @@ function Get-FfmpegVerifiedArchiveSha256 {
     throw "Required $Label was not found: $ArchivePath"
   }
 
-  $computedSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $ArchivePath).Hash.ToLowerInvariant()
+  $computedSha256 = Get-FfmpegFileSha256 -Path $ArchivePath
   if ($ExpectedSha256) {
     if ($ExpectedSha256 -notmatch '^[0-9a-f]{64}$') {
       throw "$Label expected SHA-256 must be 64 lowercase hexadecimal characters."

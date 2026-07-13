@@ -86,13 +86,7 @@ export function createRequestLifecycleCoordinator<T>({
   }
 
   return {
-    async run({
-      fingerprint,
-      request,
-      onBegin,
-      onCommit,
-      onLoadingChange,
-    }) {
+    async run({ fingerprint, request, onBegin, onCommit, onLoadingChange }) {
       const ticket = guard.begin(fingerprint);
       onLoadingChange?.(true);
       replaceCurrent(null);

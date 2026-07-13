@@ -18,7 +18,9 @@ type UseDialogFocusOptions<T extends HTMLElement> = {
 };
 
 function focusableElements(container: HTMLElement) {
-  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+  ).filter(
     (element) =>
       !element.hidden &&
       !element.closest("[hidden], [aria-hidden='true'], [inert]"),
@@ -83,9 +85,8 @@ export function useDialogFocus<T extends HTMLElement>({
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
       const current = document.activeElement;
-      const currentIndex = current instanceof HTMLElement
-        ? focusable.indexOf(current)
-        : -1;
+      const currentIndex =
+        current instanceof HTMLElement ? focusable.indexOf(current) : -1;
 
       if (event.shiftKey && currentIndex <= 0) {
         event.preventDefault();

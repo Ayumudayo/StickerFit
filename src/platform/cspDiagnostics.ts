@@ -38,14 +38,7 @@ const EMPTY_SNAPSHOT: CspDiagnosticsSnapshot = Object.freeze({
 
 const SAFE_BLOCKED_TOKENS = new Set(["eval", "inline", "self"]);
 const ORIGIN_SCHEMES = new Set(["http", "https", "ws", "wss"]);
-const SAFE_SCHEMES = new Set([
-  "asset",
-  "blob",
-  "data",
-  "file",
-  "ipc",
-  "tauri",
-]);
+const SAFE_SCHEMES = new Set(["asset", "blob", "data", "file", "ipc", "tauri"]);
 
 function readString(
   event: CspViolationEventInput,
@@ -77,9 +70,7 @@ function sanitizeBlockedOrigin(event: CspViolationEventInput) {
   const rawValue = readString(event, "blockedURI");
   const inputWasTruncated =
     rawValue.length > CSP_DIAGNOSTIC_URI_INSPECTION_LIMIT;
-  const value = rawValue
-    .slice(0, CSP_DIAGNOSTIC_URI_INSPECTION_LIMIT)
-    .trim();
+  const value = rawValue.slice(0, CSP_DIAGNOSTIC_URI_INSPECTION_LIMIT).trim();
   const normalizedToken = value.toLowerCase();
 
   if (!value) {
@@ -184,8 +175,9 @@ export function createCspDiagnosticsStore(): CspDiagnosticsStore {
 const diagnosticsStore = createCspDiagnosticsStore();
 
 export function installCspDiagnostics(
-  target: CspViolationEventTarget | null =
-    typeof document === "undefined" ? null : document,
+  target: CspViolationEventTarget | null = typeof document === "undefined"
+    ? null
+    : document,
 ) {
   diagnosticsStore.install(target);
 }

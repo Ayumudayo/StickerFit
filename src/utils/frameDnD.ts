@@ -124,7 +124,11 @@ export function resolveFrameDropTargetFromVirtualGeometry({
   }
 
   const draggedInstanceIdSet = new Set(draggedInstanceIds);
-  if (orderedInstanceIds.every((instanceId) => draggedInstanceIdSet.has(instanceId))) {
+  if (
+    orderedInstanceIds.every((instanceId) =>
+      draggedInstanceIdSet.has(instanceId),
+    )
+  ) {
     return null;
   }
 
@@ -153,14 +157,22 @@ export function resolveFrameDropTargetFromVirtualGeometry({
         return { anchorInstanceId: instanceId, position: "below" };
       }
     }
-    for (let index = rawIndex + 1; index < orderedInstanceIds.length; index += 1) {
+    for (
+      let index = rawIndex + 1;
+      index < orderedInstanceIds.length;
+      index += 1
+    ) {
       const instanceId = orderedInstanceIds[index];
       if (!draggedInstanceIdSet.has(instanceId)) {
         return { anchorInstanceId: instanceId, position: "above" };
       }
     }
   } else {
-    for (let index = rawIndex + 1; index < orderedInstanceIds.length; index += 1) {
+    for (
+      let index = rawIndex + 1;
+      index < orderedInstanceIds.length;
+      index += 1
+    ) {
       const instanceId = orderedInstanceIds[index];
       if (!draggedInstanceIdSet.has(instanceId)) {
         return { anchorInstanceId: instanceId, position: "above" };
@@ -237,7 +249,9 @@ export function clampFrameRailAutoScroll({
   return clamp(scrollTop + delta, 0, maximumScrollTop);
 }
 
-export function advanceFrameRailAutoScroll(params: ClampFrameRailAutoScrollParams) {
+export function advanceFrameRailAutoScroll(
+  params: ClampFrameRailAutoScrollParams,
+) {
   const currentScrollTop = clampFrameRailAutoScroll({ ...params, delta: 0 });
   const nextScrollTop = clampFrameRailAutoScroll(params);
   return {

@@ -17,10 +17,7 @@ type SyntheticCspEvent = Readonly<{
 function createSyntheticTarget() {
   let listener: EventListenerOrEventListenerObject | null = null;
   const addEventListener = vi.fn(
-    (
-      type: string,
-      nextListener: EventListenerOrEventListenerObject | null,
-    ) => {
+    (type: string, nextListener: EventListenerOrEventListenerObject | null) => {
       expect(type).toBe("securitypolicyviolation");
       listener = nextListener;
     },
@@ -73,7 +70,10 @@ describe("CSP diagnostics", () => {
     });
 
     unsubscribe();
-    synthetic.dispatch({ effectiveDirective: "style-src", blockedURI: "inline" });
+    synthetic.dispatch({
+      effectiveDirective: "style-src",
+      blockedURI: "inline",
+    });
     expect(subscriber).toHaveBeenCalledTimes(2);
   });
 
@@ -88,8 +88,14 @@ describe("CSP diagnostics", () => {
       sample: `fetch('${secret}')`,
       originalPolicy: `connect-src https://private.example/${secret}`,
     } as SyntheticCspEvent);
-    store.record({ effectiveDirective: "img-src", blockedURI: `blob:${secret}` });
-    store.record({ effectiveDirective: "img-src", blockedURI: `data:${secret}` });
+    store.record({
+      effectiveDirective: "img-src",
+      blockedURI: `blob:${secret}`,
+    });
+    store.record({
+      effectiveDirective: "img-src",
+      blockedURI: `data:${secret}`,
+    });
     store.record({
       effectiveDirective: "connect-src",
       blockedURI: "wss://socket.example.test/private?token=secret#stream",

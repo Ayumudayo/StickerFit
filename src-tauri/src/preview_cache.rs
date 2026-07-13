@@ -69,11 +69,11 @@ pub(crate) struct PreviewCache {
 }
 
 pub(crate) fn checked_preview_cache_add(left: usize, right: usize) -> usize {
-    left.checked_add(right).unwrap_or(usize::MAX)
+    left.saturating_add(right)
 }
 
 fn checked_preview_cache_mul(left: usize, right: usize) -> usize {
-    left.checked_mul(right).unwrap_or(usize::MAX)
+    left.saturating_mul(right)
 }
 
 pub(crate) fn accounted_cached_preview_bytes(preview: &CachedPreview) -> usize {
@@ -192,14 +192,17 @@ impl PreviewCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn max_bytes(&self) -> usize {
         self.max_bytes
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn accounted_bytes(&self) -> usize {
         accounted_cache_bytes(&self.lock_inner())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn contains_key(&self, key: &PreviewSourceKey) -> bool {
         self.lock_inner()
             .entries
@@ -246,6 +249,7 @@ impl PreviewCache {
         selected
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn publish_complete(
         &self,
         key: PreviewSourceKey,
@@ -575,8 +579,7 @@ mod tests {
 
         let short_key = native_key("a");
         let long_key = native_key("a-very-long-source-name-that-must-be-accounted");
-        let mut tight = Vec::with_capacity(1);
-        tight.push(cached.clone());
+        let tight = vec![cached.clone()];
         let mut spare = Vec::with_capacity(32);
         spare.push(cached);
 

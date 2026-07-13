@@ -30,8 +30,10 @@ function normalizeBucketLimit(maxBuckets: number | undefined) {
 }
 
 function frameContainsTime(frame: TimelineFrameView, currentTimeUs: number) {
-  return currentTimeUs >= frame.startTimeUs &&
-    currentTimeUs < frame.startTimeUs + frame.durationUs;
+  return (
+    currentTimeUs >= frame.startTimeUs &&
+    currentTimeUs < frame.startTimeUs + frame.durationUs
+  );
 }
 
 function buildBucket(
@@ -86,7 +88,8 @@ function durationWeightedEndIndex(
 
   const targetEndUs = (totalDurationUs * (bucketIndex + 1)) / bucketCount;
   let endFrameIndex = firstFrameIndex + 1;
-  let candidateEndUs = durationBeforeBucketUs + frames[firstFrameIndex].durationUs;
+  let candidateEndUs =
+    durationBeforeBucketUs + frames[firstFrameIndex].durationUs;
 
   while (endFrameIndex < maximumEndIndex) {
     const nextEndUs = candidateEndUs + frames[endFrameIndex].durationUs;
@@ -118,7 +121,8 @@ export function buildTimelineSegmentBuckets({
     (sum, frame) => sum + frame.durationUs,
     0,
   );
-  const useDurationWeights = Number.isFinite(totalDurationUs) && totalDurationUs > 0;
+  const useDurationWeights =
+    Number.isFinite(totalDurationUs) && totalDurationUs > 0;
   const buckets: TimelineSegmentBucket[] = [];
   let firstFrameIndex = 0;
   let durationBeforeBucketUs = 0;

@@ -51,7 +51,7 @@
   width: 44px;
   height: 44px;
   border-radius: 12px;
-  background: #5865F2;
+  background: #5865f2;
   color: #ffffff;
 }
 
@@ -101,8 +101,8 @@
   top: 0;
   bottom: 0;
   background: rgba(88, 101, 242, 0.14);
-  border-left: 2px solid #5865F2;
-  border-right: 2px solid #5865F2;
+  border-left: 2px solid #5865f2;
+  border-right: 2px solid #5865f2;
 }
 
 .timelinePlayhead {
@@ -132,7 +132,7 @@
   bottom: 12px;
   width: 4px;
   border-radius: 999px;
-  background: #5865F2;
+  background: #5865f2;
   transform: translateX(-50%);
 }
 
@@ -175,6 +175,16 @@
   overflow-y: auto;
   padding-right: 4px;
   position: relative;
+}
+
+.frameTableBodyShell {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.frameTableBodyShell .frameTableBody {
+  height: 100%;
 }
 
 .frameVirtualSpacer {
@@ -270,6 +280,15 @@
   font-size: 0.68rem;
   white-space: nowrap;
   cursor: pointer;
+  pointer-events: auto;
+}
+
+.framePreviewRetryLayer {
+  position: absolute;
+  z-index: 4;
+  inset: 0 16px 0 0;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 .framePreviewRetry:hover,
@@ -714,7 +733,6 @@
 }
 
 @media (max-width: 760px) {
-
   .previewUtilityPrimaryStack {
     width: 100%;
     margin-left: 0;

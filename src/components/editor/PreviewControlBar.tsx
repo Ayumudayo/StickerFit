@@ -9,7 +9,10 @@ import { useMemo } from "react";
 import type { MessagesForLocale, Locale } from "../../locales/messages";
 import type { EditorText } from "../../locales/editorText";
 import type { PreviewZoomMode } from "../../components/MediaSelectionPreview";
-import type { FrameSelectionModel, TimelineFrameView } from "../../types/editor";
+import type {
+  FrameSelectionModel,
+  TimelineFrameView,
+} from "../../types/editor";
 import { buildTimelineSegmentBuckets } from "../../utils/timelineSegments";
 import {
   formatTimelineTime,
@@ -104,7 +107,7 @@ export function PreviewControlBar({
   );
   const timelineBoundariesUs = useMemo(() => {
     const boundaries = timelineFrameViews.map((frame) =>
-      clampMicroseconds(frame.startTimeUs, normalizedTotalDurationUs)
+      clampMicroseconds(frame.startTimeUs, normalizedTotalDurationUs),
     );
     boundaries.push(0, normalizedTotalDurationUs);
     return [...new Set(boundaries)].sort((left, right) => left - right);
@@ -120,15 +123,17 @@ export function PreviewControlBar({
     switch (event.key) {
       case "ArrowLeft":
       case "ArrowDown":
-        nextTimeUs = [...timelineBoundariesUs]
-          .reverse()
-          .find((boundaryUs) => boundaryUs < normalizedCurrentTimeUs) ?? 0;
+        nextTimeUs =
+          [...timelineBoundariesUs]
+            .reverse()
+            .find((boundaryUs) => boundaryUs < normalizedCurrentTimeUs) ?? 0;
         break;
       case "ArrowRight":
       case "ArrowUp":
-        nextTimeUs = timelineBoundariesUs.find(
-          (boundaryUs) => boundaryUs > normalizedCurrentTimeUs,
-        ) ?? normalizedTotalDurationUs;
+        nextTimeUs =
+          timelineBoundariesUs.find(
+            (boundaryUs) => boundaryUs > normalizedCurrentTimeUs,
+          ) ?? normalizedTotalDurationUs;
         break;
       case "Home":
         nextTimeUs = 0;
@@ -172,7 +177,10 @@ export function PreviewControlBar({
             {isPlaying ? <PauseIcon size={18} /> : <PlayIcon size={18} />}
           </button>
 
-          <section className="previewTransportRailBlock" aria-label={ui.timelineTitle}>
+          <section
+            className="previewTransportRailBlock"
+            aria-label={ui.timelineTitle}
+          >
             <div
               ref={timelineRailRef}
               className="timelineRail previewTimelineRail"
@@ -195,18 +203,17 @@ export function PreviewControlBar({
               onPointerUp={onPointerUp}
               onPointerCancel={onPointerCancel}
             >
-              <div
-                className="timelineSegments"
-                aria-hidden="true"
-              >
+              <div className="timelineSegments" aria-hidden="true">
                 {timelineSegmentBuckets.map((bucket) => (
                   <div
                     key={`${bucket.firstFrameIndex}-${bucket.lastFrameIndex}`}
                     className={`timelineSegment${bucket.containsSelected ? "" : " is-dimmed"}${bucket.containsCurrent ? " is-current" : ""}`}
                     style={{
-                      flex: `0 0 ${bucketDurationTotalUs > 0
-                        ? (bucket.durationUs / bucketDurationTotalUs) * 100
-                        : 100 / timelineSegmentBuckets.length}%`,
+                      flex: `0 0 ${
+                        bucketDurationTotalUs > 0
+                          ? (bucket.durationUs / bucketDurationTotalUs) * 100
+                          : 100 / timelineSegmentBuckets.length
+                      }%`,
                     }}
                   />
                 ))}
@@ -217,7 +224,10 @@ export function PreviewControlBar({
 
             <div className="previewTransportMeta">
               <span>{formatTimelineTime(0, locale)}</span>
-              <span>{formatTimelineTime(currentTime, locale)} / {formatTimelineTime(totalDuration, locale)}</span>
+              <span>
+                {formatTimelineTime(currentTime, locale)} /{" "}
+                {formatTimelineTime(totalDuration, locale)}
+              </span>
               <span>{formatTimelineTime(totalDuration, locale)}</span>
             </div>
           </section>
@@ -225,7 +235,9 @@ export function PreviewControlBar({
       ) : null}
 
       <div className="previewZoomBar">
-        <span className="previewZoomDockReadout" aria-live="polite">{previewZoomPercent}%</span>
+        <span className="previewZoomDockReadout" aria-live="polite">
+          {previewZoomPercent}%
+        </span>
         <button
           className="secondaryAction previewZoomDockStepButton"
           type="button"
@@ -243,7 +255,9 @@ export function PreviewControlBar({
           max={400}
           step={0.5}
           value={previewZoomSliderValue}
-          onChange={(event) => onPreviewZoomChange(Number(event.target.value) / 100)}
+          onChange={(event) =>
+            onPreviewZoomChange(Number(event.target.value) / 100)
+          }
         />
         <button
           className="secondaryAction previewZoomDockStepButton"
@@ -254,7 +268,11 @@ export function PreviewControlBar({
           +
         </button>
         <button
-          className={previewZoomMode === "fit" ? "secondaryAction previewZoomDockButton is-active" : "secondaryAction previewZoomDockButton"}
+          className={
+            previewZoomMode === "fit"
+              ? "secondaryAction previewZoomDockButton is-active"
+              : "secondaryAction previewZoomDockButton"
+          }
           type="button"
           aria-pressed={previewZoomMode === "fit"}
           onClick={onPreviewZoomFit}

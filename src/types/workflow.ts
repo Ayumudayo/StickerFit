@@ -133,9 +133,7 @@ export type SampledSizeEstimate = {
 };
 
 export type OutputSizeEstimate =
-  | ExactStaticSizeEstimate
-  | ExactCandidateSizeEstimate
-  | SampledSizeEstimate;
+  ExactStaticSizeEstimate | ExactCandidateSizeEstimate | SampledSizeEstimate;
 
 export type StaticSizeEstimateRequest = {
   inputPath: string;
@@ -345,4 +343,3 @@ export type OptimizerSearchResponse = {
   bestSizeBytes: number | null;
   bestWithinLimit: boolean;
 } & MediaOperationErrorFields;
-

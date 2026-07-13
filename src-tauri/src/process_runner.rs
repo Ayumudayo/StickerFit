@@ -1,18 +1,42 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+use windows::core::PCWSTR;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{
+    GetProcessIdOfThread, OpenThread, ResumeThread, CREATE_SUSPENDED,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+};
 
 use crate::media_error::PipelineError;
 use crate::operation::OperationContext;
 
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+const CHILD_CLEANUP_MAX_ATTEMPTS: usize = 20;
+const READER_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -59,20 +83,56 @@ impl From<ExitStatus> for ObservedExit {
 trait ChildLifecycle: Send + 'static {
     fn try_wait_exit(&mut self) -> io::Result<Option<ObservedExit>>;
     fn kill_child(&mut self) -> io::Result<()>;
-    fn wait_exit(&mut self) -> io::Result<ObservedExit>;
+    fn close_termination_scope(&mut self);
 }
 
-impl ChildLifecycle for Child {
+struct ManagedChild {
+    child: Child,
+    #[cfg(target_os = "windows")]
+    job: Option<OwnedHandle>,
+}
+
+impl ManagedChild {
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+}
+
+impl ChildLifecycle for ManagedChild {
     fn try_wait_exit(&mut self) -> io::Result<Option<ObservedExit>> {
-        Child::try_wait(self).map(|status| status.map(ObservedExit::from))
+        self.child
+            .try_wait()
+            .map(|status| status.map(ObservedExit::from))
     }
 
     fn kill_child(&mut self) -> io::Result<()> {
-        Child::kill(self)
+        #[cfg(target_os = "windows")]
+        if let Some(job) = self.job.as_ref() {
+            // SAFETY: `job` is an owned, live Job Object handle created by this module.
+            return unsafe { TerminateJobObject(HANDLE(job.as_raw_handle()), 1) }
+                .map_err(io::Error::other);
+        }
+
+        self.child.kill()
     }
 
-    fn wait_exit(&mut self) -> io::Result<ObservedExit> {
-        Child::wait(self).map(ObservedExit::from)
+    fn close_termination_scope(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            // Dropping the final Job Object handle is the non-blocking fallback that asks
+            // Windows to terminate every still-associated process. The job was configured
+            // with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE before the child was spawned.
+            drop(self.job.take());
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = self.child.kill();
+        }
     }
 }
 
@@ -145,20 +205,303 @@ fn process_failed(program: &OsStr, status: ObservedExit, stderr: &[u8]) -> Pipel
 fn configure_managed_child(command: &mut Command) {
     #[cfg(target_os = "windows")]
     {
-        command.creation_flags(CREATE_NO_WINDOW);
+        // The process must not execute user code until it has been assigned to the Job Object.
+        // This closes the spawn/assignment window in which a fast child could create an
+        // untracked grandchild.
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED.0);
     }
 }
 
-fn spawn_managed_child(program: &OsStr, args: &[OsString]) -> Result<Child, PipelineError> {
+#[cfg(target_os = "windows")]
+fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
+    // SAFETY: a null name requests a private, unnamed Job Object. The returned handle is
+    // immediately wrapped in `OwnedHandle`, which closes it exactly once.
+    let raw_job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(io::Error::other)?;
+    // SAFETY: `raw_job` is a newly-created owned handle and is not used after this conversion.
+    let job = unsafe { OwnedHandle::from_raw_handle(raw_job.0) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let limits_size = u32::try_from(std::mem::size_of_val(&limits))
+        .expect("Job Object limit structure size must fit in u32");
+
+    // SAFETY: `job` is live, and the pointer/size pair references `limits` for the duration
+    // of this call with the structure required by JobObjectExtendedLimitInformation.
+    unsafe {
+        SetInformationJobObject(
+            HANDLE(job.as_raw_handle()),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            limits_size,
+        )
+    }
+    .map_err(io::Error::other)?;
+
+    Ok(job)
+}
+
+#[cfg(target_os = "windows")]
+fn assign_child_to_job(job: &OwnedHandle, child: &Child) -> io::Result<()> {
+    // SAFETY: both handles are live for the call. `child` was spawned by this module and the
+    // Job Object remains owned by the returned `ManagedChild`.
+    unsafe { AssignProcessToJobObject(HANDLE(job.as_raw_handle()), HANDLE(child.as_raw_handle())) }
+        .map_err(io::Error::other)
+}
+
+#[cfg(target_os = "windows")]
+fn is_no_more_thread_entries(error: &windows::core::Error) -> bool {
+    let hresult_from_win32 = 0x8007_0000_u32 | ERROR_NO_MORE_FILES.0;
+    error.code().0.cast_unsigned() == hresult_from_win32
+}
+
+#[cfg(target_os = "windows")]
+fn snapshot_process_thread_ids(process_id: u32) -> io::Result<Vec<u32>> {
+    // SAFETY: the returned snapshot handle is immediately wrapped for single ownership.
+    let raw_snapshot =
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }.map_err(io::Error::other)?;
+    // SAFETY: `raw_snapshot` is newly owned and is not used after the conversion.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw_snapshot.0) };
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>())
+            .expect("thread entry structure size must fit in u32"),
+        ..THREADENTRY32::default()
+    };
+    let mut thread_ids = Vec::new();
+
+    // SAFETY: `snapshot` is live and `entry` is initialized with the documented structure size.
+    if let Err(error) = unsafe { Thread32First(HANDLE(snapshot.as_raw_handle()), &mut entry) } {
+        if is_no_more_thread_entries(&error) {
+            return Ok(thread_ids);
+        }
+        return Err(io::Error::other(error));
+    }
+
+    loop {
+        if entry.th32OwnerProcessID == process_id {
+            thread_ids.push(entry.th32ThreadID);
+        }
+
+        // SAFETY: the same live snapshot and correctly-sized output structure are reused.
+        match unsafe { Thread32Next(HANDLE(snapshot.as_raw_handle()), &mut entry) } {
+            Ok(()) => {}
+            Err(error) if is_no_more_thread_entries(&error) => break,
+            Err(error) => return Err(io::Error::other(error)),
+        }
+    }
+
+    Ok(thread_ids)
+}
+
+#[cfg(target_os = "windows")]
+fn resume_suspended_child(child: &mut Child) -> io::Result<()> {
+    let process_id = child.id();
+    let started = Instant::now();
+    let mut attempts = 0usize;
+    let thread_id = loop {
+        attempts += 1;
+        match snapshot_process_thread_ids(process_id) {
+            Ok(thread_ids) if thread_ids.len() == 1 => break thread_ids[0],
+            Ok(thread_ids) if thread_ids.len() > 1 => {
+                return Err(io::Error::other(format!(
+                    "suspended child exposed {} threads before resume",
+                    thread_ids.len()
+                )));
+            }
+            Ok(_) => {}
+            Err(error)
+                if attempts >= CHILD_CLEANUP_MAX_ATTEMPTS
+                    || started.elapsed() >= CHILD_CLEANUP_TIMEOUT =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+
+        if attempts >= CHILD_CLEANUP_MAX_ATTEMPTS || started.elapsed() >= CHILD_CLEANUP_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "suspended child primary thread was not found",
+            ));
+        }
+        thread::sleep(CONTROL_POLL_INTERVAL);
+    };
+
+    // SAFETY: the thread ID was discovered while the child is still suspended and belongs to
+    // exactly one thread owned by `process_id`. The handle is wrapped immediately.
+    let raw_thread = unsafe {
+        OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            false,
+            thread_id,
+        )
+    }
+    .map_err(io::Error::other)?;
+    // SAFETY: `raw_thread` is a newly-owned handle and is not used after this conversion.
+    let thread_handle = unsafe { OwnedHandle::from_raw_handle(raw_thread.0) };
+    // SAFETY: `thread_handle` is live and grants query access. Rechecking ownership after
+    // OpenThread prevents a recycled thread ID from resuming a thread outside this child.
+    let owner_process_id = unsafe { GetProcessIdOfThread(HANDLE(thread_handle.as_raw_handle())) };
+    if owner_process_id == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if owner_process_id != process_id {
+        return Err(io::Error::other(format!(
+            "suspended child thread ownership changed: expected process {process_id}, got \
+             {owner_process_id}"
+        )));
+    }
+    if child.try_wait()?.is_some() {
+        return Err(io::Error::other(
+            "suspended child exited before its initial thread could be resumed",
+        ));
+    }
+    // SAFETY: `thread_handle` grants THREAD_SUSPEND_RESUME for the sole initial child thread.
+    let previous_suspend_count = unsafe { ResumeThread(HANDLE(thread_handle.as_raw_handle())) };
+    if previous_suspend_count == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    if previous_suspend_count != 1 {
+        return Err(io::Error::other(format!(
+            "unexpected initial child suspend count: {previous_suspend_count}"
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+struct SuspendedChildCustodian {
+    sender: mpsc::Sender<Child>,
+    _worker: JoinHandle<()>,
+}
+
+#[cfg(target_os = "windows")]
+fn suspended_child_custodian() -> Option<&'static SuspendedChildCustodian> {
+    static CUSTODIAN: OnceLock<Option<SuspendedChildCustodian>> = OnceLock::new();
+    CUSTODIAN
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<Child>();
+            let worker = thread::Builder::new()
+                .name("stickerfit-suspended-child-custodian".into())
+                .spawn(move || {
+                    let mut pending = Vec::<Child>::new();
+                    loop {
+                        match receiver.recv_timeout(CONTROL_POLL_INTERVAL) {
+                            Ok(child) => pending.push(child),
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) if pending.is_empty() => break,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                thread::sleep(CONTROL_POLL_INTERVAL);
+                            }
+                        }
+
+                        let mut index = 0;
+                        while index < pending.len() {
+                            if matches!(pending[index].try_wait(), Ok(Some(_))) {
+                                let mut reaped = pending.swap_remove(index);
+                                // `try_wait` observed the signaled process handle, so this
+                                // follow-up wait only records the already-available status.
+                                let _ = reaped.wait();
+                            } else {
+                                let _ = pending[index].kill();
+                                index += 1;
+                            }
+                        }
+                    }
+                })
+                .ok()?;
+            Some(SuspendedChildCustodian {
+                sender,
+                _worker: worker,
+            })
+        })
+        .as_ref()
+}
+
+#[cfg(target_os = "windows")]
+fn retain_suspended_child_ownership(child: Child) {
+    static RETAINED_CHILDREN: OnceLock<Mutex<Vec<Child>>> = OnceLock::new();
+
+    let child = if let Some(custodian) = suspended_child_custodian() {
+        match custodian.sender.send(child) {
+            Ok(()) => return,
+            Err(error) => error.0,
+        }
+    } else {
+        child
+    };
+    lock_unpoisoned(RETAINED_CHILDREN.get_or_init(|| Mutex::new(Vec::new()))).push(child);
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_unassigned_suspended_child(mut child: Child) -> String {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return "child exited while termination-scope assignment was being diagnosed".into();
+    }
+
+    match child.kill() {
+        Ok(()) => {
+            retain_suspended_child_ownership(child);
+            "fallback TerminateProcess was requested and suspended child ownership was \
+             transferred to the process custodian"
+                .into()
+        }
+        Err(error) => {
+            let diagnostic = format!(
+                "fallback TerminateProcess failed ({error}); suspended child ownership was \
+                 transferred to the process custodian"
+            );
+            retain_suspended_child_ownership(child);
+            diagnostic
+        }
+    }
+}
+
+fn spawn_managed_child(program: &OsStr, args: &[OsString]) -> Result<ManagedChild, PipelineError> {
+    #[cfg(target_os = "windows")]
+    let job = create_kill_on_close_job()
+        .map_err(|error| io_pipeline_error("create child process termination scope", error))?;
+
     let mut command = Command::new(program);
     configure_managed_child(&mut command);
-    command
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| io_pipeline_error("spawn child process", error))
+        .map_err(|error| io_pipeline_error("spawn child process", error))?;
+
+    #[cfg(target_os = "windows")]
+    if let Err(assignment_error) = assign_child_to_job(&job, &child) {
+        let cleanup = terminate_unassigned_suspended_child(child);
+        return Err(io_pipeline_error(
+            "assign child process termination scope",
+            format!("{assignment_error}; {cleanup}"),
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Err(resume_error) = resume_suspended_child(&mut child) {
+        // SAFETY: `job` is live and owns the still-suspended child after successful assignment.
+        let termination = unsafe { TerminateJobObject(HANDLE(job.as_raw_handle()), 1) };
+        let termination_diagnostic = termination
+            .err()
+            .map(|error| format!("; explicit Job termination also failed: {error}"))
+            .unwrap_or_default();
+        // KILL_ON_JOB_CLOSE is the final documented fallback even if TerminateJobObject failed.
+        drop(job);
+        retain_suspended_child_ownership(child);
+        return Err(io_pipeline_error(
+            "resume managed child process",
+            format!("{resume_error}{termination_diagnostic}"),
+        ));
+    }
+
+    Ok(ManagedChild {
+        child,
+        #[cfg(target_os = "windows")]
+        job: Some(job),
+    })
 }
 
 fn spawn_bounded_reader<R>(
@@ -324,6 +667,68 @@ fn join_reader(
     }
 }
 
+struct ReaderJoinCustodian {
+    sender: mpsc::Sender<JoinHandle<()>>,
+    _worker: JoinHandle<()>,
+}
+
+fn reader_join_custodian() -> Option<&'static ReaderJoinCustodian> {
+    static CUSTODIAN: OnceLock<Option<ReaderJoinCustodian>> = OnceLock::new();
+    CUSTODIAN
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<JoinHandle<()>>();
+            let worker = thread::Builder::new()
+                .name("stickerfit-process-reader-custodian".into())
+                .spawn(move || {
+                    let mut pending = Vec::<JoinHandle<()>>::new();
+                    loop {
+                        match receiver.recv_timeout(CONTROL_POLL_INTERVAL) {
+                            Ok(handle) => pending.push(handle),
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) if pending.is_empty() => break,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                thread::sleep(CONTROL_POLL_INTERVAL);
+                            }
+                        }
+
+                        let mut index = 0;
+                        while index < pending.len() {
+                            if pending[index].is_finished() {
+                                let handle = pending.swap_remove(index);
+                                let _ = handle.join();
+                            } else {
+                                index += 1;
+                            }
+                        }
+                    }
+                })
+                .ok()?;
+            Some(ReaderJoinCustodian {
+                sender,
+                _worker: worker,
+            })
+        })
+        .as_ref()
+}
+
+fn retain_reader_ownership(handle: JoinHandle<()>) {
+    static RETAINED_READERS: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
+
+    let handle = if let Some(custodian) = reader_join_custodian() {
+        match custodian.sender.send(handle) {
+            Ok(()) => return,
+            Err(error) => error.0,
+        }
+    } else {
+        handle
+    };
+
+    // If the custodian cannot be created or has unexpectedly stopped, retain the join handle
+    // for the remainder of the process rather than dropping it and silently detaching the
+    // still-running reader thread.
+    lock_unpoisoned(RETAINED_READERS.get_or_init(|| Mutex::new(Vec::new()))).push(handle);
+}
+
 fn retain_cleanup_error(
     cleanup_error: &mut Option<PipelineError>,
     operation: &'static str,
@@ -334,37 +739,119 @@ fn retain_cleanup_error(
     }
 }
 
-fn reap_child_synchronously<C: ChildLifecycle>(child: &mut C, status: &mut Option<ObservedExit>) {
-    while status.is_none() {
+fn drain_readers_bounded(
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
+    cleanup_error: &mut Option<PipelineError>,
+) {
+    let readers = [
+        ("stdout", "join child stdout reader", stdout_reader),
+        ("stderr", "join child stderr reader", stderr_reader),
+    ];
+    let started = Instant::now();
+
+    while readers
+        .iter()
+        .any(|(_, _, handle)| handle.as_ref().is_some_and(|handle| !handle.is_finished()))
+        && started.elapsed() < READER_CLEANUP_TIMEOUT
+    {
+        thread::sleep(CONTROL_POLL_INTERVAL);
+    }
+
+    let mut transferred = Vec::new();
+    for (name, operation, handle) in readers {
+        let Some(handle) = handle else {
+            continue;
+        };
+        if handle.is_finished() {
+            join_reader(handle, operation, cleanup_error);
+        } else {
+            transferred.push(name);
+            retain_reader_ownership(handle);
+        }
+    }
+
+    if !transferred.is_empty() {
+        let earlier_cleanup = cleanup_error
+            .take()
+            .map(|error| format!("; earlier cleanup failure: {error}"))
+            .unwrap_or_default();
+        *cleanup_error = Some(io_pipeline_error(
+            "drain child process readers",
+            format!(
+                "bounded reader cleanup exhausted after {} ms; unfinished {} reader ownership \
+                 was transferred to the join custodian{earlier_cleanup}",
+                started.elapsed().as_millis(),
+                transferred.join(" and ")
+            ),
+        ));
+    }
+}
+
+fn reap_child_bounded<C: ChildLifecycle>(
+    child: &mut C,
+    status: &mut Option<ObservedExit>,
+) -> Option<PipelineError> {
+    if status.is_some() {
+        return None;
+    }
+
+    let started = Instant::now();
+    let mut attempts = 0usize;
+    let mut termination_requested = false;
+    let mut last_failure: Option<(&'static str, String)> = None;
+
+    while status.is_none()
+        && attempts < CHILD_CLEANUP_MAX_ATTEMPTS
+        && started.elapsed() < CHILD_CLEANUP_TIMEOUT
+    {
+        attempts += 1;
+
         match child.try_wait_exit() {
             Ok(Some(observed)) => {
                 *status = Some(observed);
                 break;
             }
             Ok(None) => {}
-            Err(_) => {
-                thread::sleep(CONTROL_POLL_INTERVAL);
-                continue;
+            Err(error) => {
+                last_failure = Some(("poll child process", error.to_string()));
             }
         }
 
-        match child.kill_child() {
-            Ok(()) => loop {
-                match child.wait_exit() {
-                    Ok(observed) => {
-                        *status = Some(observed);
-                        break;
-                    }
-                    Err(_) => {
-                        thread::sleep(CONTROL_POLL_INTERVAL);
-                    }
+        if !termination_requested {
+            match child.kill_child() {
+                Ok(()) => termination_requested = true,
+                Err(error) => {
+                    last_failure = Some(("terminate child process", error.to_string()));
                 }
-            },
-            Err(_) => {
-                thread::sleep(CONTROL_POLL_INTERVAL);
             }
         }
+
+        if status.is_none()
+            && attempts < CHILD_CLEANUP_MAX_ATTEMPTS
+            && started.elapsed() < CHILD_CLEANUP_TIMEOUT
+        {
+            thread::sleep(CONTROL_POLL_INTERVAL);
+        }
     }
+
+    if status.is_some() {
+        return None;
+    }
+
+    let elapsed_ms = started.elapsed().as_millis();
+    let last_failure = last_failure
+        .map(|(operation, message)| format!("last failure: {operation}: {message}"))
+        .unwrap_or_else(|| "the child never exposed an exit status".into());
+    Some(io_pipeline_error(
+        "reap child process",
+        format!(
+            "bounded cleanup exhausted after {attempts} attempts in {elapsed_ms} ms; \
+             child status is unavailable; the kill-on-close termination scope will be closed \
+             and unfinished reader ownership will be transferred to the join custodian; \
+             {last_failure}"
+        ),
+    ))
 }
 
 struct CleanupResult {
@@ -377,24 +864,23 @@ fn select_process_primary(
     observed_nonzero: Option<PipelineError>,
     cleanup_error: Option<PipelineError>,
 ) -> Option<PipelineError> {
-    existing.or(observed_nonzero).or(cleanup_error)
+    // Failure to prove process cleanup is an integrity error: returning only the earlier
+    // timeout/cancellation/process error would hide that ffmpeg teardown did not complete.
+    cleanup_error.or(existing).or(observed_nonzero)
 }
 
 fn cleanup_child_and_readers<C: ChildLifecycle>(
     mut child: C,
     mut status: Option<ObservedExit>,
-    mut stdout_reader: Option<JoinHandle<()>>,
-    mut stderr_reader: Option<JoinHandle<()>>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
 ) -> CleanupResult {
-    let mut cleanup_error = None;
-    reap_child_synchronously(&mut child, &mut status);
-
-    if let Some(handle) = stdout_reader.take() {
-        join_reader(handle, "join child stdout reader", &mut cleanup_error);
+    let mut cleanup_error = reap_child_bounded(&mut child, &mut status);
+    if status.is_none() {
+        child.close_termination_scope();
     }
-    if let Some(handle) = stderr_reader.take() {
-        join_reader(handle, "join child stderr reader", &mut cleanup_error);
-    }
+    drop(child);
+    drain_readers_bounded(stdout_reader, stderr_reader, &mut cleanup_error);
 
     CleanupResult {
         status,
@@ -456,7 +942,7 @@ pub(crate) fn run_captured(
     }
     let started = Instant::now();
     let mut child = spawn_managed_child(program, args)?;
-    let stdout = match child.stdout.take() {
+    let stdout = match child.take_stdout() {
         Some(stdout) => stdout,
         None => {
             let primary = Some(io_pipeline_error(
@@ -468,7 +954,7 @@ pub(crate) fn run_captured(
                 .expect("missing stdout primary error"));
         }
     };
-    let stderr = match child.stderr.take() {
+    let stderr = match child.take_stderr() {
         Some(stderr) => stderr,
         None => {
             drop(stdout);
@@ -733,7 +1219,7 @@ where
     let initial_frame = allocate_frame_buffer(frame_size)?;
     let started = Instant::now();
     let mut child = spawn_managed_child(program, args)?;
-    let stdout = match child.stdout.take() {
+    let stdout = match child.take_stdout() {
         Some(stdout) => stdout,
         None => {
             let primary = Some(io_pipeline_error(
@@ -745,7 +1231,7 @@ where
                 .expect("missing stdout primary error"));
         }
     };
-    let stderr = match child.stderr.take() {
+    let stderr = match child.take_stderr() {
         Some(stderr) => stderr,
         None => {
             drop(stdout);
@@ -1062,16 +1548,23 @@ mod tests {
     struct ScriptedChild {
         polls: VecDeque<io::Result<Option<ObservedExit>>>,
         kills: VecDeque<io::Result<()>>,
-        waits: VecDeque<io::Result<ObservedExit>>,
+        poll_fallback_error: Option<io::ErrorKind>,
+        kill_fallback_error: Option<io::ErrorKind>,
         kill_calls: usize,
-        wait_calls: usize,
+        close_scope_calls: usize,
         audit: ChildAudit,
     }
 
     impl ChildLifecycle for ScriptedChild {
         fn try_wait_exit(&mut self) -> io::Result<Option<ObservedExit>> {
             self.audit.record("try-wait");
-            let result = self.polls.pop_front().unwrap_or(Ok(None));
+            let result = self.polls.pop_front().unwrap_or_else(|| {
+                if let Some(kind) = self.poll_fallback_error {
+                    Err(io::Error::new(kind, "permanent try-wait failure"))
+                } else {
+                    Ok(None)
+                }
+            });
             if let Ok(Some(_)) = result.as_ref() {
                 self.audit.mark_reaped();
             }
@@ -1081,20 +1574,19 @@ mod tests {
         fn kill_child(&mut self) -> io::Result<()> {
             self.kill_calls += 1;
             self.audit.record("kill");
-            self.kills.pop_front().unwrap_or(Ok(()))
+            self.kills.pop_front().unwrap_or_else(|| {
+                if let Some(kind) = self.kill_fallback_error {
+                    Err(io::Error::new(kind, "permanent kill failure"))
+                } else {
+                    Ok(())
+                }
+            })
         }
 
-        fn wait_exit(&mut self) -> io::Result<ObservedExit> {
-            self.wait_calls += 1;
-            self.audit.record("wait");
-            let result = self
-                .waits
-                .pop_front()
-                .unwrap_or_else(|| Ok(observed_exit(0)));
-            if result.is_ok() {
-                self.audit.mark_reaped();
-            }
-            result
+        fn close_termination_scope(&mut self) {
+            self.close_scope_calls += 1;
+            self.audit.record("close-scope");
+            self.audit.mark_reaped();
         }
     }
 
@@ -1907,9 +2399,8 @@ mod tests {
             let stdout_reader = audit.spawn_reader("stdout-reader-finished");
             let stderr_reader = audit.spawn_reader("stderr-reader-finished");
             let child = ScriptedChild {
-                polls: VecDeque::from([Ok(None)]),
+                polls: VecDeque::from([Ok(None), Ok(Some(observed_exit(0)))]),
                 kills: VecDeque::from([Ok(())]),
-                waits: VecDeque::from([Ok(observed_exit(0))]),
                 audit: audit.clone(),
                 ..ScriptedChild::default()
             };
@@ -1931,7 +2422,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_try_wait_failure_retries_until_reaped() {
+    fn transient_try_wait_failure_still_terminates_and_reaps() {
         let audit = ChildAudit::default();
         let stdout_reader = audit.spawn_reader("stdout-reader-finished");
         let stderr_reader = audit.spawn_reader("stderr-reader-finished");
@@ -1941,10 +2432,9 @@ mod tests {
                     io::ErrorKind::Interrupted,
                     "transient try-wait failure",
                 )),
-                Ok(None),
+                Ok(Some(observed_exit(0))),
             ]),
             kills: VecDeque::from([Ok(())]),
-            waits: VecDeque::from([Ok(observed_exit(0))]),
             audit: audit.clone(),
             ..ScriptedChild::default()
         };
@@ -1954,7 +2444,9 @@ mod tests {
         let events = audit.events();
 
         assert_eq!(cleanup.status, Some(observed_exit(0)));
-        assert!(events.iter().filter(|event| **event == "try-wait").count() >= 2);
+        assert!(events.contains(&"try-wait"));
+        assert!(events.contains(&"kill"));
+        assert!(!events.contains(&"close-scope"));
         assert_reap_precedes_reader_completion(&audit);
     }
 
@@ -1964,7 +2456,7 @@ mod tests {
         let stdout_reader = audit.spawn_reader("stdout-reader-finished");
         let stderr_reader = audit.spawn_reader("stderr-reader-finished");
         let child = ScriptedChild {
-            polls: VecDeque::from([Ok(None), Ok(None)]),
+            polls: VecDeque::from([Ok(None), Ok(None), Ok(Some(observed_exit(0)))]),
             kills: VecDeque::from([
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -1972,7 +2464,6 @@ mod tests {
                 )),
                 Ok(()),
             ]),
-            waits: VecDeque::from([Ok(observed_exit(0))]),
             audit: audit.clone(),
             ..ScriptedChild::default()
         };
@@ -1987,20 +2478,20 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_wait_retries_without_requiring_another_kill() {
+    fn interrupted_nonblocking_poll_retries_without_requiring_another_kill() {
         let audit = ChildAudit::default();
         let stdout_reader = audit.spawn_reader("stdout-reader-finished");
         let stderr_reader = audit.spawn_reader("stderr-reader-finished");
         let child = ScriptedChild {
-            polls: VecDeque::from([Ok(None)]),
-            kills: VecDeque::from([Ok(())]),
-            waits: VecDeque::from([
+            polls: VecDeque::from([
+                Ok(None),
                 Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "transient wait failure",
+                    "transient try-wait failure",
                 )),
-                Ok(observed_exit(0)),
+                Ok(Some(observed_exit(0))),
             ]),
+            kills: VecDeque::from([Ok(())]),
             audit: audit.clone(),
             ..ScriptedChild::default()
         };
@@ -2010,12 +2501,222 @@ mod tests {
         let events = audit.events();
 
         assert_eq!(cleanup.status, Some(observed_exit(0)));
-        assert!(events.iter().filter(|event| **event == "wait").count() >= 2);
+        assert!(events.iter().filter(|event| **event == "try-wait").count() >= 3);
+        assert_eq!(events.iter().filter(|event| **event == "kill").count(), 1);
+        assert!(!events.contains(&"close-scope"));
         assert_reap_precedes_reader_completion(&audit);
     }
 
     #[test]
-    fn permanent_cleanup_failure_model_never_replaces_an_existing_primary() {
+    fn permanent_poll_and_kill_errors_return_bounded_explicit_cleanup_state() {
+        let child = ScriptedChild {
+            poll_fallback_error: Some(io::ErrorKind::PermissionDenied),
+            kill_fallback_error: Some(io::ErrorKind::PermissionDenied),
+            ..ScriptedChild::default()
+        };
+        let started = Instant::now();
+
+        let cleanup = super::cleanup_child_and_readers(child, None, None, None);
+
+        assert_eq!(cleanup.status, None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            cleanup.cleanup_error,
+            Some(PipelineError::Io {
+                operation: "reap child process",
+                message,
+            }) if message.contains("bounded cleanup exhausted")
+                && message.contains("child status is unavailable")
+                && message.contains("terminate child process: permanent kill failure")
+        ));
+    }
+
+    #[test]
+    fn missing_exit_status_closes_scope_and_transfers_unfinished_reader_ownership() {
+        let audit = ChildAudit::default();
+        let stdout_reader = audit.spawn_reader("stdout-reader-finished");
+        let stderr_reader = audit.spawn_reader("stderr-reader-finished");
+        let child = ScriptedChild {
+            polls: VecDeque::from([Ok(None)]),
+            kills: VecDeque::from([Ok(())]),
+            poll_fallback_error: Some(io::ErrorKind::PermissionDenied),
+            audit: audit.clone(),
+            ..ScriptedChild::default()
+        };
+        let started = Instant::now();
+
+        let cleanup =
+            super::cleanup_child_and_readers(child, None, Some(stdout_reader), Some(stderr_reader));
+
+        assert_eq!(cleanup.status, None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            cleanup.cleanup_error,
+            Some(PipelineError::Io {
+                operation: "reap child process",
+                message,
+            }) if message.contains("bounded cleanup exhausted")
+                && message.contains("kill-on-close termination scope will be closed")
+                && message.contains("reader ownership will be transferred")
+                && message.contains("poll child process: permanent try-wait failure")
+        ));
+        assert!(audit.events().contains(&"close-scope"));
+        let wait_started = Instant::now();
+        while audit.events().len() < 5 && wait_started.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_reap_precedes_reader_completion(&audit);
+    }
+
+    #[test]
+    fn reaped_child_with_open_pipe_reader_returns_bounded_integrity_error_without_detach() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let _ = release_receiver.recv();
+        });
+        let started = Instant::now();
+
+        let cleanup = super::cleanup_child_and_readers(
+            ScriptedChild::default(),
+            Some(observed_exit(0)),
+            Some(reader),
+            None,
+        );
+
+        assert_eq!(cleanup.status, Some(observed_exit(0)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            cleanup.cleanup_error,
+            Some(PipelineError::Io {
+                operation: "drain child process readers",
+                message,
+            }) if message.contains("bounded reader cleanup exhausted")
+                && message.contains("stdout reader ownership")
+                && message.contains("join custodian")
+        ));
+        release_sender
+            .send(())
+            .expect("custodian-owned reader must remain releasable");
+    }
+
+    #[test]
+    fn bounded_cleanup_contains_no_blocking_child_wait_call() {
+        let source = include_str!("process_runner.rs");
+        let test_module = source.find("#[cfg(test)]").expect("test module boundary");
+        let production = &source[..test_module];
+        let reap = source_section(production, "fn reap_child_bounded", "struct CleanupResult");
+
+        assert!(!production.contains("fn wait_exit"));
+        assert!(!reap.contains(".wait("));
+        assert!(reap.contains("try_wait_exit()"));
+        assert!(reap.contains("CHILD_CLEANUP_TIMEOUT"));
+        assert!(reap.contains("CHILD_CLEANUP_MAX_ATTEMPTS"));
+    }
+
+    #[test]
+    fn windows_child_is_suspended_until_job_assignment_succeeds() {
+        let source = include_str!("process_runner.rs");
+        let test_module = source.find("#[cfg(test)]").expect("test module boundary");
+        let production = &source[..test_module];
+        let configure = source_section(
+            production,
+            "fn configure_managed_child",
+            "fn create_kill_on_close_job",
+        );
+        let spawn = source_section(
+            production,
+            "fn spawn_managed_child",
+            "fn spawn_bounded_reader",
+        );
+
+        assert!(configure.contains("CREATE_NO_WINDOW | CREATE_SUSPENDED.0"));
+        let assign = spawn
+            .find("assign_child_to_job(&job, &child)")
+            .expect("Job Object assignment");
+        let resume = spawn
+            .find("resume_suspended_child(&mut child)")
+            .expect("suspended child resume");
+        assert!(assign < resume);
+        assert!(spawn[assign..resume].contains("terminate_unassigned_suspended_child(child)"));
+
+        let setup_cleanup = source_section(
+            production,
+            "fn terminate_unassigned_suspended_child",
+            "fn spawn_managed_child",
+        );
+        assert!(setup_cleanup.contains("retain_suspended_child_ownership(child)"));
+        assert!(setup_cleanup.contains("match child.kill()"));
+
+        let resume_helper = source_section(
+            production,
+            "fn resume_suspended_child",
+            "struct SuspendedChildCustodian",
+        );
+        let open = resume_helper
+            .find("OpenThread(")
+            .expect("open initial thread");
+        let ownership = resume_helper[open..]
+            .find("GetProcessIdOfThread(")
+            .map(|offset| open + offset)
+            .expect("thread ownership recheck");
+        let child_live = resume_helper[ownership..]
+            .find("child.try_wait()?")
+            .map(|offset| ownership + offset)
+            .expect("child liveness recheck");
+        let resume_thread = resume_helper[child_live..]
+            .find("ResumeThread(")
+            .map(|offset| child_live + offset)
+            .expect("resume verified thread");
+        assert!(open < ownership);
+        assert!(ownership < child_live);
+        assert!(child_live < resume_thread);
+    }
+
+    #[test]
+    fn reader_cleanup_joins_only_finished_handles_before_bounded_handoff() {
+        let source = include_str!("process_runner.rs");
+        let test_module = source.find("#[cfg(test)]").expect("test module boundary");
+        let production = &source[..test_module];
+        let drain = source_section(
+            production,
+            "fn drain_readers_bounded",
+            "fn reap_child_bounded",
+        );
+        let finished = drain
+            .find("if handle.is_finished()")
+            .expect("finished reader guard");
+        let join = drain[finished..]
+            .find("join_reader(handle")
+            .map(|offset| finished + offset)
+            .expect("guarded reader join");
+        let handoff = drain[join..]
+            .find("retain_reader_ownership(handle)")
+            .map(|offset| join + offset)
+            .expect("bounded reader handoff");
+
+        assert!(finished < join);
+        assert!(join < handoff);
+        assert!(drain.contains("READER_CLEANUP_TIMEOUT"));
+
+        let custodian = source_section(
+            production,
+            "fn reader_join_custodian",
+            "fn retain_reader_ownership",
+        );
+        let custodian_finished = custodian
+            .find("pending[index].is_finished()")
+            .expect("custodian finished guard");
+        let custodian_join = custodian[custodian_finished..]
+            .find("handle.join()")
+            .map(|offset| custodian_finished + offset)
+            .expect("custodian guarded join");
+        assert!(custodian_finished < custodian_join);
+        assert!(custodian.contains("Vec::<JoinHandle<()>>::new()"));
+        assert!(custodian.contains("recv_timeout(CONTROL_POLL_INTERVAL)"));
+    }
+
+    #[test]
+    fn permanent_cleanup_failure_is_never_hidden_by_an_existing_primary() {
         let observed_nonzero = PipelineError::ProcessFailed {
             command: "ffmpeg".into(),
             exit_code: Some(17),
@@ -2036,20 +2737,20 @@ mod tests {
             },
         ];
 
-        for expected in existing_primaries {
+        for existing in existing_primaries {
             assert_eq!(
                 super::select_process_primary(
-                    Some(expected.clone()),
+                    Some(existing),
                     Some(observed_nonzero.clone()),
                     Some(cleanup_error.clone()),
                 ),
-                Some(expected)
+                Some(cleanup_error.clone())
             );
         }
     }
 
     #[test]
-    fn observed_nonzero_process_failure_outranks_later_cleanup_error() {
+    fn cleanup_integrity_failure_outranks_observed_nonzero_process_failure() {
         let process_error = PipelineError::ProcessFailed {
             command: "ffmpeg".into(),
             exit_code: Some(17),
@@ -2061,12 +2762,8 @@ mod tests {
         };
 
         assert_eq!(
-            super::select_process_primary(
-                None,
-                Some(process_error.clone()),
-                Some(cleanup_error.clone()),
-            ),
-            Some(process_error)
+            super::select_process_primary(None, Some(process_error), Some(cleanup_error.clone()),),
+            Some(cleanup_error.clone())
         );
         assert_eq!(
             super::select_process_primary(None, None, Some(cleanup_error.clone())),
@@ -2176,10 +2873,14 @@ mod tests {
     }
 
     #[test]
-    fn production_source_has_no_deferred_cleanup_grace_pool_or_recycle_path() {
+    fn production_source_owns_unfinished_readers_without_restoring_obsolete_recycle_paths() {
         let source = include_str!("process_runner.rs");
         let test_module = source.find("#[cfg(test)]").expect("test module boundary");
         let production = &source[..test_module];
+
+        assert!(production.contains("struct ReaderJoinCustodian"));
+        assert!(production.contains("retain_reader_ownership(handle)"));
+        assert!(production.contains("drop(self.job.take())"));
 
         for removed in [
             "CALLER_CLEANUP_GRACE",
@@ -2347,14 +3048,30 @@ mod tests {
         let source = include_str!("process_runner.rs");
         let test_module = source.find("#[cfg(test)]").expect("test module boundary");
         let production = &source[..test_module];
+        let prepare = source_section(
+            production,
+            "fn prepare_stream_event(",
+            "pub(crate) fn stream_fixed_rgba_frames",
+        );
         let stream_start = production
             .find("pub(crate) fn stream_fixed_rgba_frames")
             .expect("streaming runner source");
         let stream = &production[stream_start..];
+        let lib_source = include_str!("lib.rs");
+        let lib_test_module = lib_source.find("mod tests {").expect("lib test boundary");
+        let helper = source_section(
+            &lib_source[..lib_test_module],
+            "fn validate_exact_selected_frame_stream(",
+            "fn normalized_fit_mode(",
+        );
 
-        assert!(stream.contains("next_count > max_frames"));
+        assert!(prepare.contains("next_count > max_frames"));
+        assert!(stream.contains("prepare_stream_event("));
         assert!(stream.contains("raw RGBA output ended with a partial frame"));
         assert!(!stream.contains("frame count did not match the request"));
+        assert!(!stream.contains("validate_exact_selected_frame_stream("));
+        assert!(helper.contains("expected_frame_count != actual_frame_count"));
+        assert!(helper.contains("raw RGBA output frame count did not match the request"));
     }
 
     #[test]

@@ -6,10 +6,7 @@ import {
   type CropRegion,
 } from "../components/MediaSelectionPreview";
 import { type Locale } from "../locales/messages";
-import {
-  getAppRuntime,
-  normalizeLegacyMediaError,
-} from "../platform/runtime";
+import { getAppRuntime, normalizeLegacyMediaError } from "../platform/runtime";
 import { createMediaOperationId } from "../platform/mediaOperationId";
 import type {
   MediaInspection,
@@ -125,13 +122,11 @@ export function useMediaWorkflowController({
   });
   const [optimizerPresetStrategy, setOptimizerPresetStrategy] =
     useState<OptimizerPresetStrategy>("auto");
-  const [optimizerGoal, setOptimizerGoal] =
-    useState<OptimizerGoal>("balanced");
+  const [optimizerGoal, setOptimizerGoal] = useState<OptimizerGoal>("balanced");
   const [qualityFrameDropInterval, setQualityFrameDropInterval] = useState(3);
   const [optimizerSearchDepth, setOptimizerSearchDepth] =
     useState<OptimizerSearchDepth>("standard");
-  const [cropRegion, setCropRegion] =
-    useState<CropRegion>(FULL_CROP_REGION);
+  const [cropRegion, setCropRegion] = useState<CropRegion>(FULL_CROP_REGION);
   const [cropAspectRatioPreset, setCropAspectRatioPreset] =
     useState<CropAspectRatioPreset>("free");
 
@@ -225,10 +220,7 @@ export function useMediaWorkflowController({
     setCropAspectRatioPreset("free");
   }, [getCurrentWorkflowFingerprints, invalidateWorkflowResults]);
 
-  const { toolReport, toolError } = useToolHealthReport(
-    runtime,
-    initialLocale,
-  );
+  const { toolReport, toolError } = useToolHealthReport(runtime, initialLocale);
   const {
     inspection,
     inspectionLoading,
@@ -263,9 +255,7 @@ export function useMediaWorkflowController({
       baseFrameCount,
       editedTimelineFramesForRequest,
       fingerprint,
-    }: WorkflowRequestContext): Promise<
-      WorkflowResultEnvelope<OptimizerPlanResponse> | null
-    > => {
+    }: WorkflowRequestContext): Promise<WorkflowResultEnvelope<OptimizerPlanResponse> | null> => {
       if (!inspection?.ok || inspection.isStaticImage) {
         return null;
       }
@@ -338,13 +328,7 @@ export function useMediaWorkflowController({
             );
           },
         });
-        if (
-          !isCurrentOperation(
-            "planner",
-            ticket,
-            planTicketRef.current,
-          )
-        ) {
+        if (!isCurrentOperation("planner", ticket, planTicketRef.current)) {
           return null;
         }
 
@@ -354,17 +338,11 @@ export function useMediaWorkflowController({
           fingerprint,
         );
         setPlanState(nextState);
-        return nextState.status === "cancelled"
-          ? null
-          : { fingerprint, value: result };
+        return nextState.status === "ready"
+          ? { fingerprint, value: result }
+          : null;
       } catch (error) {
-        if (
-          !isCurrentOperation(
-            "planner",
-            ticket,
-            planTicketRef.current,
-          )
-        ) {
+        if (!isCurrentOperation("planner", ticket, planTicketRef.current)) {
           return null;
         }
 
@@ -383,13 +361,7 @@ export function useMediaWorkflowController({
         );
         return null;
       } finally {
-        if (
-          isCurrentOperation(
-            "planner",
-            ticket,
-            planTicketRef.current,
-          )
-        ) {
+        if (isCurrentOperation("planner", ticket, planTicketRef.current)) {
           setPlanState((current) =>
             current.status === "loading" &&
             current.revision === stateRevision &&
@@ -428,9 +400,7 @@ export function useMediaWorkflowController({
       baseFrameCount,
       editedTimelineFramesForRequest,
       fingerprint,
-    }: WorkflowRequestContext): Promise<
-      WorkflowResultEnvelope<OptimizerSearchResponse> | null
-    > => {
+    }: WorkflowRequestContext): Promise<WorkflowResultEnvelope<OptimizerSearchResponse> | null> => {
       if (!inspection?.ok || inspection.isStaticImage) {
         return null;
       }
@@ -452,6 +422,18 @@ export function useMediaWorkflowController({
       if (!request) {
         return null;
       }
+
+      planAbortControllerRef.current?.abort();
+      planTicketRef.current += 1;
+      setPlanState((current) =>
+        current.status === "loading"
+          ? {
+              status: "cancelled",
+              revision: current.revision,
+              fingerprint: current.fingerprint,
+            }
+          : current,
+      );
 
       searchAbortControllerRef.current?.abort();
       const controller = new AbortController();
@@ -503,13 +485,7 @@ export function useMediaWorkflowController({
           },
         });
 
-        if (
-          !isCurrentOperation(
-            "export",
-            ticket,
-            searchTicketRef.current,
-          )
-        ) {
+        if (!isCurrentOperation("export", ticket, searchTicketRef.current)) {
           return null;
         }
 
@@ -523,17 +499,11 @@ export function useMediaWorkflowController({
           fingerprint,
         );
         setSearchState(nextState);
-        return nextState.status === "cancelled"
-          ? null
-          : { fingerprint, value: normalizedResult };
+        return nextState.status === "ready"
+          ? { fingerprint, value: normalizedResult }
+          : null;
       } catch (error) {
-        if (
-          !isCurrentOperation(
-            "export",
-            ticket,
-            searchTicketRef.current,
-          )
-        ) {
+        if (!isCurrentOperation("export", ticket, searchTicketRef.current)) {
           return null;
         }
 
@@ -552,13 +522,7 @@ export function useMediaWorkflowController({
         );
         return null;
       } finally {
-        if (
-          isCurrentOperation(
-            "export",
-            ticket,
-            searchTicketRef.current,
-          )
-        ) {
+        if (isCurrentOperation("export", ticket, searchTicketRef.current)) {
           setSearchState((current) =>
             current.status === "loading" &&
             current.revision === stateRevision &&
@@ -599,9 +563,7 @@ export function useMediaWorkflowController({
   const convertStaticImageToPng = useCallback(
     async (
       fingerprint: string,
-    ): Promise<
-      WorkflowResultEnvelope<StaticImageConversionResult> | null
-    > => {
+    ): Promise<WorkflowResultEnvelope<StaticImageConversionResult> | null> => {
       if (!inspection?.ok || !inspection.isStaticImage) {
         return null;
       }
@@ -666,11 +628,7 @@ export function useMediaWorkflowController({
         });
 
         if (
-          !isCurrentOperation(
-            "export",
-            ticket,
-            conversionTicketRef.current,
-          )
+          !isCurrentOperation("export", ticket, conversionTicketRef.current)
         ) {
           return null;
         }
@@ -681,16 +639,12 @@ export function useMediaWorkflowController({
           fingerprint,
         );
         setConversionState(nextState);
-        return nextState.status === "cancelled"
-          ? null
-          : { fingerprint, value: result };
+        return nextState.status === "ready"
+          ? { fingerprint, value: result }
+          : null;
       } catch (error) {
         if (
-          !isCurrentOperation(
-            "export",
-            ticket,
-            conversionTicketRef.current,
-          )
+          !isCurrentOperation("export", ticket, conversionTicketRef.current)
         ) {
           return null;
         }
@@ -710,13 +664,7 @@ export function useMediaWorkflowController({
         );
         return null;
       } finally {
-        if (
-          isCurrentOperation(
-            "export",
-            ticket,
-            conversionTicketRef.current,
-          )
-        ) {
+        if (isCurrentOperation("export", ticket, conversionTicketRef.current)) {
           setConversionState((current) =>
             current.status === "loading" &&
             current.revision === stateRevision &&

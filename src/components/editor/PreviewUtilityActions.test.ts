@@ -1,9 +1,15 @@
-import { Children, createElement, type ReactElement, type ReactNode } from "react";
+import {
+  Children,
+  createElement,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import { MESSAGES } from "../../locales/messages";
 import appSource from "../../App.tsx?raw";
+import advancedDetailsSource from "../AdvancedDetailsPanel.tsx?raw";
 import controllerSource from "../../hooks/useMediaWorkflowController.ts?raw";
 import estimateCardSource from "./OutputSizeEstimateCard.tsx?raw";
 import resultsOverlaySource from "./EditorResultsOverlay.tsx?raw";
@@ -64,7 +70,9 @@ describe("PreviewUtilityActions optimizer primary action", () => {
   it("runs optimization while idle", () => {
     const onRunOptimizer = vi.fn();
     const onCancelOptimizer = vi.fn();
-    const button = optimizerButton(props({ onRunOptimizer, onCancelOptimizer }));
+    const button = optimizerButton(
+      props({ onRunOptimizer, onCancelOptimizer }),
+    );
 
     button.props.onClick();
 
@@ -92,17 +100,20 @@ describe("PreviewUtilityActions optimizer primary action", () => {
   it.each([
     ["en", MESSAGES.en.cancelOptimizer],
     ["ko", MESSAGES.ko.cancelOptimizer],
-  ] as const)("uses the %s cancel label for visible and accessible copy", (_locale, label) => {
-    const button = optimizerButton(
-      props({
-        copy: _locale === "en" ? MESSAGES.en : MESSAGES.ko,
-        searchLoading: true,
-      }),
-    );
+  ] as const)(
+    "uses the %s cancel label for visible and accessible copy",
+    (_locale, label) => {
+      const button = optimizerButton(
+        props({
+          copy: _locale === "en" ? MESSAGES.en : MESSAGES.ko,
+          searchLoading: true,
+        }),
+      );
 
-    expect(renderToStaticMarkup(button)).toContain(label);
-    expect(button.props["aria-label"]).toBe(label);
-  });
+      expect(renderToStaticMarkup(button)).toContain(label);
+      expect(button.props["aria-label"]).toBe(label);
+    },
+  );
 
   it("keeps an active cancel action enabled even if ordinary start prerequisites disappear", () => {
     const onCancelOptimizer = vi.fn();
@@ -189,7 +200,9 @@ describe("PreviewUtilityActions optimizer primary action", () => {
 describe("Task 16 UI source contracts", () => {
   it("shows exact probing only for a sampled near-limit estimate", () => {
     expect(estimateCardSource).toContain('estimate?.kind === "range"');
-    expect(estimateCardSource).toContain('classifyEstimate(estimate) === "near-limit"');
+    expect(estimateCardSource).toContain(
+      'classifyEstimate(estimate) === "near-limit"',
+    );
     expect(estimateCardSource).toContain("copy.checkExactCandidateSize");
     expect(estimateCardSource).toContain("copy.exactProbeNoOutput");
   });
@@ -205,13 +218,41 @@ describe("Task 16 UI source contracts", () => {
     expect(warningBlock).not.toContain("toolDetail");
   });
 
-  it("keeps the full plan for estimates and slices only the display projection", () => {
+  it("estimates from the full plan while keeping the display projection bounded", () => {
     expect(controllerSource).not.toContain(
       "candidates: result.candidates.slice(0, advancedPreviewCount)",
     );
     expect(appSource).toContain(
       "candidates: fullPlan.candidates.slice(0, ADVANCED_PREVIEW_COUNT)",
     );
+    const estimateHook = appSource.slice(
+      appSource.indexOf("const outputSizeEstimate = useOutputSizeEstimate"),
+      appSource.indexOf("const currentEstimateState"),
+    );
+    expect(estimateHook).toContain("plan: fullPlan");
+  });
+
+  it("keeps estimate recovery visible in the candidate overlay", () => {
+    expect(advancedDetailsSource).toContain("showSharedCandidateEstimateState");
+    expect(advancedDetailsSource).toContain('estimateState.status === "error"');
+    expect(advancedDetailsSource).toContain(
+      "onRetryEstimate={onRetryEstimate}",
+    );
+    expect(advancedDetailsSource).toContain("estimateState={estimateState}");
+  });
+
+  it("keeps one keyed exact-probe action across loading transitions", () => {
+    expect(estimateCardSource).toContain('key="exact-probe-action"');
+    expect(estimateCardSource).toContain("probeActionCancels");
+    expect(estimateCardSource).toContain("showProbeControls");
+  });
+
+  it("offers a truthful plan refresh action before estimating changed settings", () => {
+    expect(estimateCardSource).toContain("planLoading");
+    expect(estimateCardSource).toContain("onRequestPlan");
+    expect(estimateCardSource).toContain("copy.estimateWaitingForPlan");
+    expect(estimateCardSource).toContain("copy.buildPreview");
+    expect(appSource).toContain("handleBuildPreviewCandidates");
   });
 
   it("renders actual bytes, elapsed time, warnings, and a representative failure", () => {

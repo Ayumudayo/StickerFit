@@ -31,7 +31,11 @@ describe("createMediaOperationId", () => {
   it("uses a cryptographic session prefix and counter for 10,000 fallback IDs", async () => {
     let seed = 1;
     const getRandomValues = vi.fn(<T extends ArrayBufferView>(value: T) => {
-      const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      const bytes = new Uint8Array(
+        value.buffer,
+        value.byteOffset,
+        value.byteLength,
+      );
       bytes.fill(seed++);
       return value;
     });
@@ -51,7 +55,9 @@ describe("createMediaOperationId", () => {
   it("does not reuse IDs across simulated hook or component remounts", async () => {
     vi.stubGlobal("crypto", {
       getRandomValues: <T extends ArrayBufferView>(value: T) => {
-        new Uint8Array(value.buffer, value.byteOffset, value.byteLength).fill(0x5a);
+        new Uint8Array(value.buffer, value.byteOffset, value.byteLength).fill(
+          0x5a,
+        );
         return value;
       },
     });
@@ -67,7 +73,9 @@ describe("createMediaOperationId", () => {
   it("uses a different fallback session prefix after a module reload", async () => {
     let seed = 0x10;
     const getRandomValues = vi.fn(<T extends ArrayBufferView>(value: T) => {
-      new Uint8Array(value.buffer, value.byteOffset, value.byteLength).fill(seed++);
+      new Uint8Array(value.buffer, value.byteOffset, value.byteLength).fill(
+        seed++,
+      );
       return value;
     });
     vi.stubGlobal("crypto", {

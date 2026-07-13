@@ -274,6 +274,7 @@ impl PipelineError {
         self.error_code().as_str()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reason_code(&self) -> Option<&'static str> {
         self.media_reason_code().map(|reason| reason.as_str())
     }
@@ -705,19 +706,27 @@ mod tests {
             let end = tail.find("\n}").expect("managed response struct end");
             let definition = &tail[..end];
             assert!(
-                definition.contains("error_code: Option<MediaOperationErrorCode>"),
+                definition
+                    .lines()
+                    .any(|line| line.trim() == "error_code: Option<MediaOperationErrorCode>,"),
                 "{marker} error code must be closed"
             );
             assert!(
-                definition.contains("reason_code: Option<MediaOperationReasonCode>"),
+                definition
+                    .lines()
+                    .any(|line| line.trim() == "reason_code: Option<MediaOperationReasonCode>,"),
                 "{marker} reason code must be closed"
             );
             assert!(
-                !definition.contains("error_code: Option<String>"),
+                !definition
+                    .lines()
+                    .any(|line| line.trim() == "error_code: Option<String>,"),
                 "{marker}"
             );
             assert!(
-                !definition.contains("reason_code: Option<String>"),
+                !definition
+                    .lines()
+                    .any(|line| line.trim() == "reason_code: Option<String>,"),
                 "{marker}"
             );
         }

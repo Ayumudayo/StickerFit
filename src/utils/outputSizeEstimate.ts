@@ -5,15 +5,10 @@ import type {
 } from "../types/workflow";
 
 export type EstimateLimitStatus =
-  | "within"
-  | "over"
-  | "likely-within"
-  | "near-limit"
-  | "likely-over";
+  "within" | "over" | "likely-within" | "near-limit" | "likely-over";
 
 export type ExactOutputSizeEstimate =
-  | ExactStaticSizeEstimate
-  | ExactCandidateSizeEstimate;
+  ExactStaticSizeEstimate | ExactCandidateSizeEstimate;
 
 export function isExactEstimate(
   estimate: OutputSizeEstimate,
@@ -40,10 +35,7 @@ export function classifyEstimate(
 }
 
 export type OptimizerStopReason =
-  | "best-ranked-within-limit"
-  | "budget-exhausted"
-  | "cancelled"
-  | "failed";
+  "best-ranked-within-limit" | "budget-exhausted" | "cancelled" | "failed";
 
 export function normalizeOptimizerStopReason(
   reason: string | null,

@@ -7,6 +7,27 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Get-FileSha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+      $sha256.Dispose()
+    }
+  }
+  finally {
+    $stream.Dispose()
+  }
+}
+
 function Get-PathSizeBytes {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -35,7 +56,7 @@ function New-ArtifactRecord {
   $sha256 = if ($item.PSIsContainer) {
     $null
   } else {
-    (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    Get-FileSha256 -Path $item.FullName
   }
 
   return [pscustomobject][ordered]@{
@@ -204,7 +225,7 @@ $report = [pscustomobject][ordered]@{
   commitSha = Get-CheckedGitCommit -ResolvedWorkspaceRoot $resolvedWorkspaceRoot
   installedFootprintBytes = $installedFootprintBytes
   installedFootprintMiB = [math]::Round(($installedFootprintBytes / 1MB), 2)
-  artifacts = @($artifacts)
+  artifacts = $artifacts.ToArray()
   webDist = $distRecord
 }
 

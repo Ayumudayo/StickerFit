@@ -46,9 +46,16 @@ export function useFrameSelectionCommands({
   }, [closeFrameContextMenu, setSelectedInstanceIds, timelineFrames]);
 
   const invertFrameSelection = useCallback(() => {
-    setSelectedInstanceIds(invertTimelineSelection(timelineFrames, selectedInstanceIds));
+    setSelectedInstanceIds(
+      invertTimelineSelection(timelineFrames, selectedInstanceIds),
+    );
     closeFrameContextMenu();
-  }, [closeFrameContextMenu, selectedInstanceIds, setSelectedInstanceIds, timelineFrames]);
+  }, [
+    closeFrameContextMenu,
+    selectedInstanceIds,
+    setSelectedInstanceIds,
+    timelineFrames,
+  ]);
 
   const moveSelectedFrames = useCallback(
     (direction: -1 | 1) => {

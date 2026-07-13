@@ -55,7 +55,10 @@ export function PreviewInfoBar({
       </div>
 
       <div className="previewInfoSettings">
-        <label className="previewInfoField previewInfoFieldCrop" htmlFor="preview-crop-aspect-ratio-select">
+        <label
+          className="previewInfoField previewInfoFieldCrop"
+          htmlFor="preview-crop-aspect-ratio-select"
+        >
           <span className="metaLabel">{copy.cropAspectRatio}</span>
           <div className="previewInlineSelectShell">
             <select
@@ -63,7 +66,9 @@ export function PreviewInfoBar({
               className="previewInlineSelect"
               value={cropAspectRatioPreset}
               onChange={(event) =>
-                onCropAspectRatioPresetChange(event.target.value as CropAspectRatioPreset)
+                onCropAspectRatioPresetChange(
+                  event.target.value as CropAspectRatioPreset,
+                )
               }
             >
               <option value="free">{copy.cropAspectRatioFree}</option>

@@ -1,10 +1,7 @@
 import { useId } from "react";
 
 import type { MessagesForLocale } from "../../locales/messages";
-import type {
-  OptimizerGoal,
-  OptimizerSearchDepth,
-} from "../../types/workflow";
+import type { OptimizerGoal, OptimizerSearchDepth } from "../../types/workflow";
 
 import { ChevronDownIcon, SettingsIcon } from "../AppIcons";
 
@@ -99,7 +96,9 @@ export function AdvancedOptimizerSettingsPanel({
               className="fieldSelect"
               value={optimizerSearchDepth}
               onChange={(event) =>
-                onOptimizerSearchDepthChange(event.target.value as OptimizerSearchDepth)
+                onOptimizerSearchDepthChange(
+                  event.target.value as OptimizerSearchDepth,
+                )
               }
             >
               <option value="standard">{copy.searchDepthStandard}</option>
@@ -109,7 +108,9 @@ export function AdvancedOptimizerSettingsPanel({
           </div>
         </label>
       </div>
-      <p className="detailText estimateSettingsHint">{copy.estimateSettingsHint}</p>
+      <p className="detailText estimateSettingsHint">
+        {copy.estimateSettingsHint}
+      </p>
     </section>
   );
 }

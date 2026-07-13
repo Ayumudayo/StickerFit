@@ -11,9 +11,7 @@ describe("timeline frame durations", () => {
     const frames = buildSourceFrames(1, 3, null);
 
     expect(frames.map((frame) => frame.durationUs)).toEqual([
-      333_334,
-      333_333,
-      333_333,
+      333_334, 333_333, 333_333,
     ]);
     expect(frames.reduce((sum, frame) => sum + frame.durationUs, 0)).toBe(
       1_000_000,
@@ -28,11 +26,11 @@ describe("timeline frame durations", () => {
     );
 
     expect(frames.map((frame) => frame.durationUs)).toEqual([
-      16_667,
-      16_667,
-      16_666,
+      16_667, 16_667, 16_666,
     ]);
-    expect(frames.reduce((sum, frame) => sum + frame.durationUs, 0)).toBe(50_000);
+    expect(frames.reduce((sum, frame) => sum + frame.durationUs, 0)).toBe(
+      50_000,
+    );
   });
 
   it("derives timeline view start times from integer microseconds", () => {
@@ -43,14 +41,10 @@ describe("timeline frame durations", () => {
     );
 
     expect(views.map((frame) => frame.startTimeUs)).toEqual([
-      0,
-      333_334,
-      666_667,
+      0, 333_334, 666_667,
     ]);
     expect(views.map((frame) => frame.startTimeSeconds)).toEqual([
-      0,
-      0.333334,
-      0.666667,
+      0, 0.333334, 0.666667,
     ]);
   });
 

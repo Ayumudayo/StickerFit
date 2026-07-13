@@ -10,9 +10,11 @@ import type {
   OptimizerCandidatePreview,
   OutputSizeEstimate,
 } from "../types/workflow";
+import appSource from "../App.tsx?raw";
 import hookSource from "./useOutputSizeEstimate.ts?raw";
 import {
   createOutputSizeEstimateCoordinator,
+  exactEstimateCacheKey,
   sampleSeedFromFingerprint,
   selectCandidatesForEstimate,
   type OutputEstimateCoordinatorState,
@@ -99,10 +101,7 @@ function estimateList(candidateId: string): OutputSizeEstimate[] {
   return [exactCandidate(candidateId)];
 }
 
-function progress(
-  operationId: string,
-  completed: number,
-): OperationProgress {
+function progress(operationId: string, completed: number): OperationProgress {
   return {
     operationId,
     stage: "estimating",
@@ -124,13 +123,9 @@ describe("output-size candidate selection", () => {
       candidate("rank-5", 5, 0.6),
     ];
 
-    expect(selectCandidatesForEstimate(candidates).map((value) => value.id)).toEqual([
-      "rank-1",
-      "rank-2",
-      "rank-3",
-      "compact-plus",
-      "compact",
-    ]);
+    expect(
+      selectCandidatesForEstimate(candidates).map((value) => value.id),
+    ).toEqual(["rank-1", "rank-2", "rank-3", "compact-plus", "compact"]);
   });
 
   it("deduplicates overlap without backfilling beyond the frozen top-three plus-smallest-two union", () => {
@@ -143,17 +138,19 @@ describe("output-size candidate selection", () => {
       candidate("rank-6", 6, 0.5),
     ];
 
-    expect(selectCandidatesForEstimate(candidates).map((value) => value.id)).toEqual([
-      "rank-1",
-      "rank-2",
-      "rank-3",
-    ]);
+    expect(
+      selectCandidatesForEstimate(candidates).map((value) => value.id),
+    ).toEqual(["rank-1", "rank-2", "rank-3"]);
     expect(selectCandidatesForEstimate(candidates)).toHaveLength(3);
   });
 
   it("uses deterministic tie breaks and never returns more than five candidates", () => {
     const candidates = Array.from({ length: 12 }, (_, index) =>
-      candidate(`candidate-${String(index + 1).padStart(2, "0")}`, index + 1, 0.5),
+      candidate(
+        `candidate-${String(index + 1).padStart(2, "0")}`,
+        index + 1,
+        0.5,
+      ),
     );
     const selected = selectCandidatesForEstimate(candidates);
 
@@ -163,6 +160,30 @@ describe("output-size candidate selection", () => {
       "candidate-03",
     ]);
     expect(selected.length).toBeLessThanOrEqual(5);
+  });
+
+  it("keeps a compact candidate beyond the six-item display projection eligible", () => {
+    const fullPlanCandidates = Array.from({ length: 8 }, (_, index) =>
+      candidate(
+        index === 7 ? "rank-8-compact" : `rank-${index + 1}`,
+        index + 1,
+        index === 7 ? 0.05 : 1 - index / 20,
+      ),
+    );
+    const displayedCandidates = fullPlanCandidates.slice(0, 6);
+
+    expect(
+      selectCandidatesForEstimate(fullPlanCandidates).map((value) => value.id),
+    ).toContain("rank-8-compact");
+    expect(
+      selectCandidatesForEstimate(displayedCandidates).map((value) => value.id),
+    ).not.toContain("rank-8-compact");
+    expect(appSource).toContain(
+      "candidates: fullPlan.candidates.slice(0, ADVANCED_PREVIEW_COUNT)",
+    );
+    expect(appSource).toMatch(
+      /useOutputSizeEstimate\(\{\s*runtime,\s*inspection,\s*plan: fullPlan,/,
+    );
   });
 });
 
@@ -270,7 +291,9 @@ describe("output-size estimate coordinator", () => {
     expect(optionsA.signal?.aborted).toBe(true);
     requestA.resolve(estimateList("stale-a"));
     await settleMicrotasks();
-    expect(coordinator.getState().estimate).toMatchObject({ status: "loading" });
+    expect(coordinator.getState().estimate).toMatchObject({
+      status: "loading",
+    });
 
     await vi.advanceTimersByTimeAsync(400);
     await settleMicrotasks();
@@ -387,7 +410,9 @@ describe("output-size estimate coordinator", () => {
       },
     });
     await settleMicrotasks();
-    expect(coordinator.getState().probe.revision).toBeGreaterThan(firstRevision);
+    expect(coordinator.getState().probe.revision).toBeGreaterThan(
+      firstRevision,
+    );
     first.resolve(exactCandidate("candidate-a", 500 * 1024));
     await settleMicrotasks();
     expect(coordinator.getState().probe).toMatchObject({ status: "loading" });
@@ -415,6 +440,81 @@ describe("output-size estimate coordinator", () => {
       candidateId: "candidate-a",
       code: "internal-task-failed",
     });
+  });
+
+  it("caches exact probes by fingerprint and candidate while another probe runs", async () => {
+    const { coordinator } = createHarness();
+    const candidateB = deferred<ExactCandidateSizeEstimate>();
+    const exactA = exactCandidate("candidate-a", 470 * 1024);
+
+    coordinator.startProbe({
+      fingerprint: "encoding-a",
+      candidateId: "candidate-a",
+      run: async () => exactA,
+    });
+    await settleMicrotasks();
+
+    const keyA = exactEstimateCacheKey("encoding-a", "candidate-a");
+    expect(coordinator.getState().exactEstimateCache.get(keyA)).toBe(exactA);
+
+    coordinator.startProbe({
+      fingerprint: "encoding-a",
+      candidateId: "candidate-b",
+      run: () => candidateB.promise,
+    });
+    await settleMicrotasks();
+
+    expect(coordinator.getState().probe).toMatchObject({
+      status: "loading",
+      candidateId: "candidate-b",
+    });
+    expect(coordinator.getState().exactEstimateCache.get(keyA)).toBe(exactA);
+
+    const exactB = exactCandidate("candidate-b", 480 * 1024);
+    candidateB.resolve(exactB);
+    await settleMicrotasks();
+
+    expect(
+      coordinator
+        .getState()
+        .exactEstimateCache.get(
+          exactEstimateCacheKey("encoding-a", "candidate-b"),
+        ),
+    ).toBe(exactB);
+    expect(
+      coordinator
+        .getState()
+        .exactEstimateCache.get(
+          exactEstimateCacheKey("encoding-b", "candidate-a"),
+        ),
+    ).toBeUndefined();
+  });
+
+  it("bounds exact probe history and evicts the least recently cached entry", async () => {
+    const { coordinator } = createHarness();
+
+    for (let index = 0; index < 24; index += 1) {
+      const fingerprint = `encoding-${index}`;
+      coordinator.invalidate(fingerprint);
+      coordinator.startProbe({
+        fingerprint,
+        candidateId: "candidate-a",
+        run: async () => exactCandidate("candidate-a", (index + 1) * 1024),
+      });
+      await settleMicrotasks();
+    }
+
+    const cache = coordinator.getState().exactEstimateCache;
+    expect(cache.size).toBe(20);
+    expect(
+      cache.get(exactEstimateCacheKey("encoding-3", "candidate-a")),
+    ).toBeUndefined();
+    expect(
+      cache.get(exactEstimateCacheKey("encoding-4", "candidate-a")),
+    ).toMatchObject({ bytes: 5 * 1024 });
+    expect(
+      cache.get(exactEstimateCacheKey("encoding-23", "candidate-a")),
+    ).toMatchObject({ bytes: 24 * 1024 });
   });
 
   it("clears pending timers and aborts active estimate and probe work on dispose", async () => {
@@ -469,7 +569,9 @@ describe("useOutputSizeEstimate source contract", () => {
   it("does not invoke desktop estimate APIs in web runtime or synthesize input-size estimates", () => {
     const webGuard = hookSource.indexOf('runtime.kind === "web"');
     const staticInvoke = hookSource.indexOf("runtime.estimateStaticOutputSize");
-    const candidateInvoke = hookSource.indexOf("runtime.estimateOptimizerCandidates");
+    const candidateInvoke = hookSource.indexOf(
+      "runtime.estimateOptimizerCandidates",
+    );
 
     expect(webGuard).toBeGreaterThanOrEqual(0);
     expect(webGuard).toBeLessThan(staticInvoke);
@@ -489,11 +591,13 @@ describe("useOutputSizeEstimate source contract", () => {
     expect(hookSource).not.toContain("if (plan === null");
   });
 
-  it("limits probes to current near-limit sampled candidates and overlays only matching exact results", () => {
+  it("limits probes to current near-limit sampled candidates and overlays fingerprint-keyed exact results", () => {
     expect(hookSource).toContain('estimate?.kind === "range"');
     expect(hookSource).toContain("estimate.lowerBytes <= estimate.limitBytes");
     expect(hookSource).toContain("estimate.upperBytes > estimate.limitBytes");
-    expect(hookSource).toContain("estimate.candidateId === probe.candidateId");
-    expect(hookSource).toContain("overlaid[index] = probe.value");
+    expect(hookSource).toContain("state.exactEstimateCache.get(");
+    expect(hookSource).toContain(
+      "exactEstimateCacheKey(encodingFingerprint, estimate.candidateId)",
+    );
   });
 });

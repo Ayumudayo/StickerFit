@@ -23,7 +23,9 @@ async function createSmokeVideoPath() {
   const tempDir = await mkdtemp(path.join(tmpdir(), "stickerfit-web-smoke-"));
   const outputPath = path.join(tempDir, "smoke.webm");
   const buffer = Buffer.from(TINY_WEBM_BASE64, "base64");
-  await import("node:fs/promises").then(({ writeFile }) => writeFile(outputPath, buffer));
+  await import("node:fs/promises").then(({ writeFile }) =>
+    writeFile(outputPath, buffer),
+  );
 
   return outputPath;
 }
@@ -41,7 +43,9 @@ test("renders the web preview start screen", async ({ page }) => {
     page.getByRole("heading", { name: "Discord sticker converter" }),
   ).toBeVisible();
   await expect(
-    page.getByText("Web mode supports file inspection, crop, zoom, and timeline review."),
+    page.getByText(
+      "Web mode supports file inspection, crop, zoom, and timeline review.",
+    ),
   ).toBeVisible();
 });
 
@@ -54,7 +58,9 @@ test("loads a still image in web preview mode", async ({ page }) => {
     buffer: Buffer.from(TINY_PNG_BASE64, "base64"),
   });
 
-  await expect(page.getByRole("button", { name: "Convert to PNG" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Convert to PNG" }),
+  ).toBeVisible();
   await expect(page.getByText("Frame rate")).toHaveCount(0);
 
   const hasPageScroll = await page.evaluate(
@@ -73,7 +79,9 @@ test("does not expose a redundant image fitting mode", async ({ page }) => {
     buffer: Buffer.from(TINY_PNG_BASE64, "base64"),
   });
 
-  await expect(page.getByRole("button", { name: "Convert to PNG" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Convert to PNG" }),
+  ).toBeVisible();
   await expect(page.getByLabel("Image fitting")).toHaveCount(0);
 
   await page.getByRole("button", { name: "KO" }).click();
@@ -93,16 +101,22 @@ test("opens and closes the advanced settings overlay for video preview", async (
   try {
     await chooseInputFile(page, videoPath);
 
-    const settingsToggle = page.getByRole("button", { name: "Show advanced settings" });
+    const settingsToggle = page.getByRole("button", {
+      name: "Show advanced settings",
+    });
     const overlayDialog = page.getByRole("dialog");
     await expect(settingsToggle).toBeVisible();
     await settingsToggle.click();
     await expect(
       overlayDialog.getByRole("heading", { name: "Advanced settings" }),
     ).toBeVisible();
-    await expect(overlayDialog.locator("[data-dialog-initial-focus]")).toBeFocused();
+    await expect(
+      overlayDialog.locator("[data-dialog-initial-focus]"),
+    ).toBeFocused();
 
-    const closeButton = overlayDialog.getByRole("button", { name: "Close panel" });
+    const closeButton = overlayDialog.getByRole("button", {
+      name: "Close panel",
+    });
     const lastSelect = overlayDialog.locator("select").last();
     await page.keyboard.press("Shift+Tab");
     await expect(lastSelect).toBeFocused();
@@ -137,14 +151,20 @@ test("supports keyboard timeline and crop movement without global shortcut leaka
   try {
     await chooseInputFile(page, videoPath);
 
-    const timeline = page.getByRole("slider", { name: "Timeline & frame controls" });
+    const timeline = page.getByRole("slider", {
+      name: "Timeline & frame controls",
+    });
     await expect(timeline).toHaveAttribute("aria-valuenow", "0");
     await timeline.press("ArrowRight");
-    await expect.poll(async () => Number(await timeline.getAttribute("aria-valuenow")))
+    await expect
+      .poll(async () => Number(await timeline.getAttribute("aria-valuenow")))
       .toBeGreaterThan(0);
     await timeline.press("End");
     const maximumTimeUs = Number(await timeline.getAttribute("aria-valuemax"));
-    await expect(timeline).toHaveAttribute("aria-valuenow", String(maximumTimeUs));
+    await expect(timeline).toHaveAttribute(
+      "aria-valuenow",
+      String(maximumTimeUs),
+    );
     await timeline.press("PageDown");
     await expect(timeline).toHaveAttribute(
       "aria-valuenow",
@@ -158,7 +178,8 @@ test("supports keyboard timeline and crop movement without global shortcut leaka
     await timeline.press("Home");
     await expect(timeline).toHaveAttribute("aria-valuenow", "0");
     await timeline.press("ArrowUp");
-    await expect.poll(async () => Number(await timeline.getAttribute("aria-valuenow")))
+    await expect
+      .poll(async () => Number(await timeline.getAttribute("aria-valuenow")))
       .toBeGreaterThan(0);
     await timeline.press("ArrowDown");
     await expect(timeline).toHaveAttribute("aria-valuenow", "0");
@@ -187,6 +208,7 @@ test("supports keyboard timeline and crop movement without global shortcut leaka
     await expect(liveSummary).not.toHaveText(beforeMoveSummary ?? "");
 
     await page.getByLabel("Crop ratio").selectOption("1:1");
+    await topRightHandle.press("Shift+ArrowLeft");
     const lockedHandleBox = await topRightHandle.boundingBox();
     expect(lockedHandleBox).not.toBeNull();
     await topRightHandle.press("ArrowRight");
@@ -197,7 +219,10 @@ test("supports keyboard timeline and crop movement without global shortcut leaka
     await selectionBox.press("ArrowLeft");
     const cropFocusStyle = await selectionBox.evaluate((element) => {
       const style = getComputedStyle(element);
-      return { outlineStyle: style.outlineStyle, outlineOffset: style.outlineOffset };
+      return {
+        outlineStyle: style.outlineStyle,
+        outlineOffset: style.outlineOffset,
+      };
     });
     expect(cropFocusStyle.outlineStyle).not.toBe("none");
     expect(Number.parseFloat(cropFocusStyle.outlineOffset)).toBeLessThan(0);
@@ -207,7 +232,9 @@ test("supports keyboard timeline and crop movement without global shortcut leaka
   }
 });
 
-test("uses menu semantics, roving focus, and Escape opener restoration", async ({ page }) => {
+test("uses menu semantics, roving focus, and Escape opener restoration", async ({
+  page,
+}) => {
   await page.goto("/");
 
   const videoPath = await createSmokeVideoPath();
@@ -239,13 +266,17 @@ test("uses menu semantics, roving focus, and Escape opener restoration", async (
     await frame2.click({ button: "right" });
     await menu.getByRole("menuitem", { name: "Cut", exact: true }).click();
     await expect(page.locator("[data-instance-id]")).toHaveCount(0);
-    await expect(page.locator(".frameRailEmptyState button:not(:disabled)")).toBeFocused();
+    await expect(
+      page.locator(".frameRailEmptyState button:not(:disabled)"),
+    ).toBeFocused();
   } finally {
     await rm(path.dirname(videoPath), { force: true, recursive: true });
   }
 });
 
-test("bounds a synthetic 240-frame rail and keeps one roving tab stop", async ({ page }) => {
+test("bounds a synthetic 240-frame rail and keeps one roving tab stop", async ({
+  page,
+}) => {
   await page.addInitScript(() => {
     Object.defineProperty(HTMLMediaElement.prototype, "duration", {
       configurable: true,
@@ -267,7 +298,8 @@ test("bounds a synthetic 240-frame rail and keeps one roving tab stop", async ({
     const initialMetrics = await frameTableBody.evaluate((element) => ({
       clientHeight: element.clientHeight,
       optionCount: element.querySelectorAll("[role='option']").length,
-      activeCount: element.querySelectorAll("[role='option'][tabindex='0']").length,
+      activeCount: element.querySelectorAll("[role='option'][tabindex='0']")
+        .length,
     }));
     expect(initialMetrics.optionCount).toBeLessThanOrEqual(
       Math.ceil(initialMetrics.clientHeight / 48) + 8,
@@ -278,13 +310,17 @@ test("bounds a synthetic 240-frame rail and keeps one roving tab stop", async ({
     const lastFrame = page.locator('[data-instance-id="frame-240"]');
     await expect(lastFrame).toBeFocused();
     await expect(lastFrame).toHaveAttribute("tabindex", "0");
-    await expect(frameTableBody.locator("[role='option'][tabindex='0']")).toHaveCount(1);
+    await expect(
+      frameTableBody.locator("[role='option'][tabindex='0']"),
+    ).toHaveCount(1);
   } finally {
     await rm(path.dirname(videoPath), { force: true, recursive: true });
   }
 });
 
-test("supports Explorer-style frame selection and drag reorder", async ({ page }) => {
+test("supports Explorer-style frame selection and drag reorder", async ({
+  page,
+}) => {
   await page.goto("/");
 
   const videoPath = await createSmokeVideoPath();
@@ -306,7 +342,9 @@ test("supports Explorer-style frame selection and drag reorder", async ({ page }
     await expect(frame2).toHaveAttribute("aria-selected", "true");
     await expect(frame3).toHaveAttribute("aria-selected", "true");
     await expect(frame4).toHaveAttribute("aria-selected", "true");
-    await expect(page.locator("[data-preview-frame-canvas='true']")).toBeVisible();
+    await expect(
+      page.locator("[data-preview-frame-canvas='true']"),
+    ).toBeVisible();
     await expect.poll(() => readPreviewVideoTime(page)).toBeGreaterThan(0.1);
     const frame4PreviewTime = await readPreviewVideoTime(page);
 
@@ -320,7 +358,9 @@ test("supports Explorer-style frame selection and drag reorder", async ({ page }
     await expect(frame3).toHaveAttribute("aria-selected", "false");
     await expect(frame4).toHaveAttribute("aria-selected", "false");
     await expect(page.locator("video")).toHaveJSProperty("paused", true);
-    await expect.poll(() => readPreviewVideoTime(page)).toBeLessThan(frame4PreviewTime);
+    await expect
+      .poll(() => readPreviewVideoTime(page))
+      .toBeLessThan(frame4PreviewTime);
 
     await frame2.click();
     await frame4.click({ modifiers: ["Shift"] });
@@ -337,7 +377,10 @@ test("supports Explorer-style frame selection and drag reorder", async ({ page }
       return;
     }
 
-    await page.mouse.move(frame4Box.x + frame4Box.width / 2, frame4Box.y + frame4Box.height / 2);
+    await page.mouse.move(
+      frame4Box.x + frame4Box.width / 2,
+      frame4Box.y + frame4Box.height / 2,
+    );
     await page.mouse.down();
     await page.mouse.move(
       frame5Box.x + frame5Box.width / 2,
@@ -367,7 +410,9 @@ test("supports Explorer-style frame selection and drag reorder", async ({ page }
   }
 });
 
-test("drags an unselected frame as a single selected item", async ({ page }) => {
+test("drags an unselected frame as a single selected item", async ({
+  page,
+}) => {
   await page.goto("/");
 
   const videoPath = await createSmokeVideoPath();
@@ -388,7 +433,10 @@ test("drags an unselected frame as a single selected item", async ({ page }) => 
       return;
     }
 
-    await page.mouse.move(frame2Box.x + frame2Box.width / 2, frame2Box.y + frame2Box.height / 2);
+    await page.mouse.move(
+      frame2Box.x + frame2Box.width / 2,
+      frame2Box.y + frame2Box.height / 2,
+    );
     await page.mouse.down();
     await page.mouse.move(
       frame5Box.x + frame5Box.width / 2,
@@ -432,7 +480,8 @@ test("clamps roving frame navigation and scrolls Home and End into view", async 
 
     await frame5.click();
     await expect(frame5).toHaveAttribute("aria-selected", "true");
-    await expect.poll(() => frameTableBody.evaluate((element) => element.scrollTop))
+    await expect
+      .poll(() => frameTableBody.evaluate((element) => element.scrollTop))
       .toBeGreaterThan(0);
 
     await frame5.press("ArrowDown");
@@ -443,7 +492,8 @@ test("clamps roving frame navigation and scrolls Home and End into view", async 
     await expect(frame1).toHaveAttribute("aria-selected", "true");
     await expect(frame5).toHaveAttribute("aria-selected", "false");
     await expect(frame1).toBeFocused();
-    await expect.poll(() => frameTableBody.evaluate((element) => element.scrollTop))
+    await expect
+      .poll(() => frameTableBody.evaluate((element) => element.scrollTop))
       .toBe(0);
 
     await frame1.press("ArrowUp");
@@ -459,7 +509,8 @@ test("clamps roving frame navigation and scrolls Home and End into view", async 
     await expect(frame5).toHaveAttribute("aria-selected", "true");
     await expect(frame1).toHaveAttribute("aria-selected", "false");
     await expect(frame5).toBeFocused();
-    await expect.poll(() => frameTableBody.evaluate((element) => element.scrollTop))
+    await expect
+      .poll(() => frameTableBody.evaluate((element) => element.scrollTop))
       .toBeGreaterThan(0);
   } finally {
     await rm(path.dirname(videoPath), { force: true, recursive: true });
@@ -475,7 +526,9 @@ test("limits global shortcuts to editor background and ignores interactive contr
   try {
     await chooseInputFile(page, videoPath);
 
-    const settingsToggle = page.getByRole("button", { name: "Show advanced settings" });
+    const settingsToggle = page.getByRole("button", {
+      name: "Show advanced settings",
+    });
     const overlayDialog = page.getByRole("dialog");
     const frame2 = page.locator('[data-instance-id="frame-2"]');
     const frame3 = page.locator('[data-instance-id="frame-3"]');
@@ -526,7 +579,9 @@ test("limits global shortcuts to editor background and ignores interactive contr
   }
 });
 
-test("renders a visible focus indicator for the active frame option", async ({ page }) => {
+test("renders a visible focus indicator for the active frame option", async ({
+  page,
+}) => {
   await page.goto("/");
 
   const videoPath = await createSmokeVideoPath();
@@ -535,7 +590,9 @@ test("renders a visible focus indicator for the active frame option", async ({ p
 
     const frame1 = page.locator('[data-instance-id="frame-1"]');
     for (let step = 0; step < 20; step += 1) {
-      if (await frame1.evaluate((element) => document.activeElement === element)) {
+      if (
+        await frame1.evaluate((element) => document.activeElement === element)
+      ) {
         break;
       }
       await page.keyboard.press("Tab");
@@ -543,7 +600,10 @@ test("renders a visible focus indicator for the active frame option", async ({ p
     await expect(frame1).toBeFocused();
     const focusStyle = await frame1.evaluate((element) => {
       const style = getComputedStyle(element);
-      return { outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth };
+      return {
+        outlineStyle: style.outlineStyle,
+        outlineWidth: style.outlineWidth,
+      };
     });
 
     expect(focusStyle.outlineStyle).not.toBe("none");
@@ -588,22 +648,27 @@ test("tracks playback in the frame rail with a single active selection", async (
       .poll(async () =>
         page.evaluate(() => {
           const activeElement = document.activeElement;
-          return activeElement instanceof HTMLElement &&
-            activeElement.matches(".frameRow[aria-selected='false']");
+          return (
+            activeElement instanceof HTMLElement &&
+            activeElement.matches(".frameRow[aria-selected='false']")
+          );
         }),
       )
       .toBe(false);
 
     await expect(page.locator(".frameRow.is-current")).toHaveCount(0);
     await expect(page.locator(".frameDot")).toHaveCount(0);
-    await expect.poll(() => frameTableBody.evaluate((element) => element.scrollTop))
+    await expect
+      .poll(() => frameTableBody.evaluate((element) => element.scrollTop))
       .toBeGreaterThan(0);
   } finally {
     await rm(path.dirname(videoPath), { force: true, recursive: true });
   }
 });
 
-test("keeps the selected group intact when dragging from an all-selected frame", async ({ page }) => {
+test("keeps the selected group intact when dragging from an all-selected frame", async ({
+  page,
+}) => {
   await page.goto("/");
 
   const videoPath = await createSmokeVideoPath();
@@ -619,11 +684,16 @@ test("keeps the selected group intact when dragging from an all-selected frame",
 
     await frame1.click();
     await frame5.click({ modifiers: ["Shift"] });
-    for (const instanceId of ["frame-1", "frame-2", "frame-3", "frame-4", "frame-5"]) {
-      await expect(page.locator(`[data-instance-id="${instanceId}"]`)).toHaveAttribute(
-        "aria-selected",
-        "true",
-      );
+    for (const instanceId of [
+      "frame-1",
+      "frame-2",
+      "frame-3",
+      "frame-4",
+      "frame-5",
+    ]) {
+      await expect(
+        page.locator(`[data-instance-id="${instanceId}"]`),
+      ).toHaveAttribute("aria-selected", "true");
     }
 
     const frame3Box = await frame3.boundingBox();
@@ -632,7 +702,10 @@ test("keeps the selected group intact when dragging from an all-selected frame",
       return;
     }
 
-    await page.mouse.move(frame3Box.x + frame3Box.width / 2, frame3Box.y + frame3Box.height / 2);
+    await page.mouse.move(
+      frame3Box.x + frame3Box.width / 2,
+      frame3Box.y + frame3Box.height / 2,
+    );
     await page.mouse.down();
     await page.mouse.move(
       frame3Box.x + frame3Box.width / 2,
@@ -640,11 +713,16 @@ test("keeps the selected group intact when dragging from an all-selected frame",
       { steps: 4 },
     );
 
-    for (const instanceId of ["frame-1", "frame-2", "frame-3", "frame-4", "frame-5"]) {
-      await expect(page.locator(`[data-instance-id="${instanceId}"]`)).toHaveAttribute(
-        "aria-selected",
-        "true",
-      );
+    for (const instanceId of [
+      "frame-1",
+      "frame-2",
+      "frame-3",
+      "frame-4",
+      "frame-5",
+    ]) {
+      await expect(
+        page.locator(`[data-instance-id="${instanceId}"]`),
+      ).toHaveAttribute("aria-selected", "true");
     }
     await page.mouse.up();
   } finally {

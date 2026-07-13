@@ -76,7 +76,10 @@ type MediaSelectionPreviewProps = {
   showDetails?: boolean;
   previewZoomMode: PreviewZoomMode;
   manualZoomScale: number;
-  onResolvedZoomChange?: (nextZoom: { effectiveScale: number; fitScale: number }) => void;
+  onResolvedZoomChange?: (nextZoom: {
+    effectiveScale: number;
+    fitScale: number;
+  }) => void;
 };
 
 export function MediaSelectionPreview({
@@ -108,10 +111,26 @@ export function MediaSelectionPreview({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [dragState, setDragState] = useState<PreviewDragState | null>(null);
   const [previewFailed, setPreviewFailed] = useState(false);
-  const [stageViewportWidth, setStageViewportWidth] = useState<number | null>(null);
-  const [stageViewportHeight, setStageViewportHeight] = useState<number | null>(null);
-  const [scrollState, setScrollState] = useState<{ scrollX: number, scrollY: number, viewWidth: number, viewHeight: number, fullWidth: number, fullHeight: number } | null>(null);
-  const [minimapDragState, setMinimapDragState] = useState<{ startX: number; startY: number; startScrollX: number; startScrollY: number } | null>(null);
+  const [stageViewportWidth, setStageViewportWidth] = useState<number | null>(
+    null,
+  );
+  const [stageViewportHeight, setStageViewportHeight] = useState<number | null>(
+    null,
+  );
+  const [scrollState, setScrollState] = useState<{
+    scrollX: number;
+    scrollY: number;
+    viewWidth: number;
+    viewHeight: number;
+    fullWidth: number;
+    fullHeight: number;
+  } | null>(null);
+  const [minimapDragState, setMinimapDragState] = useState<{
+    startX: number;
+    startY: number;
+    startScrollX: number;
+    startScrollY: number;
+  } | null>(null);
 
   const handleNativeDragStart = useCallback((event: DragEvent<HTMLElement>) => {
     event.preventDefault();
@@ -131,7 +150,8 @@ export function MediaSelectionPreview({
   }, []);
 
   const selectionEnabled = sourceWidth !== null && sourceHeight !== null;
-  const isControlledVideo = previewKind === "video" && typeof isPlaying === "boolean";
+  const isControlledVideo =
+    previewKind === "video" && typeof isPlaying === "boolean";
   const shouldRenderVideoFrameCanvas = isControlledVideo && !framePreviewSrc;
   const shouldHideVideoElement = isControlledVideo;
 
@@ -142,7 +162,11 @@ export function MediaSelectionPreview({
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    if (
+      !video ||
+      !canvas ||
+      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+    ) {
       return;
     }
 
@@ -160,7 +184,8 @@ export function MediaSelectionPreview({
   }, [shouldRenderVideoFrameCanvas, sourceHeight, sourceWidth]);
 
   const handleMinimapPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!stageRef.current || !scrollState || mediaW === 0 || mediaH === 0) return;
+    if (!stageRef.current || !scrollState || mediaW === 0 || mediaH === 0)
+      return;
     e.preventDefault();
 
     const mediaX = Math.max(0, (scrollState.fullWidth - mediaW) / 2);
@@ -170,8 +195,8 @@ export function MediaSelectionPreview({
     const fx = (e.clientX - rect.left) / rect.width;
     const fy = (e.clientY - rect.top) / rect.height;
 
-    const newScrollX = (mediaX + fx * mediaW) - scrollState.viewWidth / 2;
-    const newScrollY = (mediaY + fy * mediaH) - scrollState.viewHeight / 2;
+    const newScrollX = mediaX + fx * mediaW - scrollState.viewWidth / 2;
+    const newScrollY = mediaY + fy * mediaH - scrollState.viewHeight / 2;
 
     stageRef.current.scrollLeft = newScrollX;
     stageRef.current.scrollTop = newScrollY;
@@ -187,7 +212,14 @@ export function MediaSelectionPreview({
   };
 
   const handleMinimapPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!minimapDragState || !stageRef.current || !scrollState || mediaW === 0 || mediaH === 0) return;
+    if (
+      !minimapDragState ||
+      !stageRef.current ||
+      !scrollState ||
+      mediaW === 0 ||
+      mediaH === 0
+    )
+      return;
     e.preventDefault();
 
     const dx = e.clientX - minimapDragState.startX;
@@ -197,8 +229,8 @@ export function MediaSelectionPreview({
     const scaleX = mediaW / rect.width;
     const scaleY = mediaH / rect.height;
 
-    stageRef.current.scrollLeft = minimapDragState.startScrollX + (dx * scaleX);
-    stageRef.current.scrollTop = minimapDragState.startScrollY + (dy * scaleY);
+    stageRef.current.scrollLeft = minimapDragState.startScrollX + dx * scaleX;
+    stageRef.current.scrollTop = minimapDragState.startScrollY + dy * scaleY;
   };
 
   const handleMinimapPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -233,8 +265,6 @@ export function MediaSelectionPreview({
     };
   }, [updateScrollState]);
 
-
-
   const fitZoomScale = useMemo(() => {
     if (!sourceWidth || !sourceHeight) {
       return 1;
@@ -242,10 +272,15 @@ export function MediaSelectionPreview({
 
     const availableWidth = stageViewportWidth ?? sourceWidth;
     const availableHeight = stageViewportHeight ?? sourceHeight;
-    return Math.min(availableWidth / sourceWidth, availableHeight / sourceHeight, 1);
+    return Math.min(
+      availableWidth / sourceWidth,
+      availableHeight / sourceHeight,
+      1,
+    );
   }, [sourceHeight, sourceWidth, stageViewportHeight, stageViewportWidth]);
 
-  const effectiveZoomScale = previewZoomMode === "fit" ? fitZoomScale : manualZoomScale;
+  const effectiveZoomScale =
+    previewZoomMode === "fit" ? fitZoomScale : manualZoomScale;
   const mediaW = effectiveZoomScale * (sourceWidth ?? 0);
   const mediaH = effectiveZoomScale * (sourceHeight ?? 0);
 
@@ -359,8 +394,7 @@ export function MediaSelectionPreview({
     const target = event.target as HTMLElement;
 
     const handle = target.dataset.handle as
-      | PreviewDragState["resizeHandle"]
-      | undefined;
+      PreviewDragState["resizeHandle"] | undefined;
 
     if (handle) {
       setDragState({
@@ -390,14 +424,14 @@ export function MediaSelectionPreview({
     const initialRegion =
       lockedAspectRatio && sourceWidth && sourceHeight
         ? cropRegionFromAnchor(
-          point.x,
-          point.y,
-          point.x + MIN_CROP_REGION_RATIO,
-          point.y + MIN_CROP_REGION_RATIO,
-          sourceWidth,
-          sourceHeight,
-          lockedAspectRatio,
-        )
+            point.x,
+            point.y,
+            point.x + MIN_CROP_REGION_RATIO,
+            point.y + MIN_CROP_REGION_RATIO,
+            sourceWidth,
+            sourceHeight,
+            lockedAspectRatio,
+          )
         : nextRegion;
 
     onCropRegionChange(initialRegion);
@@ -510,7 +544,9 @@ export function MediaSelectionPreview({
     }
   }
 
-  function handleSelectionMoveKeyDown(event: KeyboardEvent<HTMLFieldSetElement>) {
+  function handleSelectionMoveKeyDown(
+    event: KeyboardEvent<HTMLFieldSetElement>,
+  ) {
     if (event.currentTarget !== event.target) {
       return;
     }
@@ -557,14 +593,14 @@ export function MediaSelectionPreview({
         resizeDelta = {
           x: delta.x,
           y:
-            (signedWidthChangePx / lockedAspectRatio) * verticalDirection /
+            ((signedWidthChangePx / lockedAspectRatio) * verticalDirection) /
             sourceHeight,
         };
       } else if (delta.y !== 0) {
         const signedHeightChangePx = delta.y * sourceHeight * verticalDirection;
         resizeDelta = {
           x:
-            (signedHeightChangePx * lockedAspectRatio) * horizontalDirection /
+            (signedHeightChangePx * lockedAspectRatio * horizontalDirection) /
             sourceWidth,
           y: delta.y,
         };
@@ -592,7 +628,12 @@ export function MediaSelectionPreview({
     );
   }
 
-  const cropSummary = selectionSummary(cropRegion, copy, sourceWidth, sourceHeight);
+  const cropSummary = selectionSummary(
+    cropRegion,
+    copy,
+    sourceWidth,
+    sourceHeight,
+  );
   const cropPositionSummary =
     `x ${(cropRegion.x * 100).toFixed(4)}%, ` +
     `y ${(cropRegion.y * 100).toFixed(4)}%`;
@@ -601,11 +642,15 @@ export function MediaSelectionPreview({
   const previewFooterText = previewFailed
     ? copy.previewUnavailable
     : [copy.previewHint, copy.previewKeyboardHint]
-      .filter((value) => value.trim().length > 0)
-      .join(" ");
+        .filter((value) => value.trim().length > 0)
+        .join(" ");
 
   return (
-    <section className={showDetails ? "previewCard" : "previewCard previewCardStageOnly"}>
+    <section
+      className={
+        showDetails ? "previewCard" : "previewCard previewCardStageOnly"
+      }
+    >
       {showDetails ? (
         <div className="previewHeader">
           <div className="previewCopy">
@@ -632,7 +677,16 @@ export function MediaSelectionPreview({
         </div>
       ) : null}
 
-      <div className="previewStageWrapper" style={{ position: "relative", minHeight: 0, height: "100%", width: "100%", overflow: "hidden" }}>
+      <div
+        className="previewStageWrapper"
+        style={{
+          position: "relative",
+          minHeight: 0,
+          height: "100%",
+          width: "100%",
+          overflow: "hidden",
+        }}
+      >
         <div ref={stageRef} className="previewStage">
           <div className="previewStageViewport">
             <div className="previewMediaFrame" style={mediaFrameStyle}>
@@ -661,8 +715,14 @@ export function MediaSelectionPreview({
                   ) : null}
                   <video
                     ref={videoRef}
-                    className={shouldHideVideoElement ? "previewVideoSource" : "previewMedia"}
-                    data-preview-video-source={shouldHideVideoElement ? "true" : undefined}
+                    className={
+                      shouldHideVideoElement
+                        ? "previewVideoSource"
+                        : "previewMedia"
+                    }
+                    data-preview-video-source={
+                      shouldHideVideoElement ? "true" : undefined
+                    }
                     src={previewSrc}
                     draggable={false}
                     autoPlay={!isControlledVideo}
@@ -786,7 +846,9 @@ export function MediaSelectionPreview({
                         tabIndex={0}
                         aria-label={copy.selectionHandleTopLeft}
                         aria-describedby={selectionSummaryId}
-                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "nw")}
+                        onKeyDown={(event) =>
+                          handleSelectionResizeKeyDown(event, "nw")
+                        }
                       />
                       <button
                         className="selectionCorner selectionCornerTopRight selectionHandle"
@@ -795,7 +857,9 @@ export function MediaSelectionPreview({
                         tabIndex={0}
                         aria-label={copy.selectionHandleTopRight}
                         aria-describedby={selectionSummaryId}
-                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "ne")}
+                        onKeyDown={(event) =>
+                          handleSelectionResizeKeyDown(event, "ne")
+                        }
                       />
                       <button
                         className="selectionCorner selectionCornerBottomLeft selectionHandle"
@@ -804,7 +868,9 @@ export function MediaSelectionPreview({
                         tabIndex={0}
                         aria-label={copy.selectionHandleBottomLeft}
                         aria-describedby={selectionSummaryId}
-                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "sw")}
+                        onKeyDown={(event) =>
+                          handleSelectionResizeKeyDown(event, "sw")
+                        }
                       />
                       <button
                         className="selectionCorner selectionCornerBottomRight selectionHandle"
@@ -813,7 +879,9 @@ export function MediaSelectionPreview({
                         tabIndex={0}
                         aria-label={copy.selectionHandleBottomRight}
                         aria-describedby={selectionSummaryId}
-                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "se")}
+                        onKeyDown={(event) =>
+                          handleSelectionResizeKeyDown(event, "se")
+                        }
                       />
                     </fieldset>
                   ) : null}
@@ -823,54 +891,63 @@ export function MediaSelectionPreview({
           </div>
         </div>
 
-        {scrollState && mediaW > 0 && mediaH > 0 && (scrollState.fullWidth > scrollState.viewWidth + 2 || scrollState.fullHeight > scrollState.viewHeight + 2) ? (() => {
-          const mediaX = Math.max(0, (scrollState.fullWidth - mediaW) / 2);
-          const mediaY = Math.max(0, (scrollState.fullHeight - mediaH) / 2);
-          return (
-            <div className="previewMinimap">
-              <div
-                className="previewMinimapInner"
-                style={{ aspectRatio: `${mediaW} / ${mediaH}` }}
-                onDragStart={handleNativeDragStart}
-                onPointerDown={handleMinimapPointerDown}
-                onPointerMove={handleMinimapPointerMove}
-                onPointerUp={handleMinimapPointerUp}
-                onPointerCancel={handleMinimapPointerUp}
-              >
-                <div className="previewMinimapMediaWrapper">
-                  {previewKind === "video" ? (
-                    <video
-                      className="previewMedia"
-                      src={`${previewSrc}#t=0.01`}
-                      draggable={false}
-                      preload="metadata"
-                      muted
-                      playsInline
-                      onDragStart={handleNativeDragStart}
-                      style={{ objectFit: 'contain' }}
+        {scrollState &&
+        mediaW > 0 &&
+        mediaH > 0 &&
+        (scrollState.fullWidth > scrollState.viewWidth + 2 ||
+          scrollState.fullHeight > scrollState.viewHeight + 2)
+          ? (() => {
+              const mediaX = Math.max(0, (scrollState.fullWidth - mediaW) / 2);
+              const mediaY = Math.max(0, (scrollState.fullHeight - mediaH) / 2);
+              return (
+                <div className="previewMinimap">
+                  <div
+                    className="previewMinimapInner"
+                    style={{ aspectRatio: `${mediaW} / ${mediaH}` }}
+                    onDragStart={handleNativeDragStart}
+                    onPointerDown={handleMinimapPointerDown}
+                    onPointerMove={handleMinimapPointerMove}
+                    onPointerUp={handleMinimapPointerUp}
+                    onPointerCancel={handleMinimapPointerUp}
+                  >
+                    <div className="previewMinimapMediaWrapper">
+                      {previewKind === "video" ? (
+                        <video
+                          className="previewMedia"
+                          src={`${previewSrc}#t=0.01`}
+                          draggable={false}
+                          preload="metadata"
+                          muted
+                          playsInline
+                          onDragStart={handleNativeDragStart}
+                          style={{ objectFit: "contain" }}
+                        />
+                      ) : (
+                        <img
+                          className="previewMedia"
+                          src={previewSrc}
+                          alt={copy.previewSelection}
+                          draggable={false}
+                          onDragStart={handleNativeDragStart}
+                          style={{ objectFit: "contain" }}
+                          decoding="async"
+                        />
+                      )}
+                    </div>
+                    <div
+                      className="previewMinimapViewport"
+                      style={{
+                        left: `${((scrollState.scrollX - mediaX) / mediaW) * 100}%`,
+                        top: `${((scrollState.scrollY - mediaY) / mediaH) * 100}%`,
+                        width: `${(scrollState.viewWidth / mediaW) * 100}%`,
+                        height: `${(scrollState.viewHeight / mediaH) * 100}%`,
+                      }}
                     />
-                  ) : (
-                    <img
-                      className="previewMedia"
-                      src={previewSrc}
-                      alt={copy.previewSelection}
-                      draggable={false}
-                      onDragStart={handleNativeDragStart}
-                      style={{ objectFit: 'contain' }}
-                      decoding="async"
-                    />
-                  )}
+                  </div>
                 </div>
-                <div className="previewMinimapViewport" style={{
-                  left: `${((scrollState.scrollX - mediaX) / mediaW) * 100}%`,
-                  top: `${((scrollState.scrollY - mediaY) / mediaH) * 100}%`,
-                  width: `${(scrollState.viewWidth / mediaW) * 100}%`,
-                  height: `${(scrollState.viewHeight / mediaH) * 100}%`,
-                }} />
-              </div>
-            </div>
-          );
-        })() : null}
+              );
+            })()
+          : null}
       </div>
 
       {previewFooterText ? (
@@ -881,7 +958,3 @@ export function MediaSelectionPreview({
     </section>
   );
 }
-
-
-
-

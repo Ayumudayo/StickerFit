@@ -54,6 +54,7 @@ impl PendingOutput {
         self.temp.as_file_mut()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn temp_path(&self) -> &Path {
         self.temp.path()
     }

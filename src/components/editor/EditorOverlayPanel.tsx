@@ -28,7 +28,10 @@ type EditorOverlayPanelProps = {
   resultsPanelId: string;
   plan: OptimizerPlanResponse | null;
   searchResult: OptimizerSearchResponse | null;
-  estimateState: VersionedWorkflowState<OutputSizeEstimate[], OperationProgress>;
+  estimateState: VersionedWorkflowState<
+    OutputSizeEstimate[],
+    OperationProgress
+  >;
   estimateByCandidateId: ReadonlyMap<string, OutputSizeEstimate>;
   probeState: VersionedProbeState;
   desktopAvailable: boolean;
@@ -142,7 +145,9 @@ export function EditorOverlayPanel({
               qualityFrameDropInterval={qualityFrameDropInterval}
               optimizerSearchDepth={optimizerSearchDepth}
               onOptimizerGoalChange={onOptimizerGoalChange}
-              onQualityFrameDropIntervalChange={onQualityFrameDropIntervalChange}
+              onQualityFrameDropIntervalChange={
+                onQualityFrameDropIntervalChange
+              }
               onOptimizerSearchDepthChange={onOptimizerSearchDepthChange}
             />
           ) : null}

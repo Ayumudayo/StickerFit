@@ -26,6 +26,7 @@ pub(crate) enum TimelineTimingAuthority {
 pub(crate) struct PreparedFrame {
     pub(crate) source_frame_id: u32,
     pub(crate) pixels: Arc<RgbaImage>,
+    #[allow(dead_code)]
     pub(crate) duration_us: u64,
 }
 
@@ -35,6 +36,7 @@ pub(crate) struct PreparedSearchSource {
     pub(crate) base_sequence: Vec<ResolvedTimelineFrame>,
     pub(crate) timing_authority: TimelineTimingAuthority,
     pub(crate) base_fps: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) decoded_bytes: usize,
     pub(crate) tool_source: String,
     pub(crate) tool_command: Option<String>,
@@ -65,6 +67,7 @@ impl PreparedSearchSource {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FramePreparationRequest<'a> {
     pub(crate) input_path: &'a Path,
+    #[allow(dead_code)]
     pub(crate) source_revision: &'a str,
     pub(crate) crop_region: Option<&'a CropRegion>,
     pub(crate) input_width: Option<u32>,
@@ -116,7 +119,7 @@ pub(crate) fn checked_prepared_bytes(
     current: usize,
     additional: usize,
 ) -> Result<usize, PipelineError> {
-    let actual = current.checked_add(additional).unwrap_or(usize::MAX);
+    let actual = current.saturating_add(additional);
     if actual > MAX_PREPARED_SEARCH_BYTES {
         return Err(PipelineError::LimitExceeded {
             resource: "decoded-bytes",

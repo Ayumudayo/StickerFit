@@ -48,7 +48,10 @@ describe("resolveFrameDropTargetFromGeometry", () => {
 });
 
 describe("resolveFrameDropTargetFromVirtualGeometry", () => {
-  const orderedInstanceIds = Array.from({ length: 12 }, (_, index) => `frame-${index + 1}`);
+  const orderedInstanceIds = Array.from(
+    { length: 12 },
+    (_, index) => `frame-${index + 1}`,
+  );
   const listBounds = { left: 20, right: 220, top: 100, bottom: 200 };
 
   it("resolves an offscreen full-list anchor with nonzero scrollTop", () => {
@@ -74,11 +77,15 @@ describe("resolveFrameDropTargetFromVirtualGeometry", () => {
       draggedInstanceIds: [] as string[],
       clientX: 60,
     };
-    expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 109 })).toEqual({
+    expect(
+      resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 109 }),
+    ).toEqual({
       anchorInstanceId: "frame-1",
       position: "above",
     });
-    expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 110 })).toEqual({
+    expect(
+      resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 110 }),
+    ).toEqual({
       anchorInstanceId: "frame-1",
       position: "below",
     });
@@ -107,11 +114,15 @@ describe("resolveFrameDropTargetFromVirtualGeometry", () => {
       draggedInstanceIds: ["frame-2", "frame-3"],
       clientX: 60,
     };
-    expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 135 })).toEqual({
+    expect(
+      resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 135 }),
+    ).toEqual({
       anchorInstanceId: "frame-4",
       position: "above",
     });
-    expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 121 })).toEqual({
+    expect(
+      resolveFrameDropTargetFromVirtualGeometry({ ...params, clientY: 121 }),
+    ).toEqual({
       anchorInstanceId: "frame-1",
       position: "below",
     });
@@ -132,8 +143,20 @@ describe("resolveFrameDropTargetFromVirtualGeometry", () => {
       orderedInstanceIds,
       draggedInstanceIds: [] as string[],
     };
-    expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientX: 10, clientY: 120 })).toBeNull();
-    expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientX: 60, clientY: 220 })).toBeNull();
+    expect(
+      resolveFrameDropTargetFromVirtualGeometry({
+        ...params,
+        clientX: 10,
+        clientY: 120,
+      }),
+    ).toBeNull();
+    expect(
+      resolveFrameDropTargetFromVirtualGeometry({
+        ...params,
+        clientX: 60,
+        clientY: 220,
+      }),
+    ).toBeNull();
   });
 
   it("resolves a far-offscreen anchor from the full 1,000-frame index space", () => {
@@ -163,20 +186,67 @@ describe("frame rail edge autoscroll math", () => {
   const listBounds = { left: 20, right: 220, top: 100, bottom: 200 };
 
   it("returns signed bounded deltas only inside the edge zones", () => {
-    expect(computeFrameRailAutoScrollDelta({ clientY: 100, listBounds, edgeSize: 24, maxStep: 16 })).toBe(-16);
-    expect(computeFrameRailAutoScrollDelta({ clientY: 150, listBounds, edgeSize: 24, maxStep: 16 })).toBe(0);
-    expect(computeFrameRailAutoScrollDelta({ clientY: 200, listBounds, edgeSize: 24, maxStep: 16 })).toBe(16);
+    expect(
+      computeFrameRailAutoScrollDelta({
+        clientY: 100,
+        listBounds,
+        edgeSize: 24,
+        maxStep: 16,
+      }),
+    ).toBe(-16);
+    expect(
+      computeFrameRailAutoScrollDelta({
+        clientY: 150,
+        listBounds,
+        edgeSize: 24,
+        maxStep: 16,
+      }),
+    ).toBe(0);
+    expect(
+      computeFrameRailAutoScrollDelta({
+        clientY: 200,
+        listBounds,
+        edgeSize: 24,
+        maxStep: 16,
+      }),
+    ).toBe(16);
     expect(
       Math.abs(
-        computeFrameRailAutoScrollDelta({ clientY: 102, listBounds, edgeSize: 24, maxStep: 16 }),
+        computeFrameRailAutoScrollDelta({
+          clientY: 102,
+          listBounds,
+          edgeSize: 24,
+          maxStep: 16,
+        }),
       ),
     ).toBeLessThanOrEqual(16);
   });
 
   it("clamps repeated RAF steps at both scroll boundaries", () => {
-    expect(clampFrameRailAutoScroll({ scrollTop: 2, delta: -16, scrollHeight: 500, clientHeight: 100 })).toBe(0);
-    expect(clampFrameRailAutoScroll({ scrollTop: 395, delta: 16, scrollHeight: 500, clientHeight: 100 })).toBe(400);
-    expect(clampFrameRailAutoScroll({ scrollTop: 120, delta: 0, scrollHeight: 500, clientHeight: 100 })).toBe(120);
+    expect(
+      clampFrameRailAutoScroll({
+        scrollTop: 2,
+        delta: -16,
+        scrollHeight: 500,
+        clientHeight: 100,
+      }),
+    ).toBe(0);
+    expect(
+      clampFrameRailAutoScroll({
+        scrollTop: 395,
+        delta: 16,
+        scrollHeight: 500,
+        clientHeight: 100,
+      }),
+    ).toBe(400);
+    expect(
+      clampFrameRailAutoScroll({
+        scrollTop: 120,
+        delta: 0,
+        scrollHeight: 500,
+        clientHeight: 100,
+      }),
+    ).toBe(120);
 
     let scrollTop = 380;
     let didScroll = true;

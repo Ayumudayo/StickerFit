@@ -31,8 +31,10 @@ type OutputSizeEstimateCardProps = {
   candidateId: string | null;
   desktopAvailable: boolean;
   waitingForPlan?: boolean;
+  planLoading?: boolean;
   probeState: VersionedProbeState;
   compact?: boolean;
+  onRequestPlan?: () => void;
   onRetryEstimate: () => void;
   onProbeCandidate: (candidateId: string) => void;
   onCancelProbe: () => void;
@@ -76,7 +78,10 @@ function estimateStatusLabel(
   }
 }
 
-function estimateSummary(copy: MessagesForLocale, estimate: OutputSizeEstimate) {
+function estimateSummary(
+  copy: MessagesForLocale,
+  estimate: OutputSizeEstimate,
+) {
   if (isExactEstimate(estimate)) {
     return copy.estimateExactSummary(formatKiB(estimate.bytes));
   }
@@ -137,9 +142,7 @@ export function OperationProgressIndicator({
   progress,
 }: OperationProgressIndicatorProps) {
   const hasKnownTotal =
-    progress !== null &&
-    progress.total !== null &&
-    progress.total > 0;
+    progress !== null && progress.total !== null && progress.total > 0;
   const percent = hasKnownTotal
     ? Math.min(100, Math.max(0, (progress.completed / progress.total!) * 100))
     : 0;
@@ -149,7 +152,12 @@ export function OperationProgressIndicator({
 
   return (
     <div className="operationProgressBlock">
-      <span className="detailText" role="status" aria-live="polite" aria-atomic="true">
+      <span
+        className="detailText"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
         {message}
       </span>
       <div
@@ -180,8 +188,10 @@ export function OutputSizeEstimateCard({
   candidateId,
   desktopAvailable,
   waitingForPlan = false,
+  planLoading = false,
   probeState,
   compact = false,
+  onRequestPlan,
   onRetryEstimate,
   onProbeCandidate,
   onCancelProbe,
@@ -196,24 +206,32 @@ export function OutputSizeEstimateCard({
     candidateId !== null &&
     estimate?.kind === "range" &&
     classifyEstimate(estimate) === "near-limit";
-  const estimateError = estimateState.status === "error"
-    ? mediaOperationMessage(
-        locale,
-        estimateState.code,
-        estimateState.reasonCode,
-      ) ?? copy.estimateCalculating
-    : null;
-  const probeError = activeProbe?.status === "error"
-    ? mediaOperationMessage(
-        locale,
-        activeProbe.code,
-        activeProbe.reasonCode,
-      ) ?? copy.estimateCalculating
-    : null;
+  const estimateError =
+    estimateState.status === "error"
+      ? (mediaOperationMessage(
+          locale,
+          estimateState.code,
+          estimateState.reasonCode,
+        ) ?? copy.estimateCalculating)
+      : null;
+  const probeError =
+    activeProbe?.status === "error"
+      ? (mediaOperationMessage(
+          locale,
+          activeProbe.code,
+          activeProbe.reasonCode,
+        ) ?? copy.estimateCalculating)
+      : null;
   const hasNestedLiveRegion =
     estimateState.status === "loading" ||
     activeProbe?.status === "loading" ||
     activeProbe?.status === "error";
+  const showProbeControls =
+    activeProbe?.status === "loading" ||
+    activeProbe?.status === "error" ||
+    activeProbe?.status === "cancelled" ||
+    canProbe;
+  const probeActionCancels = activeProbe?.status === "loading";
   const cardRole = estimateError
     ? "alert"
     : hasNestedLiveRegion
@@ -226,7 +244,11 @@ export function OutputSizeEstimateCard({
 
   return (
     <section
-      className={compact ? "outputEstimateCard outputEstimateCardCompact" : "outputEstimateCard"}
+      className={
+        compact
+          ? "outputEstimateCard outputEstimateCardCompact"
+          : "outputEstimateCard"
+      }
       role={cardRole}
       aria-live={
         cardRole === "alert"
@@ -249,7 +271,11 @@ export function OutputSizeEstimateCard({
       ) : estimateError && !estimate ? (
         <div className="outputEstimateStateActions">
           <p className="errorText">{estimateError}</p>
-          <button className="subtleAction" type="button" onClick={onRetryEstimate}>
+          <button
+            className="subtleAction"
+            type="button"
+            onClick={onRetryEstimate}
+          >
             {copy.estimateRetry}
           </button>
         </div>
@@ -263,62 +289,65 @@ export function OutputSizeEstimateCard({
         <p className="summaryText">{copy.estimateCancelled}</p>
       ) : estimate ? (
         <>
-          <strong className="outputEstimateSummary">{estimateSummary(copy, estimate)}</strong>
+          <strong className="outputEstimateSummary">
+            {estimateSummary(copy, estimate)}
+          </strong>
           <p className="detailText">
             {estimateStatusLabel(copy, estimate)}
-            {isExactEstimate(estimate) ? ` · ${copy.estimateCompressionBasis}` : ""}
+            {isExactEstimate(estimate)
+              ? ` · ${copy.estimateCompressionBasis}`
+              : ""}
           </p>
         </>
+      ) : planLoading ? (
+        <p className="summaryText">{copy.buildingPreview}</p>
       ) : waitingForPlan ? (
-        <p className="summaryText">{copy.estimateWaitingForPlan}</p>
+        <div className="outputEstimateStateActions">
+          <p className="summaryText">{copy.estimateWaitingForPlan}</p>
+          {onRequestPlan ? (
+            <button
+              className="subtleAction"
+              type="button"
+              onClick={onRequestPlan}
+            >
+              {copy.buildPreview}
+            </button>
+          ) : null}
+        </div>
       ) : (
         <p className="summaryText">{copy.estimateCalculating}</p>
       )}
 
-      {activeProbe?.status === "loading" ? (
-        <div className="outputEstimateProbe">
-          <OperationProgressIndicator
-            label={copy.checkExactCandidateSize}
-            message={estimateProgressMessage(copy, activeProbe.progress)}
-            progress={activeProbe.progress}
-          />
-          <p className="detailText">{copy.exactProbeNoOutput}</p>
-          <button className="subtleAction" type="button" onClick={onCancelProbe}>
-            {copy.cancelExactProbe}
-          </button>
-        </div>
-      ) : activeProbe?.status === "error" ? (
-        <div className="outputEstimateProbe" role="alert">
-          <p className="errorText">{probeError}</p>
-          <p className="detailText">{copy.exactProbeNoOutput}</p>
-          <button
-            className="subtleAction"
-            type="button"
-            onClick={() => candidateId && onProbeCandidate(candidateId)}
-          >
-            {copy.checkExactCandidateSize}
-          </button>
-        </div>
-      ) : activeProbe?.status === "cancelled" ? (
-        <div className="outputEstimateProbe">
-          <p className="detailText">{copy.estimateCancelled}</p>
-          <button
-            className="subtleAction"
-            type="button"
-            onClick={() => candidateId && onProbeCandidate(candidateId)}
-          >
-            {copy.checkExactCandidateSize}
-          </button>
-        </div>
-      ) : canProbe ? (
-        <div className="outputEstimateProbe">
+      {showProbeControls ? (
+        <div
+          className="outputEstimateProbe"
+          role={activeProbe?.status === "error" ? "alert" : undefined}
+        >
+          {activeProbe?.status === "loading" ? (
+            <OperationProgressIndicator
+              label={copy.checkExactCandidateSize}
+              message={estimateProgressMessage(copy, activeProbe.progress)}
+              progress={activeProbe.progress}
+            />
+          ) : activeProbe?.status === "error" ? (
+            <p className="errorText">{probeError}</p>
+          ) : activeProbe?.status === "cancelled" ? (
+            <p className="detailText">{copy.estimateCancelled}</p>
+          ) : null}
           <p className="detailText">{copy.exactProbeNoOutput}</p>
           <button
-            className="secondaryAction"
+            key="exact-probe-action"
+            className={activeProbe ? "subtleAction" : "secondaryAction"}
             type="button"
-            onClick={() => candidateId && onProbeCandidate(candidateId)}
+            onClick={
+              probeActionCancels
+                ? onCancelProbe
+                : () => candidateId && onProbeCandidate(candidateId)
+            }
           >
-            {copy.checkExactCandidateSize}
+            {probeActionCancels
+              ? copy.cancelExactProbe
+              : copy.checkExactCandidateSize}
           </button>
         </div>
       ) : null}

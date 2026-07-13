@@ -103,19 +103,23 @@ describe("buildTimelineSegmentBuckets", () => {
         lastFrameIndex: 504,
       }),
     ]);
+    expect(buckets.reduce((sum, bucket) => sum + bucket.durationUs, 0)).toBe(
+      1_000_000,
+    );
     expect(
-      buckets.reduce((sum, bucket) => sum + bucket.durationUs, 0),
-    ).toBe(1_000_000);
-    expect(
-      buckets.every((bucket, index) =>
-        index === 0 ||
-        bucket.firstFrameIndex === buckets[index - 1].lastFrameIndex + 1
+      buckets.every(
+        (bucket, index) =>
+          index === 0 ||
+          bucket.firstFrameIndex === buckets[index - 1].lastFrameIndex + 1,
       ),
     ).toBe(true);
   });
 
   it("chooses adjacent boundaries by duration rather than frame count", () => {
-    const frames = buildFrameViews([1_000, ...Array.from({ length: 200 }, () => 1)]);
+    const frames = buildFrameViews([
+      1_000,
+      ...Array.from({ length: 200 }, () => 1),
+    ]);
     const buckets = buildTimelineSegmentBuckets({
       frames,
       currentTimeUs: 1_050,

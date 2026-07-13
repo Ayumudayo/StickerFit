@@ -33,7 +33,7 @@
 }
 
 .desktopTitleIcon {
-  color: #5865F2;
+  color: #5865f2;
 }
 
 .desktopHeaderActions {
@@ -450,7 +450,7 @@
   height: 30px;
   border: 0;
   border-radius: 9px;
-  background: #5865F2;
+  background: #5865f2;
   color: #ffffff;
 }
 
@@ -787,7 +787,7 @@
   padding: 4px 10px;
   border-radius: 999px;
   background: rgba(88, 101, 242, 0.16);
-  color: #5865F2;
+  color: #5865f2;
   font-size: 0.85rem;
 }
 
@@ -1150,7 +1150,6 @@
   .previewUtilityPrimaryAction {
     justify-self: auto;
   }
-
 }
 
 @media (max-width: 760px) {
@@ -1168,7 +1167,6 @@
     width: 100%;
     justify-content: center;
   }
-
 }
 
 @media (max-width: 1040px) {

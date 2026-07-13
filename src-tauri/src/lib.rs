@@ -58,11 +58,13 @@ use crate::estimation::{
     estimate_candidate_size, estimate_static_png_with_operation, parse_sample_seed,
     probe_candidate_size, OutputSizeEstimate, OutputSizeEstimateError, StaticSizeEstimateRequest,
 };
+#[cfg(test)]
+use crate::frame_source::MAX_SEARCH_OUTPUT_FRAMES;
 use crate::frame_source::{
     build_candidate_output_sequence, build_inspected_timing_grid, checked_prepared_bytes,
     checked_timeline_duration, project_timing_grid, FramePreparationRequest, FrameSourceLoader,
     PreparedCandidateSequence, PreparedFrame, PreparedSearchSource, TimelineTimingAuthority,
-    MAX_PREPARED_SEARCH_BYTES, MAX_SEARCH_OUTPUT_FRAMES,
+    MAX_PREPARED_SEARCH_BYTES,
 };
 use crate::locale::{parse_ui_locale, UiLocale};
 use crate::media_error::{MediaOperationErrorCode, MediaOperationReasonCode, PipelineError};
@@ -85,50 +87,44 @@ use crate::process_runner::{
 
 const CANONICAL_FIT_MODE: &str = "contain";
 const MAX_MEDIA_FRAME_COUNT: usize = 300;
+const MAX_OPTIMIZER_CANDIDATE_IDS: usize = 5;
 const MAX_PREVIEW_BATCH_IDS: usize = 24;
 const MAX_PREVIEW_EDGE: u32 = 128;
 const MEDIA_FOUNDATION_FAILED_REASON_CODE: &str = "media-foundation-failed";
 
-struct BoundedVecVisitor<T>(PhantomData<T>);
+struct BoundedVecVisitor<T, const MAX_ITEMS: usize> {
+    marker: PhantomData<T>,
+    overflow_message: &'static str,
+}
 
-impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+impl<'de, T, const MAX_ITEMS: usize> Visitor<'de> for BoundedVecVisitor<T, MAX_ITEMS>
 where
     T: Deserialize<'de>,
 {
     type Value = Vec<T>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "a sequence containing at most {MAX_MEDIA_FRAME_COUNT} frame items"
-        )
+        write!(formatter, "a sequence containing at most {MAX_ITEMS} items")
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
     {
-        if sequence
-            .size_hint()
-            .is_some_and(|size| size > MAX_MEDIA_FRAME_COUNT)
-        {
-            return Err(de::Error::custom("media frame count exceeds 300"));
+        if sequence.size_hint().is_some_and(|size| size > MAX_ITEMS) {
+            return Err(de::Error::custom(self.overflow_message));
         }
 
-        let mut values = Vec::with_capacity(
-            sequence
-                .size_hint()
-                .unwrap_or_default()
-                .min(MAX_MEDIA_FRAME_COUNT),
-        );
-        while values.len() < MAX_MEDIA_FRAME_COUNT {
+        let mut values =
+            Vec::with_capacity(sequence.size_hint().unwrap_or_default().min(MAX_ITEMS));
+        while values.len() < MAX_ITEMS {
             let Some(value) = sequence.next_element()? else {
                 return Ok(values);
             };
             values.push(value);
         }
         if sequence.next_element::<de::IgnoredAny>()?.is_some() {
-            return Err(de::Error::custom("media frame count exceeds 300"));
+            return Err(de::Error::custom(self.overflow_message));
         }
         Ok(values)
     }
@@ -139,7 +135,20 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX_MEDIA_FRAME_COUNT> {
+        marker: PhantomData,
+        overflow_message: "media frame count exceeds 300",
+    })
+}
+
+fn deserialize_candidate_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor::<String, MAX_OPTIMIZER_CANDIDATE_IDS> {
+        marker: PhantomData,
+        overflow_message: "optimizer candidate count exceeds 5",
+    })
 }
 
 struct OptionalBoundedVecVisitor<T>(PhantomData<T>);
@@ -325,6 +334,7 @@ pub(crate) struct OptimizerPlanRequest {
 struct OptimizerSizeEstimateRequest {
     input_path: String,
     source_revision: String,
+    #[serde(deserialize_with = "deserialize_candidate_ids")]
     candidate_ids: Vec<String>,
     sample_seed: String,
     #[serde(flatten)]
@@ -590,6 +600,7 @@ const RECOMMENDED_MAX_DURATION_US: u64 = 3_000_000;
 const DISCORD_MAX_DURATION_US: u64 = 5_000_000;
 const DISCORD_MAX_STICKER_BYTES: u64 = 512 * 1024;
 const MAX_SEARCH_BUDGET: usize = 20;
+#[allow(dead_code)]
 const INTERNAL_TASK_ERROR_CODE: &str = "internal-task-failed";
 const PROCESS_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const TOOL_PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -599,6 +610,7 @@ fn duration_us_to_seconds(duration_us: u64) -> f64 {
     duration_us as f64 / 1_000_000.0
 }
 
+#[allow(dead_code)]
 fn frame_duration_us_for_fps(fps: u32) -> u64 {
     let fps = u64::from(fps.max(1));
     (1_000_000 + fps / 2) / fps
@@ -711,6 +723,7 @@ fn source_similarity_score(
         + (duration_score * 0.05)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn optimizer_goal_score(
     optimizer_goal: &str,
     source_fps: f64,
@@ -999,25 +1012,43 @@ fn resolve_output_directory(
     input_path: &str,
     locale: UiLocale,
 ) -> Result<PathBuf, String> {
-    let Some(selected_directory) = selected_directory
+    let directory = if let Some(selected_directory) = selected_directory
         .map(str::trim)
         .filter(|directory| !directory.is_empty())
-    else {
-        return source_output_directory(input_path, locale);
+    {
+        PathBuf::from(selected_directory)
+    } else {
+        source_output_directory(input_path, locale)?
     };
 
-    let directory = PathBuf::from(selected_directory);
-
     if directory.exists() {
-        if directory.is_dir() {
-            Ok(directory)
-        } else {
-            Err(locale::output_path_not_directory_error(locale))
+        if !directory.is_dir() {
+            return Err(locale::output_path_not_directory_error(locale));
         }
     } else {
         fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        Ok(directory)
     }
+
+    probe_output_directory_writable(&directory)?;
+    Ok(directory)
+}
+
+fn probe_output_directory_writable(directory: &Path) -> Result<(), String> {
+    probe_output_directory_writable_with_sync(directory, File::sync_all)
+}
+
+fn probe_output_directory_writable_with_sync(
+    directory: &Path,
+    sync_probe: impl FnOnce(&File) -> std::io::Result<()>,
+) -> Result<(), String> {
+    // `tempfile_in` creates an unlinked file on Unix and uses
+    // FILE_FLAG_DELETE_ON_CLOSE on Windows. That makes cleanup an OS-owned part
+    // of the open contract instead of a fallible named-path deletion that can
+    // leave one probe behind per retry.
+    let mut probe = tempfile::tempfile_in(directory).map_err(|error| error.to_string())?;
+    probe.write_all(&[0]).map_err(|error| error.to_string())?;
+    probe.flush().map_err(|error| error.to_string())?;
+    sync_probe(&probe).map_err(|error| error.to_string())
 }
 
 fn sidecar_candidate_paths_for_exe(tool: &str, current_exe: Option<&Path>) -> Vec<PathBuf> {
@@ -1122,6 +1153,7 @@ fn run_resolved_command(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn run_sidecar_tool(
     tool: &'static str,
     args: &[OsString],
@@ -1652,6 +1684,7 @@ fn build_candidate_universe_fixed_duration(
     candidates
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_candidate_ladder_fixed_duration(
     duration_seconds: f64,
     fps: u32,
@@ -1676,6 +1709,7 @@ fn build_candidate_ladder_fixed_duration(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_filter_graph(
     fps: u32,
     content_scale: f64,
@@ -1708,6 +1742,7 @@ fn build_filter_graph(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_source_frame_select_filter(frame_indexes: &BTreeSet<u32>) -> String {
     let eq_exprs = frame_indexes
         .iter()
@@ -1817,6 +1852,7 @@ fn crop_rgba_image(source: &RgbaImage, crop_region: Option<ResolvedCropRegion>) 
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn transform_frame_for_candidate(
     source: &RgbaImage,
     content_scale: f64,
@@ -1854,9 +1890,10 @@ fn prepare_frame_for_search(
         None if source.dimensions() == (target_width, target_height) => source,
         None => imageops::resize(&source, target_width, target_height, FilterType::Lanczos3),
         Some(crop) => {
-            let cropped = imageops::crop_imm(&source, crop.x, crop.y, crop.width, crop.height);
+            let cropped =
+                imageops::crop_imm(&source, crop.x, crop.y, crop.width, crop.height).to_image();
             if (crop.width, crop.height) == (target_width, target_height) {
-                cropped.to_image()
+                cropped
             } else {
                 imageops::resize(&cropped, target_width, target_height, FilterType::Lanczos3)
             }
@@ -1922,9 +1959,7 @@ fn checked_total_decoded_bytes(
     frame_bytes: usize,
     limits: MediaLimits,
 ) -> Result<u64, PipelineError> {
-    let actual = current
-        .checked_add(u64::try_from(frame_bytes).unwrap_or(u64::MAX))
-        .unwrap_or(u64::MAX);
+    let actual = current.saturating_add(u64::try_from(frame_bytes).unwrap_or(u64::MAX));
     if actual > limits.max_total_decoded_bytes {
         return Err(PipelineError::LimitExceeded {
             resource: "decoded-bytes",
@@ -1949,8 +1984,7 @@ fn preflight_animation_decoded_bytes(
     }
     let actual = u64::try_from(frame_bytes)
         .unwrap_or(u64::MAX)
-        .checked_mul(frame_count)
-        .unwrap_or(u64::MAX);
+        .saturating_mul(frame_count);
     if actual > limits.max_total_decoded_bytes {
         return Err(PipelineError::LimitExceeded {
             resource: "decoded-bytes",
@@ -2012,6 +2046,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 fn select_decoded_animation_frame<I>(
     format: &'static str,
     mut frames: I,
@@ -2152,9 +2187,7 @@ fn validate_still_decoder_allocation(
     let peak_bytes = if color_type == image::ColorType::Rgba8 {
         native_total_bytes
     } else {
-        native_total_bytes
-            .checked_add(rgba_bytes)
-            .unwrap_or(u64::MAX)
+        native_total_bytes.saturating_add(rgba_bytes)
     };
     if peak_bytes > limits.max_total_decoded_bytes {
         return Err(PipelineError::LimitExceeded {
@@ -2235,7 +2268,7 @@ fn decode_gif_animation_frames(
             frame_bytes,
             u64::from(frame_count),
             limits,
-            || checkpoint(),
+            checkpoint,
         )
     })
 }
@@ -2378,6 +2411,7 @@ fn read_gif_frame_metadata<R: Read>(
     }
 }
 
+#[allow(dead_code)]
 fn decode_gif_animation_frame(
     input_path: &str,
     frame_index: usize,
@@ -2422,11 +2456,12 @@ fn decode_gif_animation_frame(
             frame_index,
             frame_bytes,
             limits,
-            || checkpoint(),
+            checkpoint,
         )
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn decode_apng_animation_frames(
     input_path: &str,
     limits: MediaLimits,
@@ -2470,11 +2505,12 @@ fn decode_apng_animation_frames(
             frame_bytes,
             frame_count,
             limits,
-            || checkpoint(),
+            checkpoint,
         )
     })
 }
 
+#[allow(dead_code)]
 fn decode_apng_animation_frame(
     input_path: &str,
     frame_index: usize,
@@ -2526,7 +2562,7 @@ fn decode_apng_animation_frame(
             frame_index,
             frame_bytes,
             limits,
-            || checkpoint(),
+            checkpoint,
         )
     })
 }
@@ -2578,7 +2614,7 @@ where
                 Some(u64::from(frame_count)),
                 limits,
                 context,
-                |source_frame_id, frame| visitor(source_frame_id, frame),
+                &mut visitor,
             )
         }),
         "apng" | "png" => run_decoder_boundary("png", || {
@@ -2615,7 +2651,7 @@ where
                 Some(frame_count),
                 limits,
                 context,
-                |source_frame_id, frame| visitor(source_frame_id, frame),
+                visitor,
             )
         }),
         _ => Err(PipelineError::InvalidRequest {
@@ -3044,22 +3080,22 @@ impl FrameSourceLoader for DefaultFrameSourceLoader {
     }
 }
 
+#[allow(dead_code)]
 fn decode_native_animation_frames(
     input_path: &str,
     limits: MediaLimits,
     mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<Vec<StickerFrame>, PipelineError> {
     match lowercase_source_extension(input_path).as_deref() {
-        Some("gif") => decode_gif_animation_frames(input_path, limits, || checkpoint()),
-        Some("apng") | Some("png") => {
-            decode_apng_animation_frames(input_path, limits, || checkpoint())
-        }
+        Some("gif") => decode_gif_animation_frames(input_path, limits, &mut checkpoint),
+        Some("apng") | Some("png") => decode_apng_animation_frames(input_path, limits, checkpoint),
         _ => Err(PipelineError::InvalidRequest {
             reason: "unsupported-source-format",
         }),
     }
 }
 
+#[allow(dead_code)]
 fn decode_native_animation_frame(
     input_path: &str,
     source_frame_id: u32,
@@ -3074,9 +3110,9 @@ fn decode_native_animation_frame(
 
     let frame_index = (source_frame_id - 1) as usize;
     match lowercase_source_extension(input_path).as_deref() {
-        Some("gif") => decode_gif_animation_frame(input_path, frame_index, limits, || checkpoint()),
+        Some("gif") => decode_gif_animation_frame(input_path, frame_index, limits, &mut checkpoint),
         Some("apng") | Some("png") => {
-            decode_apng_animation_frame(input_path, frame_index, limits, || checkpoint())
+            decode_apng_animation_frame(input_path, frame_index, limits, checkpoint)
         }
         _ => Err(PipelineError::InvalidRequest {
             reason: "unsupported-source-format",
@@ -3251,6 +3287,7 @@ fn build_video_preview_filter(extraction: &[(u32, u32)], width: u32, height: u32
     format!("select='{selection}',scale={width}:{height}:flags=lanczos,format=rgba,setsar=1")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_video_preview_batch(
     input_path: &Path,
     cache: &PreviewCache,
@@ -3455,7 +3492,7 @@ fn finalize_preview_cache_publication_with_check(
     publication: Option<&PreviewCachePublication>,
     source_check: impl FnOnce() -> Result<(), PipelineError>,
 ) -> Result<(), PipelineError> {
-    context.checkpoint()?;
+    checkpoint_preview_cache_publication(cache, key, context, publication)?;
     let source_check = source_check();
     if matches!(&source_check, Err(PipelineError::SourceChanged)) {
         cache.invalidate(key);
@@ -3534,6 +3571,7 @@ struct LoadedCachedFramePreviews {
     publication: Option<PreviewCachePublication>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_cached_frame_previews(
     cache: &PreviewCache,
     key: &PreviewSourceKey,
@@ -3627,6 +3665,7 @@ fn frame_preview_response_from_cached(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_frame_preview_internal(
     input_path: &str,
     source_frame_id: u32,
@@ -3695,6 +3734,7 @@ fn extract_frame_preview_with_operation(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_frame_preview_with_callbacks(
     input_path: &str,
     source_frame_id: u32,
@@ -3770,6 +3810,7 @@ fn frame_previews_pipeline_error(error: &PipelineError, locale: UiLocale) -> Fra
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_frame_previews_internal(
     input_path: &str,
     source_frame_ids: &[u32],
@@ -3849,6 +3890,7 @@ fn extract_frame_previews_with_operation(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_frame_previews_with_callbacks(
     input_path: &str,
     source_frame_ids: &[u32],
@@ -4193,6 +4235,7 @@ impl<W: Write> NativeApngWriteSession<W> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_native_apng<W: Write>(
     writer: W,
     frames: &[StickerFrame],
@@ -4201,11 +4244,12 @@ fn write_native_apng<W: Write>(
     write_native_apng_with_checkpoint(writer, frames, preset, || Ok(()))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_native_apng_with_checkpoint<W: Write>(
     writer: W,
     frames: &[StickerFrame],
     preset: &str,
-    mut checkpoint: impl FnMut() -> Result<(), PipelineError>,
+    checkpoint: impl FnMut() -> Result<(), PipelineError>,
 ) -> Result<(), PipelineError> {
     let durations_us = frames
         .iter()
@@ -4217,7 +4261,7 @@ fn write_native_apng_with_checkpoint<W: Write>(
         &durations_us,
         frames.iter().cloned().map(Ok),
         preset,
-        || checkpoint(),
+        checkpoint,
     )
 }
 
@@ -4271,14 +4315,16 @@ where
     checkpoint()?;
 
     let mut previous_frame = first.pixels;
-    for frame_index in 1..frame_count {
+    for (frame_index, expected_duration_us) in
+        durations_us.iter().enumerate().take(frame_count).skip(1)
+    {
         checkpoint()?;
         let frame = frames
             .next()
             .ok_or_else(|| PipelineError::MalformedProcessOutput {
                 reason: "APNG frame iterator ended before the declared frame count".into(),
             })??;
-        if frame.duration_us != durations_us[frame_index] {
+        if frame.duration_us != *expected_duration_us {
             return Err(PipelineError::MalformedProcessOutput {
                 reason: "APNG frame duration did not match sequence metadata".into(),
             });
@@ -4309,6 +4355,7 @@ where
     session.finish()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_raw_rgba_output(
     width: u32,
     height: u32,
@@ -4317,7 +4364,7 @@ fn validate_raw_rgba_output(
     limits: MediaLimits,
 ) -> Result<(usize, usize), PipelineError> {
     let frame_size = checked_rgba_bytes(width, height, limits)?;
-    if frame_size == 0 || output_len == 0 || output_len % frame_size != 0 {
+    if frame_size == 0 || output_len == 0 || !output_len.is_multiple_of(frame_size) {
         return Err(PipelineError::MalformedProcessOutput {
             reason: "raw RGBA output is not a whole frame sequence".into(),
         });
@@ -4356,6 +4403,7 @@ fn rgba_frame_from_bytes(
     })
 }
 
+#[allow(dead_code)]
 fn extract_video_source_frames_rgba(
     input_path: &str,
     frame_indexes: &BTreeSet<u32>,
@@ -4437,6 +4485,7 @@ fn extract_video_source_frames_rgba(
     Ok((frames, resolution))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_resampled_frame_stream(frame_count: usize) -> Result<(), PipelineError> {
     if frame_count == 0 {
         return Err(PipelineError::MalformedProcessOutput {
@@ -4468,6 +4517,8 @@ fn normalized_fit_mode(raw: Option<&str>, locale: UiLocale) -> (&'static str, Op
     }
 }
 
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn build_candidate_ladder(
     selected_frame_count: usize,
     source_fps: f64,
@@ -4495,6 +4546,7 @@ fn build_candidate_ladder(
     .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_candidate_universe_with_checkpoint(
     selected_frame_count: usize,
     source_fps: f64,
@@ -4586,6 +4638,7 @@ fn build_candidate_universe_with_checkpoint(
     Ok(candidates)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_candidate_ladder_with_checkpoint(
     selected_frame_count: usize,
     source_fps: f64,
@@ -4612,6 +4665,7 @@ fn build_candidate_ladder_with_checkpoint(
     Ok(select_ranked_candidate_subset(candidates, search_budget))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synchronize_candidates_with_prepared_duration(
     plan: &mut OptimizerPlanResponse,
     prepared: &PreparedSearchSource,
@@ -4702,6 +4756,7 @@ fn synchronize_candidates_with_prepared_duration(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn prepare_optimizer_plan(
     request: &OptimizerPlanRequest,
     locale: UiLocale,
@@ -5057,6 +5112,7 @@ fn validate_candidate_ids(candidate_ids: &[String]) -> Result<(), PipelineError>
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn resolve_candidate_frame_view(
     request: &OptimizerPlanRequest,
 ) -> Result<(Option<Vec<ResolvedTimelineFrame>>, Option<Vec<u32>>), PipelineError> {
@@ -5091,6 +5147,7 @@ fn resolve_candidate_frame_view(
     Ok((None, selection.selected_frames))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_candidate_estimation_source(
     request: &OptimizerPlanRequest,
     requested_candidate_ids: &[String],
@@ -5325,6 +5382,8 @@ fn encode_prepared_candidate_with_checkpoint(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn encode_candidate_internal(
     input_path: &str,
     output_directory: Option<&str>,
@@ -5389,6 +5448,7 @@ fn encode_candidate_internal(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn convert_static_image_to_png_internal(
     input_path: &str,
     output_directory: Option<&str>,
@@ -5433,6 +5493,7 @@ fn convert_static_image_to_png_with_operation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_static_image_to_png_with_callbacks(
     input_path: &str,
     output_directory: Option<&str>,
@@ -5462,7 +5523,7 @@ fn convert_static_image_to_png_with_callbacks(
             input_path,
             locale,
             context,
-            || checkpoint(),
+            &mut checkpoint,
             |_, _, _| {},
         ),
     };
@@ -5534,7 +5595,7 @@ fn convert_static_image_to_png_with_callbacks(
     let started = Instant::now();
     progress(ProgressStage::Decoding, 0, Some(1));
     let source_pixels =
-        match decode_still_rgba_image(input_path, MediaLimits::default(), || checkpoint()) {
+        match decode_still_rgba_image(input_path, MediaLimits::default(), &mut checkpoint) {
             Ok(pixels) => pixels,
             Err(error) => {
                 return StaticImageConversionResult {
@@ -6000,6 +6061,7 @@ fn finalize_source_checked<T>(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn finalize_static_conversion_source(
     expected: &SourceIdentity,
     response: StaticImageConversionResult,
@@ -6010,6 +6072,7 @@ fn finalize_static_conversion_source(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn finalize_static_conversion_source_unless_published(
     expected: &SourceIdentity,
     response: StaticImageConversionResult,
@@ -6045,6 +6108,7 @@ fn finalize_optimizer_search_source_unless_published(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn finalize_frame_preview_source(
     expected: &SourceIdentity,
     response: FramePreviewResponse,
@@ -6055,6 +6119,7 @@ fn finalize_frame_preview_source(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn finalize_frame_previews_source(
     expected: &SourceIdentity,
     response: FramePreviewsResponse,
@@ -6561,6 +6626,7 @@ fn read_png_animation_metadata(
     read_png_metadata(input_path, limits, checkpoint).map(|metadata| metadata.animation)
 }
 
+#[allow(dead_code)]
 fn inspect_still_image_metadata_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
     inspect_still_image_metadata_with_checkpoint(input_path, locale, &mut || Ok(()))
 }
@@ -6642,6 +6708,7 @@ fn inspect_still_image_metadata_with_checkpoint(
     }
 }
 
+#[allow(dead_code)]
 fn inspect_gif_metadata_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
     inspect_gif_metadata_with_checkpoint(input_path, locale, &mut || Ok(()))
 }
@@ -6669,20 +6736,19 @@ fn inspect_gif_metadata_with_checkpoint(
         }
     };
 
-    let frames =
-        match decode_gif_animation_frames(input_path, MediaLimits::default(), || checkpoint()) {
-            Ok(frames) => frames,
-            Err(error) => {
-                return inspection_error(
-                    input_path,
-                    Some("native".into()),
-                    None,
-                    Some(locale::native_animation_detail(locale, "gif")),
-                    error.code(),
-                    pipeline_error_diagnostic(&error, locale),
-                );
-            }
-        };
+    let frames = match decode_gif_animation_frames(input_path, MediaLimits::default(), checkpoint) {
+        Ok(frames) => frames,
+        Err(error) => {
+            return inspection_error(
+                input_path,
+                Some("native".into()),
+                None,
+                Some(locale::native_animation_detail(locale, "gif")),
+                error.code(),
+                pipeline_error_diagnostic(&error, locale),
+            );
+        }
+    };
 
     let width = frames
         .first()
@@ -6745,6 +6811,7 @@ fn inspect_gif_metadata_with_checkpoint(
     }
 }
 
+#[allow(dead_code)]
 fn inspect_apng_metadata_internal(
     input_path: &str,
     locale: UiLocale,
@@ -7157,6 +7224,7 @@ fn finish_ffmpeg_inspection_result(
     }
 }
 
+#[allow(dead_code)]
 fn inspect_video_with_ffmpeg(input_path: &str, locale: UiLocale) -> MediaInspection {
     inspect_video_with_ffmpeg_and_checkpoint(input_path, locale, None, &mut || Ok(()))
 }
@@ -7190,6 +7258,8 @@ fn try_inspect_video_with_ffmpeg_and_checkpoint(
         OsString::from("0:v:0"),
         OsString::from("-frames:v"),
         OsString::from("1"),
+        OsString::from("-c:v"),
+        OsString::from("rawvideo"),
         OsString::from("-f"),
         OsString::from("null"),
         OsString::from("-"),
@@ -7231,6 +7301,7 @@ fn inspect_video_with_ffmpeg_and_checkpoint(
     }
 }
 
+#[allow(dead_code)]
 fn inspect_input_media_canonical_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
     inspect_input_media_canonical_with_checkpoint(input_path, locale, None, &mut || Ok(()))
 }
@@ -7319,6 +7390,7 @@ fn inspect_input_media_canonical_with_checkpoint(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn inspect_input_media_internal(input_path: &str, locale: UiLocale) -> MediaInspection {
     inspect_input_media_with_callbacks(input_path, locale, None, || Ok(()), |_, _, _| {})
 }
@@ -7465,14 +7537,14 @@ async fn inspect_input_media(
     operation_id: String,
     on_progress: Channel<OperationProgress>,
     pipeline_state: State<'_, PipelineState>,
-) -> MediaInspection {
+) -> Result<MediaInspection, String> {
     let locale = parse_ui_locale(locale.as_deref());
     if input_path.trim().is_empty() {
-        return inspection_pipeline_error(
+        return Ok(inspection_pipeline_error(
             &input_path,
             &PipelineError::InvalidRequestWithoutReason,
             locale,
-        );
+        ));
     }
     let kind = MediaOperationKind::Inspect;
     let input_path_for_error = input_path.clone();
@@ -7480,7 +7552,7 @@ async fn inspect_input_media(
     let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
     let reservation = match state.reserve(&operation_id) {
         Ok(reservation) => reservation,
-        Err(error) => return inspection_pipeline_error(&input_path, &error, locale),
+        Err(error) => return Ok(inspection_pipeline_error(&input_path, &error, locale)),
     };
     let preflight_context = reservation.context().clone();
     let preflight_input_path = input_path.clone();
@@ -7492,49 +7564,57 @@ async fn inspect_input_media(
     .await
     {
         Ok(Ok(preflight)) => preflight,
-        Ok(Err(error)) => return inspection_pipeline_error(&input_path, &error, locale),
+        Ok(Err(error)) => return Ok(inspection_pipeline_error(&input_path, &error, locale)),
         Err(message) => {
-            return inspection_pipeline_error(
+            return Ok(inspection_pipeline_error(
                 &input_path,
                 &PipelineError::Io {
                     operation: "join source preflight",
                     message,
                 },
                 locale,
-            )
+            ))
         }
     };
     let managed = match reservation.promote(kind, &progress).await {
         Ok(managed) => managed,
-        Err(error) => return inspection_pipeline_error(&input_path, &error, locale),
+        Err(error) => return Ok(inspection_pipeline_error(&input_path, &error, locale)),
     };
     let context = managed.context().clone();
 
-    match run_managed_blocking(managed, move || {
-        let response = if let Err(error) =
-            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+    Ok(
+        match run_managed_blocking(managed, move || {
+            let response = if let Err(error) =
+                checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+            {
+                inspection_pipeline_error(&input_path, &error, locale)
+            } else {
+                inspect_input_media_with_operation(
+                    &input_path,
+                    &preflight,
+                    locale,
+                    &context,
+                    &progress,
+                )
+            };
+            match finalize_managed_response(&context, response) {
+                Ok(response) => response,
+                Err(error) => inspection_pipeline_error(&input_path, &error, locale),
+            }
+        })
+        .await
         {
-            inspection_pipeline_error(&input_path, &error, locale)
-        } else {
-            inspect_input_media_with_operation(&input_path, &preflight, locale, &context, &progress)
-        };
-        match finalize_managed_response(&context, response) {
-            Ok(response) => response,
-            Err(error) => inspection_pipeline_error(&input_path, &error, locale),
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(message) => inspection_pipeline_error(
-            &input_path_for_error,
-            &PipelineError::Io {
-                operation: "join media worker",
-                message,
-            },
-            locale,
-        ),
-    }
+            Ok(result) => result,
+            Err(message) => inspection_pipeline_error(
+                &input_path_for_error,
+                &PipelineError::Io {
+                    operation: "join media worker",
+                    message,
+                },
+                locale,
+            ),
+        },
+    )
 }
 
 #[tauri::command]
@@ -7543,7 +7623,7 @@ async fn build_optimizer_plan(
     operation_id: String,
     on_progress: Channel<OperationProgress>,
     pipeline_state: State<'_, PipelineState>,
-) -> OptimizerPlanResponse {
+) -> Result<OptimizerPlanResponse, String> {
     let locale = parse_ui_locale(request.locale.as_deref());
     let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
     let kind = MediaOperationKind::BuildPlan;
@@ -7552,49 +7632,52 @@ async fn build_optimizer_plan(
     let reservation = match state.reserve(&operation_id) {
         Ok(reservation) => reservation,
         Err(error) => {
-            return optimizer_plan_pipeline_error(
+            return Ok(optimizer_plan_pipeline_error(
                 locale,
                 fallback_fit_warning.into_iter().collect(),
                 &error,
-            )
+            ))
         }
     };
     let managed = match reservation.promote(kind, &progress).await {
         Ok(managed) => managed,
         Err(error) => {
-            return optimizer_plan_pipeline_error(
+            return Ok(optimizer_plan_pipeline_error(
                 locale,
                 fallback_fit_warning.into_iter().collect(),
                 &error,
-            )
+            ))
         }
     };
     let context = managed.context().clone();
     let worker_fallback_fit_warning = fallback_fit_warning.clone();
 
-    match run_managed_blocking(managed, move || {
-        let response = prepare_optimizer_plan_with_operation(&request, locale, &context, &progress);
-        match finalize_managed_response(&context, response) {
-            Ok(response) => response,
-            Err(error) => optimizer_plan_pipeline_error(
+    Ok(
+        match run_managed_blocking(managed, move || {
+            let response =
+                prepare_optimizer_plan_with_operation(&request, locale, &context, &progress);
+            match finalize_managed_response(&context, response) {
+                Ok(response) => response,
+                Err(error) => optimizer_plan_pipeline_error(
+                    locale,
+                    worker_fallback_fit_warning.into_iter().collect(),
+                    &error,
+                ),
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => optimizer_plan_pipeline_error(
                 locale,
-                worker_fallback_fit_warning.into_iter().collect(),
-                &error,
+                fallback_fit_warning.into_iter().collect(),
+                &PipelineError::Io {
+                    operation: "join media worker",
+                    message,
+                },
             ),
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(message) => optimizer_plan_pipeline_error(
-            locale,
-            fallback_fit_warning.into_iter().collect(),
-            &PipelineError::Io {
-                operation: "join media worker",
-                message,
-            },
-        ),
-    }
+        },
+    )
 }
 
 #[tauri::command]
@@ -7914,7 +7997,7 @@ async fn convert_static_image_to_png(
     operation_id: String,
     on_progress: Channel<OperationProgress>,
     pipeline_state: State<'_, PipelineState>,
-) -> StaticImageConversionResult {
+) -> Result<StaticImageConversionResult, String> {
     let locale = parse_ui_locale(request.locale.as_deref());
     if request.input_path.trim().is_empty()
         || request
@@ -7923,17 +8006,17 @@ async fn convert_static_image_to_png(
             .filter(|revision| !revision.trim().is_empty())
             .is_none()
     {
-        return static_conversion_pipeline_error(
+        return Ok(static_conversion_pipeline_error(
             &PipelineError::InvalidRequestWithoutReason,
             locale,
-        );
+        ));
     }
     let kind = MediaOperationKind::StaticConversion;
     let state = pipeline_state.inner().clone();
     let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
     let reservation = match state.reserve(&operation_id) {
         Ok(reservation) => reservation,
-        Err(error) => return static_conversion_pipeline_error(&error, locale),
+        Err(error) => return Ok(static_conversion_pipeline_error(&error, locale)),
     };
     let preflight_context = reservation.context().clone();
     let preflight_input_path = request.input_path.clone();
@@ -7950,56 +8033,58 @@ async fn convert_static_image_to_png(
     .await
     {
         Ok(Ok(preflight)) => preflight,
-        Ok(Err(error)) => return static_conversion_pipeline_error(&error, locale),
+        Ok(Err(error)) => return Ok(static_conversion_pipeline_error(&error, locale)),
         Err(message) => {
-            return static_conversion_pipeline_error(
+            return Ok(static_conversion_pipeline_error(
                 &PipelineError::Io {
                     operation: "join source preflight",
                     message,
                 },
                 locale,
-            )
+            ))
         }
     };
     let managed = match reservation.promote(kind, &progress).await {
         Ok(managed) => managed,
-        Err(error) => return static_conversion_pipeline_error(&error, locale),
+        Err(error) => return Ok(static_conversion_pipeline_error(&error, locale)),
     };
     let context = managed.context().clone();
 
-    match run_managed_blocking(managed, move || {
-        let response = if let Err(error) =
-            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+    Ok(
+        match run_managed_blocking(managed, move || {
+            let response = if let Err(error) =
+                checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+            {
+                static_conversion_pipeline_error(&error, locale)
+            } else {
+                let canonical_path = preflight.canonical_path().to_string_lossy().into_owned();
+                convert_static_image_to_png_with_operation(
+                    &canonical_path,
+                    request.output_directory.as_deref(),
+                    request.crop_region.as_ref(),
+                    locale,
+                    &preflight,
+                    &context,
+                    &progress,
+                )
+            };
+            match finalize_managed_response(&context, response) {
+                Ok(response) => response,
+                Err(error) => static_conversion_pipeline_error(&error, locale),
+            }
+        })
+        .await
         {
-            static_conversion_pipeline_error(&error, locale)
-        } else {
-            let canonical_path = preflight.canonical_path().to_string_lossy().into_owned();
-            convert_static_image_to_png_with_operation(
-                &canonical_path,
-                request.output_directory.as_deref(),
-                request.crop_region.as_ref(),
+            Ok(result) => result,
+            Err(message) => static_conversion_pipeline_error(
+                &PipelineError::Io {
+                    operation: "join media worker",
+                    message,
+                },
                 locale,
-                &preflight,
-                &context,
-                &progress,
-            )
-        };
-        match finalize_managed_response(&context, response) {
-            Ok(response) => response,
-            Err(error) => static_conversion_pipeline_error(&error, locale),
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(message) => static_conversion_pipeline_error(
-            &PipelineError::Io {
-                operation: "join media worker",
-                message,
-            },
-            locale,
-        ),
-    }
+            ),
+        },
+    )
 }
 
 fn optimizer_search_pipeline_error(
@@ -8255,8 +8340,9 @@ fn optimizer_search_domain_error(
     response
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_optimizer_search_internal(
-    mut request: OptimizerSearchRequest,
+    request: OptimizerSearchRequest,
     locale: UiLocale,
 ) -> OptimizerSearchResponse {
     run_optimizer_search_with_callbacks(request, locale, None, || Ok(()), |_, _, _| {})
@@ -8283,6 +8369,7 @@ fn run_optimizer_search_with_operation(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_optimizer_search_with_callbacks(
     request: OptimizerSearchRequest,
     locale: UiLocale,
@@ -8302,8 +8389,9 @@ fn publish_optimizer_finalizing_progress(
     progress(ProgressStage::Finalizing, completed, Some(total));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_optimizer_search_with_loader(
-    mut request: OptimizerSearchRequest,
+    request: OptimizerSearchRequest,
     locale: UiLocale,
     context: Option<&OperationContext>,
     loader: &impl FrameSourceLoader,
@@ -8606,6 +8694,23 @@ fn run_optimizer_search_with_loader_core(
                 error_code: plan.error_code,
                 error_message: plan.error_message,
             };
+        }
+
+        if resolve_output_directory(
+            request.output_directory.as_deref(),
+            &request.input_path,
+            locale,
+        )
+        .is_err()
+        {
+            return optimizer_search_pipeline_error_with_duration(
+                locale,
+                plan.warnings.clone(),
+                PipelineError::InvalidRequest {
+                    reason: "invalid-output-directory",
+                },
+                plan.selected_duration_seconds,
+            );
         }
 
         progress(ProgressStage::Decoding, 0, Some(1));
@@ -9470,19 +9575,28 @@ mod tests {
 
         let command_new = ["Command", "::new("].concat();
         let spawn = [".", "spawn()"].concat();
-        let kill = ["Child", "::kill(self)"].concat();
-        let wait = ["Child", "::wait(self)"].concat();
+        let kill_child = ["fn kill_", "child(&mut self)"].concat();
+        let try_wait_exit = ["fn try_wait_", "exit(&mut self)"].concat();
         let output = [".", "output()"].concat();
         assert_eq!(lib_source.matches(&command_new).count(), 3);
         assert_eq!(lib_source.matches(&spawn).count(), 3);
         assert_eq!(lib_source.matches(&output).count(), 0);
-        let folder_open = source_section(lib_source, "fn open_folder_path(", "pub fn run()");
+        let folder_start = lib_source
+            .rfind("fn open_folder_path(")
+            .expect("folder command source marker");
+        let run_start = lib_source.rfind("pub fn run()").expect("run source marker");
+        assert!(folder_start < run_start);
+        let folder_open = &lib_source[folder_start..run_start];
         assert_eq!(folder_open.matches(&command_new).count(), 3);
         assert_eq!(folder_open.matches(&spawn).count(), 3);
         assert_eq!(runner_source.matches(&command_new).count(), 1);
         assert_eq!(runner_source.matches(&spawn).count(), 1);
-        assert_eq!(runner_source.matches(&kill).count(), 1);
-        assert_eq!(runner_source.matches(&wait).count(), 1);
+        let runner_production = runner_source
+            .split_once("#[cfg(test)]")
+            .map(|(production, _)| production)
+            .expect("process runner test module boundary");
+        assert_eq!(runner_production.matches(&kill_child).count(), 2);
+        assert_eq!(runner_production.matches(&try_wait_exit).count(), 2);
         assert_eq!(runner_source.matches(&output).count(), 0);
         assert!(runner_source.contains("Stdio::null()"));
         assert!(runner_source.contains("sync_channel::<FrameEvent>(0)"));
@@ -10040,6 +10154,7 @@ mod tests {
         let input_path = test_dir.path.join("input.png");
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         bytes.extend_from_slice(&png_ihdr(10_000, 4_001));
+        bytes.extend_from_slice(&png_chunk(b"IDAT", &[]));
         bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
         fs::write(&input_path, bytes).expect("oversized PNG header fixture must be written");
 
@@ -10066,13 +10181,10 @@ mod tests {
         let input_path = test_dir.path.join("input.gif");
         let file = File::create(&input_path).expect("GIF fixture must be created");
         image::codecs::gif::GifEncoder::new(file)
-            .encode_frames(
-                vec![
-                    image::Frame::new(RgbaImage::new(1, 1)),
-                    image::Frame::new(RgbaImage::new(1, 1)),
-                ]
-                .into_iter(),
-            )
+            .encode_frames(vec![
+                image::Frame::new(RgbaImage::new(1, 1)),
+                image::Frame::new(RgbaImage::new(1, 1)),
+            ])
             .expect("GIF fixture must be encoded");
         let limits = MediaLimits {
             max_frame_count: 1,
@@ -10604,7 +10716,8 @@ mod tests {
             serde_json::from_value::<BoundedFrameIds>(serde_json::json!(vec![1u32; 300])).is_ok()
         );
 
-        for base_frame_count in [300u32] {
+        {
+            let base_frame_count = 300u32;
             assert!(
                 serde_json::from_value::<OptimizerPlanRequest>(serde_json::json!({
                     "baseFrameCount": base_frame_count
@@ -10638,8 +10751,11 @@ mod tests {
     fn bounded_sequence_probes_the_301st_item_without_deserializing_t() {
         for size_hint in [None, Some(0)] {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                BoundedVecVisitor::<PanicOnFrame301>(PhantomData)
-                    .visit_seq(UnknownLengthFrameSequence { next: 1, size_hint })
+                BoundedVecVisitor::<PanicOnFrame301, MAX_MEDIA_FRAME_COUNT> {
+                    marker: PhantomData,
+                    overflow_message: "media frame count exceeds 300",
+                }
+                .visit_seq(UnknownLengthFrameSequence { next: 1, size_hint })
             }));
 
             let result = outcome.expect("the 301st item must not deserialize PanicOnFrame301");
@@ -10648,6 +10764,35 @@ mod tests {
                 "an unknown or false size hint must still reject item 301"
             );
         }
+    }
+
+    #[test]
+    fn optimizer_candidate_ids_are_bounded_during_deserialization() {
+        let candidate_ids = (1..=MAX_OPTIMIZER_CANDIDATE_IDS)
+            .map(|index| format!("candidate-{index}"))
+            .collect::<Vec<_>>();
+        let request = serde_json::from_value::<OptimizerSizeEstimateRequest>(serde_json::json!({
+            "inputPath": "input.gif",
+            "sourceRevision": "revision",
+            "candidateIds": candidate_ids,
+            "sampleSeed": "seed"
+        }))
+        .expect("five candidate IDs must deserialize");
+        assert_eq!(request.candidate_ids.len(), MAX_OPTIMIZER_CANDIDATE_IDS);
+
+        let candidate_ids = (1..=MAX_OPTIMIZER_CANDIDATE_IDS + 1)
+            .map(|index| format!("candidate-{index}"))
+            .collect::<Vec<_>>();
+        let error = serde_json::from_value::<OptimizerSizeEstimateRequest>(serde_json::json!({
+            "inputPath": "input.gif",
+            "sourceRevision": "revision",
+            "candidateIds": candidate_ids,
+            "sampleSeed": "seed"
+        }))
+        .expect_err("six candidate IDs must fail during deserialization");
+        assert!(error
+            .to_string()
+            .contains("optimizer candidate count exceeds 5"));
     }
 
     #[test]
@@ -12800,6 +12945,79 @@ mod tests {
     }
 
     #[test]
+    fn output_directory_probe_writes_and_removes_its_temporary_file() {
+        let test_dir = TestDir::new("output-directory-write-probe");
+        let output_directory = test_dir.path.join("created-output");
+
+        let resolved = resolve_output_directory(
+            Some(output_directory.to_string_lossy().as_ref()),
+            "unused-input.png",
+            UiLocale::En,
+        )
+        .expect("writable output directory must resolve");
+
+        assert_eq!(resolved, output_directory);
+        assert!(resolved.is_dir());
+        assert_eq!(
+            fs::read_dir(&resolved)
+                .expect("output directory must be readable")
+                .count(),
+            0,
+            "the write probe must clean up its temporary file"
+        );
+    }
+
+    #[test]
+    fn output_directory_probe_removes_its_file_when_sync_fails() {
+        let test_dir = TestDir::new("output-directory-sync-failure");
+        let result = probe_output_directory_writable_with_sync(test_dir.path.as_path(), |_| {
+            Err(std::io::Error::other("injected sync failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_dir(&test_dir.path)
+                .expect("probe directory must remain readable")
+                .count(),
+            0,
+            "OS-owned delete-on-close cleanup must run on the error path"
+        );
+    }
+
+    #[test]
+    fn optimizer_search_checks_output_writability_before_decoding() {
+        let source = include_str!("lib.rs");
+        let resolver = source_section(
+            source,
+            "fn resolve_output_directory(",
+            "fn sidecar_candidate_paths_for_exe(",
+        );
+        assert!(resolver.contains("probe_output_directory_writable(&directory)?"));
+        assert!(resolver.contains("tempfile::tempfile_in(directory)"));
+        assert!(resolver.contains(".write_all(&[0])"));
+        assert!(resolver.contains("File::sync_all"));
+        assert!(!resolver.contains("NamedTempFile"));
+
+        let search = source_section(
+            source,
+            "fn run_optimizer_search_with_loader(",
+            "#[cfg(test)]",
+        );
+        let output_preflight = search
+            .find("if resolve_output_directory(")
+            .expect("output directory preflight");
+        let decoding = search
+            .find("progress(ProgressStage::Decoding")
+            .expect("decoding progress");
+        let prepare = search.find("loader.prepare(").expect("decoder preparation");
+
+        assert!(output_preflight < decoding && decoding < prepare);
+        let output_error_mapping = &search[output_preflight..decoding];
+        assert!(output_error_mapping.contains("PipelineError::InvalidRequest"));
+        assert!(output_error_mapping.contains("reason: \"invalid-output-directory\""));
+    }
+
+    #[test]
     fn run_optimizer_search_aborts_on_operation_wide_output_directory_error() {
         let (test_dir, input_path, source_revision) =
             revisioned_placeholder("search-output-directory-error");
@@ -13930,6 +14148,46 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_finalization_entry_rolls_back_its_publication_before_source_check() {
+        let identity = SourceIdentity {
+            canonical_path: PathBuf::from("C:/preview/finalize-cancelled.gif"),
+            file_len: 1,
+            modified_nanos: 1,
+        };
+        let key = PreviewSourceKey {
+            identity,
+            source_revision: "source-finalize-cancelled".into(),
+            variant: PreviewVariant::Native,
+        };
+        let cache = PreviewCache::new(MAX_PREVIEW_CACHE_BYTES);
+        let publication = cache
+            .get_or_try_build_complete(&key, &[1], || {
+                Ok::<_, PipelineError>(vec![CachedPreview {
+                    source_frame_id: 1,
+                    png_bytes: Arc::from([1_u8, 2, 3].as_slice()),
+                    width: 1,
+                    height: 1,
+                }])
+            })
+            .expect("new complete group must be published")
+            .publication
+            .expect("successful resident publication must return a receipt");
+        let context = OperationContext::detached(MediaOperationKind::Preview.timeout());
+        assert!(context.cancel());
+
+        let result = finalize_preview_cache_publication_with_check(
+            &cache,
+            &key,
+            &context,
+            Some(&publication),
+            || panic!("source check must not run after entry cancellation"),
+        );
+
+        assert_eq!(result, Err(PipelineError::Cancelled));
+        assert!(!cache.contains_key(&key));
+    }
+
+    #[test]
     fn changed_source_finalization_invalidates_the_published_cache_key() {
         let test_dir = TestDir::new("preview-cache-source-change");
         let source_path = test_dir.path.join("input.gif");
@@ -14685,7 +14943,7 @@ async fn run_optimizer_search(
     operation_id: String,
     on_progress: Channel<OperationProgress>,
     pipeline_state: State<'_, PipelineState>,
-) -> OptimizerSearchResponse {
+) -> Result<OptimizerSearchResponse, String> {
     let locale = parse_ui_locale(request.locale.as_deref());
     let (_, fallback_fit_warning) = normalized_fit_mode(request.fit_mode.as_deref(), locale);
     if request.input_path.trim().is_empty()
@@ -14695,18 +14953,18 @@ async fn run_optimizer_search(
             .filter(|revision| !revision.trim().is_empty())
             .is_none()
     {
-        return optimizer_search_pipeline_error(
+        return Ok(optimizer_search_pipeline_error(
             locale,
             fallback_fit_warning.into_iter().collect(),
             PipelineError::InvalidRequestWithoutReason,
-        );
+        ));
     }
     if let Err(error) = validate_optimizer_search_request_domain(&request, locale) {
-        return optimizer_search_domain_error(
+        return Ok(optimizer_search_domain_error(
             locale,
             fallback_fit_warning.into_iter().collect(),
             error,
-        );
+        ));
     }
     let kind = MediaOperationKind::OptimizerSearch;
     let state = pipeline_state.inner().clone();
@@ -14714,11 +14972,11 @@ async fn run_optimizer_search(
     let reservation = match state.reserve(&operation_id) {
         Ok(reservation) => reservation,
         Err(error) => {
-            return optimizer_search_pipeline_error(
+            return Ok(optimizer_search_pipeline_error(
                 locale,
                 fallback_fit_warning.into_iter().collect(),
                 error,
-            )
+            ))
         }
     };
     let preflight_context = reservation.context().clone();
@@ -14737,72 +14995,77 @@ async fn run_optimizer_search(
     {
         Ok(Ok(preflight)) => preflight,
         Ok(Err(error)) => {
-            return optimizer_search_pipeline_error(
+            return Ok(optimizer_search_pipeline_error(
                 locale,
                 fallback_fit_warning.into_iter().collect(),
                 error,
-            )
+            ))
         }
         Err(message) => {
-            return optimizer_search_pipeline_error(
+            return Ok(optimizer_search_pipeline_error(
                 locale,
                 fallback_fit_warning.into_iter().collect(),
                 PipelineError::Io {
                     operation: "join source preflight",
                     message,
                 },
-            )
+            ))
         }
     };
     let managed = match reservation.promote(kind, &progress).await {
         Ok(managed) => managed,
         Err(error) => {
-            return optimizer_search_pipeline_error(
+            return Ok(optimizer_search_pipeline_error(
                 locale,
                 fallback_fit_warning.into_iter().collect(),
                 error,
-            )
+            ))
         }
     };
     let context = managed.context().clone();
     let worker_fallback_fit_warning = fallback_fit_warning.clone();
 
-    match run_managed_blocking(managed, move || {
-        let response = if let Err(error) =
-            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+    Ok(
+        match run_managed_blocking(managed, move || {
+            let response = if let Err(error) =
+                checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+            {
+                optimizer_search_pipeline_error(
+                    locale,
+                    worker_fallback_fit_warning.clone().into_iter().collect(),
+                    error,
+                )
+            } else {
+                run_optimizer_search_with_operation(
+                    request, locale, &preflight, &context, &progress,
+                )
+            };
+            match finalize_managed_response(&context, response) {
+                Ok(response) => response,
+                Err(error) => optimizer_search_pipeline_error(
+                    locale,
+                    worker_fallback_fit_warning.into_iter().collect(),
+                    error,
+                ),
+            }
+        })
+        .await
         {
-            optimizer_search_pipeline_error(
+            Ok(result) => result,
+            Err(message) => optimizer_search_pipeline_error(
                 locale,
-                worker_fallback_fit_warning.clone().into_iter().collect(),
-                error,
-            )
-        } else {
-            run_optimizer_search_with_operation(request, locale, &preflight, &context, &progress)
-        };
-        match finalize_managed_response(&context, response) {
-            Ok(response) => response,
-            Err(error) => optimizer_search_pipeline_error(
-                locale,
-                worker_fallback_fit_warning.into_iter().collect(),
-                error,
+                fallback_fit_warning.into_iter().collect(),
+                PipelineError::Io {
+                    operation: "join media worker",
+                    message,
+                },
             ),
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(message) => optimizer_search_pipeline_error(
-            locale,
-            fallback_fit_warning.into_iter().collect(),
-            PipelineError::Io {
-                operation: "join media worker",
-                message,
-            },
-        ),
-    }
+        },
+    )
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn extract_frame_preview(
     input_path: String,
     source_revision: Option<String>,
@@ -14813,7 +15076,7 @@ async fn extract_frame_preview(
     operation_id: String,
     on_progress: Channel<OperationProgress>,
     pipeline_state: State<'_, PipelineState>,
-) -> FramePreviewResponse {
+) -> Result<FramePreviewResponse, String> {
     let locale = parse_ui_locale(locale.as_deref());
     if input_path.trim().is_empty()
         || source_revision
@@ -14821,10 +15084,13 @@ async fn extract_frame_preview(
             .filter(|revision| !revision.trim().is_empty())
             .is_none()
     {
-        return frame_preview_pipeline_error(&PipelineError::InvalidRequestWithoutReason, locale);
+        return Ok(frame_preview_pipeline_error(
+            &PipelineError::InvalidRequestWithoutReason,
+            locale,
+        ));
     }
     if let Err(error) = normalize_preview_source_frame_ids(&[source_frame_id]) {
-        return frame_preview_pipeline_error(&error, locale);
+        return Ok(frame_preview_pipeline_error(&error, locale));
     }
     let kind = MediaOperationKind::Preview;
     let state = pipeline_state.inner().clone();
@@ -14832,7 +15098,7 @@ async fn extract_frame_preview(
     let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
     let reservation = match state.reserve(&operation_id) {
         Ok(reservation) => reservation,
-        Err(error) => return frame_preview_pipeline_error(&error, locale),
+        Err(error) => return Ok(frame_preview_pipeline_error(&error, locale)),
     };
     let preflight_context = reservation.context().clone();
     let preflight_input_path = input_path.clone();
@@ -14858,58 +15124,61 @@ async fn extract_frame_preview(
     .await
     {
         Ok(Ok(preflight)) => preflight,
-        Ok(Err(error)) => return frame_preview_pipeline_error(&error, locale),
+        Ok(Err(error)) => return Ok(frame_preview_pipeline_error(&error, locale)),
         Err(message) => {
-            return frame_preview_pipeline_error(
+            return Ok(frame_preview_pipeline_error(
                 &PipelineError::Io {
                     operation: "join source preflight",
                     message,
                 },
                 locale,
-            )
+            ))
         }
     };
     let managed = match reservation.promote(kind, &progress).await {
         Ok(managed) => managed,
-        Err(error) => return frame_preview_pipeline_error(&error, locale),
+        Err(error) => return Ok(frame_preview_pipeline_error(&error, locale)),
     };
     let context = managed.context().clone();
 
-    match run_managed_blocking(managed, move || {
-        let response = if let Err(error) =
-            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+    Ok(
+        match run_managed_blocking(managed, move || {
+            let response = if let Err(error) =
+                checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+            {
+                frame_preview_pipeline_error(&error, locale)
+            } else {
+                extract_frame_preview_with_operation(
+                    &preflight,
+                    source_frame_id,
+                    locale,
+                    &key,
+                    &preview_cache,
+                    &context,
+                    &progress,
+                )
+            };
+            match finalize_managed_response(&context, response) {
+                Ok(response) => response,
+                Err(error) => frame_preview_pipeline_error(&error, locale),
+            }
+        })
+        .await
         {
-            frame_preview_pipeline_error(&error, locale)
-        } else {
-            extract_frame_preview_with_operation(
-                &preflight,
-                source_frame_id,
-                locale,
-                &key,
-                &preview_cache,
-                &context,
-                &progress,
-            )
-        };
-        match finalize_managed_response(&context, response) {
             Ok(response) => response,
-            Err(error) => frame_preview_pipeline_error(&error, locale),
-        }
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(message) => frame_preview_pipeline_error(
-            &PipelineError::Io {
-                operation: "join media worker",
-                message,
-            },
-            locale,
-        ),
-    }
+            Err(message) => frame_preview_pipeline_error(
+                &PipelineError::Io {
+                    operation: "join media worker",
+                    message,
+                },
+                locale,
+            ),
+        },
+    )
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn extract_frame_previews(
     input_path: String,
     source_revision: Option<String>,
@@ -14920,7 +15189,7 @@ async fn extract_frame_previews(
     operation_id: String,
     on_progress: Channel<OperationProgress>,
     pipeline_state: State<'_, PipelineState>,
-) -> FramePreviewsResponse {
+) -> Result<FramePreviewsResponse, String> {
     let locale = parse_ui_locale(locale.as_deref());
     if input_path.trim().is_empty()
         || source_revision
@@ -14928,11 +15197,14 @@ async fn extract_frame_previews(
             .filter(|revision| !revision.trim().is_empty())
             .is_none()
     {
-        return frame_previews_pipeline_error(&PipelineError::InvalidRequestWithoutReason, locale);
+        return Ok(frame_previews_pipeline_error(
+            &PipelineError::InvalidRequestWithoutReason,
+            locale,
+        ));
     }
     let source_frame_ids = match normalize_preview_source_frame_ids(&source_frame_ids.0) {
         Ok(source_frame_ids) => source_frame_ids,
-        Err(error) => return frame_previews_pipeline_error(&error, locale),
+        Err(error) => return Ok(frame_previews_pipeline_error(&error, locale)),
     };
     let kind = MediaOperationKind::Preview;
     let state = pipeline_state.inner().clone();
@@ -14940,7 +15212,7 @@ async fn extract_frame_previews(
     let progress = ValidatedProgressSink::new(kind, ChannelProgressSink::new(on_progress));
     let reservation = match state.reserve(&operation_id) {
         Ok(reservation) => reservation,
-        Err(error) => return frame_previews_pipeline_error(&error, locale),
+        Err(error) => return Ok(frame_previews_pipeline_error(&error, locale)),
     };
     let preflight_context = reservation.context().clone();
     let preflight_input_path = input_path.clone();
@@ -14966,55 +15238,57 @@ async fn extract_frame_previews(
     .await
     {
         Ok(Ok(preflight)) => preflight,
-        Ok(Err(error)) => return frame_previews_pipeline_error(&error, locale),
+        Ok(Err(error)) => return Ok(frame_previews_pipeline_error(&error, locale)),
         Err(message) => {
-            return frame_previews_pipeline_error(
+            return Ok(frame_previews_pipeline_error(
                 &PipelineError::Io {
                     operation: "join source preflight",
                     message,
                 },
                 locale,
-            )
+            ))
         }
     };
     let managed = match reservation.promote(kind, &progress).await {
         Ok(managed) => managed,
-        Err(error) => return frame_previews_pipeline_error(&error, locale),
+        Err(error) => return Ok(frame_previews_pipeline_error(&error, locale)),
     };
     let context = managed.context().clone();
 
-    match run_managed_blocking(managed, move || {
-        let response = if let Err(error) =
-            checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+    Ok(
+        match run_managed_blocking(managed, move || {
+            let response = if let Err(error) =
+                checkpointed_source_check(&context, preflight.identity(), MediaLimits::default())
+            {
+                frame_previews_pipeline_error(&error, locale)
+            } else {
+                extract_frame_previews_with_operation(
+                    &preflight,
+                    &source_frame_ids,
+                    locale,
+                    &key,
+                    &preview_cache,
+                    &context,
+                    &progress,
+                )
+            };
+            match finalize_managed_response(&context, response) {
+                Ok(response) => response,
+                Err(error) => frame_previews_pipeline_error(&error, locale),
+            }
+        })
+        .await
         {
-            frame_previews_pipeline_error(&error, locale)
-        } else {
-            extract_frame_previews_with_operation(
-                &preflight,
-                &source_frame_ids,
-                locale,
-                &key,
-                &preview_cache,
-                &context,
-                &progress,
-            )
-        };
-        match finalize_managed_response(&context, response) {
             Ok(response) => response,
-            Err(error) => frame_previews_pipeline_error(&error, locale),
-        }
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(message) => frame_previews_pipeline_error(
-            &PipelineError::Io {
-                operation: "join media worker",
-                message,
-            },
-            locale,
-        ),
-    }
+            Err(message) => frame_previews_pipeline_error(
+                &PipelineError::Io {
+                    operation: "join media worker",
+                    message,
+                },
+                locale,
+            ),
+        },
+    )
 }
 
 #[tauri::command]

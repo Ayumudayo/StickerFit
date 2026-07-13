@@ -18,6 +18,7 @@ import type {
 } from "../types/workflow";
 import {
   createOutputSizeEstimateCoordinator,
+  exactEstimateCacheKey,
   sampleSeedFromFingerprint,
   selectCandidatesForEstimate,
   type OutputEstimateCoordinatorState,
@@ -50,6 +51,7 @@ function initialCoordinatorState(
   return {
     estimate: { status: "idle", revision: 0, fingerprint },
     probe: { status: "idle", revision: 0, fingerprint },
+    exactEstimateCache: new Map(),
   };
 }
 
@@ -79,19 +81,21 @@ function validateCandidateEstimates(
   candidateIds: readonly string[],
 ) {
   if (values.length !== candidateIds.length) {
-    throw new Error("Candidate size estimate returned an invalid result count.");
+    throw new Error(
+      "Candidate size estimate returned an invalid result count.",
+    );
   }
   for (let index = 0; index < candidateIds.length; index += 1) {
     if (values[index]?.candidateId !== candidateIds[index]) {
-      throw new Error("Candidate size estimate returned results out of request order.");
+      throw new Error(
+        "Candidate size estimate returned results out of request order.",
+      );
     }
   }
   return values;
 }
 
-function isNearLimitSampledEstimate(
-  estimate: OutputSizeEstimate | undefined,
-) {
+function isNearLimitSampledEstimate(estimate: OutputSizeEstimate | undefined) {
   return (
     estimate?.kind === "range" &&
     estimate.lowerBytes <= estimate.limitBytes &&
@@ -242,22 +246,15 @@ export function useOutputSizeEstimate({
     ) {
       return [];
     }
-    const base = estimateState.value;
-    const probe = state.probe;
-    if (
-      probe.fingerprint !== encodingFingerprint ||
-      probe.status !== "ready"
-    ) {
-      return base;
-    }
-    const index = base.findIndex(
-      (estimate) => estimate.candidateId === probe.candidateId,
-    );
-    if (index < 0) return base;
-    const overlaid = [...base];
-    overlaid[index] = probe.value;
-    return overlaid;
-  }, [encodingFingerprint, state.estimate, state.probe]);
+    return estimateState.value.map((estimate) => {
+      if (estimate.candidateId === null) return estimate;
+      return (
+        state.exactEstimateCache.get(
+          exactEstimateCacheKey(encodingFingerprint, estimate.candidateId),
+        ) ?? estimate
+      );
+    });
+  }, [encodingFingerprint, state.estimate, state.exactEstimateCache]);
 
   const estimateByCandidateId = useMemo(() => {
     const byCandidateId = new Map<string, OutputSizeEstimate>();
@@ -305,9 +302,14 @@ export function useOutputSizeEstimate({
         fingerprint: encodingFingerprint,
         candidateId,
         run: async (options) => {
-          const value = await runtime.probeOptimizerCandidateSize(request, options);
+          const value = await runtime.probeOptimizerCandidateSize(
+            request,
+            options,
+          );
           if (value.candidateId !== candidateId) {
-            throw new Error("Candidate probe returned a mismatched candidate ID.");
+            throw new Error(
+              "Candidate probe returned a mismatched candidate ID.",
+            );
           }
           return value;
         },

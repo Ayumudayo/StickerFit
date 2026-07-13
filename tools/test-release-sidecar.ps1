@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-  [string]$WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-  [string]$PolicyRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+  [string]$WorkspaceRoot,
+  [string]$PolicyRoot,
   [string]$ReleaseDirectory,
   [string]$InstallerPath,
   [string]$SevenZipPath,
@@ -11,6 +11,34 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not $PSBoundParameters.ContainsKey("WorkspaceRoot")) {
+  $WorkspaceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+}
+if (-not $PSBoundParameters.ContainsKey("PolicyRoot")) {
+  $PolicyRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+}
+
+function Get-FileSha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+      $sha256.Dispose()
+    }
+  }
+  finally {
+    $stream.Dispose()
+  }
+}
 
 function Get-NormalizedFullPath {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -162,8 +190,8 @@ function Assert-ExactFileBytes {
     throw "$Label byte length differs from the protected repository source."
   }
 
-  $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ExpectedPath).Hash
-  $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ActualPath).Hash
+  $expectedHash = Get-FileSha256 -Path $ExpectedPath
+  $actualHash = Get-FileSha256 -Path $ActualPath
   if (-not [string]::Equals($actualHash, $expectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "$Label bytes differ from the protected repository source."
   }
@@ -328,7 +356,7 @@ function Assert-ExtractedInstallerPayload {
     throw "Canonical 7-Zip $sevenZipVersion is too old. Required >= 26.2.0."
   }
 
-  $installerHashBeforeListing = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
+  $installerHashBeforeListing = Get-FileSha256 -Path $Installer
   $installerBytesBeforeListing = [long](Get-Item -LiteralPath $Installer -Force).Length
   $listingLines = New-Object 'System.Collections.Generic.List[string]'
   $listingCharacterCount = 0
@@ -474,7 +502,7 @@ function Assert-ExtractedInstallerPayload {
       throw "NSIS listing contains case-variant member '$listedLeafName' instead of '$requiredName'."
     }
   }
-  $installerHashAfterListing = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
+  $installerHashAfterListing = Get-FileSha256 -Path $Installer
   if (-not [string]::Equals(
       $installerHashAfterListing,
       $installerHashBeforeListing,
@@ -513,7 +541,7 @@ function Assert-ExtractedInstallerPayload {
   $markerValue = "stickerfit-nsis-inspection-v1:$inspectionId"
   Write-NewUtf8File -Path $markerPath -Content $markerValue
 
-  $installerHashBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
+  $installerHashBefore = Get-FileSha256 -Path $Installer
   if (-not [string]::Equals(
       $installerHashBefore,
       $installerHashBeforeListing,
@@ -590,7 +618,7 @@ function Assert-ExtractedInstallerPayload {
       throw "Extracted NSIS FFmpeg byte length does not match protected provenance."
     }
 
-    $installerHashAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
+    $installerHashAfter = Get-FileSha256 -Path $Installer
     if (-not [string]::Equals($installerHashBefore, $installerHashAfter, [System.StringComparison]::Ordinal) -or
         [long](Get-Item -LiteralPath $Installer -Force).Length -ne $installerBytesBeforeListing) {
       throw "NSIS installer changed during static payload inspection."
@@ -832,9 +860,7 @@ $trackedProvenancePath = Resolve-RepositoryPath `
   -Path $trackedProvenancePath `
   -Boundary $resolvedWorkspaceRoot `
   -Label "tracked FFmpeg provenance")
-$trackedProvenanceSha256 = (Get-FileHash `
-    -Algorithm SHA256 `
-    -LiteralPath $trackedProvenancePath).Hash.ToLowerInvariant()
+$trackedProvenanceSha256 = Get-FileSha256 -Path $trackedProvenancePath
 Assert-FfmpegFileSha256 `
   -Path $packagedProvenancePath `
   -ExpectedSha256 $trackedProvenanceSha256 `
@@ -855,9 +881,7 @@ if ($packagedBytes -ne $vendor.ArtifactBytes) {
   throw "Packaged release FFmpeg sidecar byte length does not match protected provenance."
 }
 
-$installerHashBeforeStaticVerification = (Get-FileHash `
-    -Algorithm SHA256 `
-    -LiteralPath $InstallerPath).Hash.ToLowerInvariant()
+$installerHashBeforeStaticVerification = Get-FileSha256 -Path $InstallerPath
 $installerBytesBeforeStaticVerification = [long](Get-Item -LiteralPath $InstallerPath -Force).Length
 Assert-ExtractedInstallerPayload `
   -Installer $InstallerPath `
@@ -867,9 +891,7 @@ Assert-ExtractedInstallerPayload `
   -Vendor $vendor `
   -TrackedLicense $trackedLicensePath `
   -TrackedProvenance $trackedProvenancePath
-$installerHashAfterStaticVerification = (Get-FileHash `
-    -Algorithm SHA256 `
-    -LiteralPath $InstallerPath).Hash.ToLowerInvariant()
+$installerHashAfterStaticVerification = Get-FileSha256 -Path $InstallerPath
 if (-not [string]::Equals(
     $installerHashAfterStaticVerification,
     $installerHashBeforeStaticVerification,
@@ -916,9 +938,7 @@ if (-not $StaticOnly) {
     }
   }
 
-  $installerHashAfterNativeChecks = (Get-FileHash `
-      -Algorithm SHA256 `
-      -LiteralPath $InstallerPath).Hash.ToLowerInvariant()
+  $installerHashAfterNativeChecks = Get-FileSha256 -Path $InstallerPath
   if (-not [string]::Equals(
       $installerHashAfterNativeChecks,
       $installerHashAfterStaticVerification,

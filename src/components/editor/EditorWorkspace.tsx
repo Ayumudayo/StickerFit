@@ -48,7 +48,11 @@ export function EditorWorkspace({
     <>
       <section
         ref={editorWorkspaceRef}
-        className={inspection.isStaticImage ? "editorWorkspace editorWorkspaceStatic" : "editorWorkspace"}
+        className={
+          inspection.isStaticImage
+            ? "editorWorkspace editorWorkspaceStatic"
+            : "editorWorkspace"
+        }
         data-editor-shortcut-surface="true"
         tabIndex={0}
         aria-label={shortcutSurfaceLabel}
@@ -60,10 +64,7 @@ export function EditorWorkspace({
           <div className="previewWorkspaceColumn">
             <PreviewInfoBar {...previewInfoBarProps} />
 
-            <MediaSelectionPreview
-              key={previewKey}
-              {...previewProps}
-            />
+            <MediaSelectionPreview key={previewKey} {...previewProps} />
 
             <EditorOverlayPanel {...overlayPanelProps} />
           </div>
@@ -73,13 +74,21 @@ export function EditorWorkspace({
             <PreviewUtilityActions {...previewUtilityActionsProps} />
 
             {isWebPreviewMode ? (
-              <section className="noticeCard previewInlineMessage" role="status" aria-live="polite">
+              <section
+                className="noticeCard previewInlineMessage"
+                role="status"
+                aria-live="polite"
+              >
                 <p>{webPreviewNotice}</p>
               </section>
             ) : null}
 
             {plannerError ? (
-              <section className="errorCard compactState previewInlineMessage" role="alert" aria-live="assertive">
+              <section
+                className="errorCard compactState previewInlineMessage"
+                role="alert"
+                aria-live="assertive"
+              >
                 <p>{plannerError}</p>
               </section>
             ) : null}

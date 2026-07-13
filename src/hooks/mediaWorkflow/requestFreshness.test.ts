@@ -95,7 +95,10 @@ describe("request freshness", () => {
 
     await harness.run("same-source", () => Promise.resolve(firstValue));
     const secondRequest = deferred<TestValue>();
-    const secondResult = harness.run("same-source", () => secondRequest.promise);
+    const secondResult = harness.run(
+      "same-source",
+      () => secondRequest.promise,
+    );
 
     expect(harness.published[harness.published.length - 1]).toBeNull();
     expect(harness.disposed).toEqual([firstValue]);

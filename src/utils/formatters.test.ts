@@ -22,9 +22,7 @@ describe("formatters", () => {
   });
 
   it("formats sampled byte ranges with one shared KiB unit", () => {
-    expect(formatKiBRange(380 * 1024, 470 * 1024)).toBe(
-      "380.0–470.0 KiB",
-    );
+    expect(formatKiBRange(380 * 1024, 470 * 1024)).toBe("380.0–470.0 KiB");
     expect(formatKiBRange(null, 470 * 1024)).toBe("-");
     expect(formatKiBRange(380 * 1024, null)).toBe("-");
   });
@@ -48,9 +46,9 @@ describe("formatters", () => {
   });
 
   it("uses normalized truthful stop-reason copy", () => {
-    expect(
-      stopReasonLabel("found-best-ranked-within-limit", MESSAGES.en),
-    ).toBe(MESSAGES.en.statusBestRanked);
+    expect(stopReasonLabel("found-best-ranked-within-limit", MESSAGES.en)).toBe(
+      MESSAGES.en.statusBestRanked,
+    );
     expect(stopReasonLabel("exhausted-ranked-candidates", MESSAGES.ko)).toBe(
       MESSAGES.ko.statusExhausted,
     );

@@ -1,5 +1,9 @@
 import type { Locale } from "../locales/messages";
-import type { SourceFrame, TimelineFrame, TimelineFrameView } from "../types/editor";
+import type {
+  SourceFrame,
+  TimelineFrame,
+  TimelineFrameView,
+} from "../types/editor";
 
 export function formatTimelineTime(value: number, locale: Locale) {
   return locale === "ko" ? `${value.toFixed(2)}초` : `${value.toFixed(2)}s`;
@@ -16,8 +20,7 @@ export function microsecondsToSeconds(value: number) {
 export function timelineDurationSeconds(
   frames: readonly Pick<TimelineFrame, "durationUs">[],
 ) {
-  return frames.reduce((sum, frame) => sum + frame.durationUs, 0) /
-    1_000_000;
+  return frames.reduce((sum, frame) => sum + frame.durationUs, 0) / 1_000_000;
 }
 
 export function buildSourceFrames(
@@ -25,10 +28,7 @@ export function buildSourceFrames(
   estimatedFrames: number | null,
   frameDurationsSeconds: number[] | null,
 ) {
-  if (
-    frameDurationsSeconds &&
-    frameDurationsSeconds.length > 0
-  ) {
+  if (frameDurationsSeconds && frameDurationsSeconds.length > 0) {
     let currentStartUs = 0;
 
     return frameDurationsSeconds.map((frameDurationSeconds, index) => {
@@ -43,7 +43,12 @@ export function buildSourceFrames(
     });
   }
 
-  if (!durationSeconds || durationSeconds <= 0 || !estimatedFrames || estimatedFrames <= 0) {
+  if (
+    !durationSeconds ||
+    durationSeconds <= 0 ||
+    !estimatedFrames ||
+    estimatedFrames <= 0
+  ) {
     return [] as SourceFrame[];
   }
 
@@ -80,7 +85,9 @@ export function buildTimelineFrameViews(
   sourceFrames: SourceFrame[],
 ) {
   let currentStartUs = 0;
-  const sourceFrameMap = new Map(sourceFrames.map((frame) => [frame.sourceFrameId, frame]));
+  const sourceFrameMap = new Map(
+    sourceFrames.map((frame) => [frame.sourceFrameId, frame]),
+  );
 
   return timelineFrames.map((frame) => {
     const sourceFrame = sourceFrameMap.get(frame.sourceFrameId);
@@ -92,7 +99,9 @@ export function buildTimelineFrameViews(
       durationSeconds: microsecondsToSeconds(frame.durationUs),
       startTimeUs: currentStartUs,
       startTimeSeconds: microsecondsToSeconds(currentStartUs),
-      sourceStartTimeSeconds: microsecondsToSeconds(sourceFrame?.startTimeUs ?? 0),
+      sourceStartTimeSeconds: microsecondsToSeconds(
+        sourceFrame?.startTimeUs ?? 0,
+      ),
     } satisfies TimelineFrameView;
 
     currentStartUs += frame.durationUs;

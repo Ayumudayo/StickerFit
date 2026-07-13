@@ -131,12 +131,12 @@ describe("canonical media operation errors", () => {
   });
   it("keeps the JSON fixture and every locale table exhaustive in both directions", () => {
     for (const locale of ["en", "ko"] as const) {
-      expect(sorted(Object.keys(MEDIA_OPERATION_MESSAGES[locale].errorCodes))).toEqual(
-        sorted(mediaOperationCodes.errorCodes),
-      );
-      expect(sorted(Object.keys(MEDIA_OPERATION_MESSAGES[locale].reasonCodes))).toEqual(
-        sorted(mediaOperationCodes.reasonCodes),
-      );
+      expect(
+        sorted(Object.keys(MEDIA_OPERATION_MESSAGES[locale].errorCodes)),
+      ).toEqual(sorted(mediaOperationCodes.errorCodes));
+      expect(
+        sorted(Object.keys(MEDIA_OPERATION_MESSAGES[locale].reasonCodes)),
+      ).toEqual(sorted(mediaOperationCodes.reasonCodes));
     }
 
     expect(MEDIA_OPERATION_MESSAGES.en.errorCodes["png-chunk-limit"]).toBe(
@@ -526,9 +526,9 @@ describe("canonical media operation errors", () => {
   });
 
   it("uses reason translations ahead of category translations", () => {
-    expect(
-      mediaOperationMessage("en", "invalid-request", "invalid-crop"),
-    ).toBe(MEDIA_OPERATION_MESSAGES.en.reasonCodes["invalid-crop"]);
+    expect(mediaOperationMessage("en", "invalid-request", "invalid-crop")).toBe(
+      MEDIA_OPERATION_MESSAGES.en.reasonCodes["invalid-crop"],
+    );
     expect(mediaOperationMessage("ko", "tool-missing", null)).toBe(
       MEDIA_OPERATION_MESSAGES.ko.errorCodes["tool-missing"],
     );
@@ -601,9 +601,9 @@ describe("web source revision", () => {
     ["lastModified", 1_700_000_000_001],
     ["type", "image/apng"],
   ] as const)("changes when %s changes", (field, value) => {
-    expect(buildWebFileSourceRevision({ ...baseFile, [field]: value })).not.toBe(
-      buildWebFileSourceRevision(baseFile),
-    );
+    expect(
+      buildWebFileSourceRevision({ ...baseFile, [field]: value }),
+    ).not.toBe(buildWebFileSourceRevision(baseFile));
   });
 });
 
@@ -655,9 +655,12 @@ describe("inspection fallback provenance contract", () => {
     { fallbackReasonCode: { value: "media-foundation-failed" } },
     { fallbackReason: "media-foundation-failed" },
     { toolDetail: "media-foundation-failed" },
-  ])("normalizes missing, legacy, malformed, and unknown provenance to null", (raw) => {
-    expect(normalizeInspectionFallbackReasonCode(raw)).toBeNull();
-  });
+  ])(
+    "normalizes missing, legacy, malformed, and unknown provenance to null",
+    (raw) => {
+      expect(normalizeInspectionFallbackReasonCode(raw)).toBeNull();
+    },
+  );
 
   it("never coerces hostile fallback values", () => {
     expect(
@@ -769,9 +772,9 @@ describe("operation progress localization", () => {
   it("keeps the six closed progress codes exhaustive and localized", () => {
     expect(PROGRESS_CODES_ARE_COMPLETE).toBe(true);
     for (const locale of ["en", "ko"] as const) {
-      expect(sorted(Object.keys(MEDIA_OPERATION_PROGRESS_MESSAGES[locale]))).toEqual(
-        sorted(EXPECTED_PROGRESS_MESSAGE_CODES),
-      );
+      expect(
+        sorted(Object.keys(MEDIA_OPERATION_PROGRESS_MESSAGES[locale])),
+      ).toEqual(sorted(EXPECTED_PROGRESS_MESSAGE_CODES));
       for (const code of EXPECTED_PROGRESS_MESSAGE_CODES) {
         expect(MEDIA_OPERATION_PROGRESS_MESSAGES[locale][code]).not.toBe("");
       }
@@ -823,7 +826,8 @@ describe("desktop media operation adapter", () => {
       outputFrameCount: 1,
     } satisfies OutputSizeEstimate;
     const channel = { serialized: "__TAURI_CHANNEL__" };
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
 
     await expect(
       invokeDesktopStaticSizeEstimate(
@@ -831,7 +835,10 @@ describe("desktop media operation adapter", () => {
         { operationId: "operation-static-estimate" },
         {
           createChannel: () => channel,
-          invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+          invoke: async <T>(
+            command: string,
+            args?: Record<string, unknown>,
+          ) => {
             calls.push({ command, args });
             return estimate as unknown as T;
           },
@@ -899,7 +906,8 @@ describe("desktop media operation adapter", () => {
       },
     ] satisfies OutputSizeEstimate[];
     const channel = { serialized: "__TAURI_CHANNEL__" };
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
 
     await expect(
       invokeDesktopEstimateOptimizerCandidates(
@@ -907,7 +915,10 @@ describe("desktop media operation adapter", () => {
         { operationId: "operation-candidate-estimates" },
         {
           createChannel: () => channel,
-          invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+          invoke: async <T>(
+            command: string,
+            args?: Record<string, unknown>,
+          ) => {
             calls.push({ command, args });
             return estimates as unknown as T;
           },
@@ -944,7 +955,8 @@ describe("desktop media operation adapter", () => {
       outputFrameCount: 150,
     } satisfies ExactCandidateSizeEstimate;
     const channel = { serialized: "__TAURI_CHANNEL__" };
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
 
     await expect(
       invokeDesktopProbeOptimizerCandidateSize(
@@ -952,7 +964,10 @@ describe("desktop media operation adapter", () => {
         { operationId: "operation-candidate-probe" },
         {
           createChannel: () => channel,
-          invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+          invoke: async <T>(
+            command: string,
+            args?: Record<string, unknown>,
+          ) => {
             calls.push({ command, args });
             return estimate as unknown as T;
           },
@@ -1014,7 +1029,8 @@ describe("desktop media operation adapter", () => {
   it("reuses the managed AbortSignal cancellation bridge for candidate estimates", async () => {
     const controller = new AbortController();
     const estimates = deferred<OutputSizeEstimate[]>();
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
     const operation = invokeDesktopEstimateOptimizerCandidates(
       {
         ...optimizerPlanRequest(),
@@ -1056,7 +1072,8 @@ describe("desktop media operation adapter", () => {
   it("keeps the DTO unchanged and adds operationId plus the Channel at top level", async () => {
     const request = { inputPath: "C:/media/input.gif", locale: "en" };
     const channel = { serialized: "__TAURI_CHANNEL__" };
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
 
     await invokeDesktopMediaOperation(
       "build_optimizer_plan",
@@ -1087,7 +1104,8 @@ describe("desktop media operation adapter", () => {
 
   it("preserves flat command arguments while adding operation metadata", async () => {
     const channel = { serialized: "__TAURI_CHANNEL__" };
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
 
     await invokeDesktopMediaOperation(
       "inspect_input_media",
@@ -1182,13 +1200,15 @@ describe("desktop media operation adapter", () => {
       { operationId: "operation-listener", signal: controller.signal },
       {
         createChannel: () => ({}),
-        invoke: async <T>() => ({ ok: true } as unknown as T),
+        invoke: async <T>() => ({ ok: true }) as unknown as T,
       },
     );
 
     expect(addListener).toHaveBeenCalledOnce();
     expect(removeListener).toHaveBeenCalledOnce();
-    expect(removeListener.mock.calls[0]?.[1]).toBe(addListener.mock.calls[0]?.[1]);
+    expect(removeListener.mock.calls[0]?.[1]).toBe(
+      addListener.mock.calls[0]?.[1],
+    );
   });
 
   it("removes the abort listener when the heavy invoke rejects", async () => {
@@ -1213,7 +1233,8 @@ describe("desktop media operation adapter", () => {
   it("sends live abort cancellation exactly once", async () => {
     const controller = new AbortController();
     const heavy = deferred<{ ok: boolean }>();
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
     const operation = invokeDesktopMediaOperation(
       "run_optimizer_search",
       { request: {} },
@@ -1250,7 +1271,8 @@ describe("desktop media operation adapter", () => {
     const controller = new AbortController();
     controller.abort();
     const cancel = deferred<boolean>();
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
 
     const operation = invokeDesktopMediaOperation(
       "convert_static_image_to_png",
@@ -1284,19 +1306,26 @@ describe("desktop media operation adapter", () => {
 
   it("closes the listener-installation abort race before starting the heavy command", async () => {
     const cancel = deferred<boolean>();
-    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
     let aborted = false;
     let installedListener: EventListener | null = null;
     const signal = {
       get aborted() {
         return aborted;
       },
-      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      addEventListener: (
+        _type: string,
+        listener: EventListenerOrEventListenerObject,
+      ) => {
         installedListener = listener as EventListener;
         aborted = true;
         installedListener(new Event("abort"));
       },
-      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      removeEventListener: (
+        _type: string,
+        listener: EventListenerOrEventListenerObject,
+      ) => {
         if (installedListener === listener) {
           installedListener = null;
         }
@@ -1413,13 +1442,14 @@ describe("web media operation adapter contract", () => {
         }
       }
     }
-    const createElement = document.createElement.bind(document);
-    vi.spyOn(document, "createElement").mockImplementation((tagName) =>
-      tagName === "video"
-        ? (new FakeVideo() as unknown as HTMLVideoElement)
-        : createElement(tagName),
+    const createElement = vi.fn((tagName: string) => {
+      expect(tagName).toBe("video");
+      return new FakeVideo() as unknown as HTMLVideoElement;
+    });
+    vi.stubGlobal("document", { createElement });
+    vi.spyOn(URL, "createObjectURL").mockReturnValue(
+      "blob:operation-web-video",
     );
-    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:operation-web-video");
     const runtime = getAppRuntime();
     const file = {
       name: "clip.mp4",
@@ -1452,7 +1482,9 @@ describe("web media operation adapter contract", () => {
       }
     }
     vi.stubGlobal("Image", FailingImage);
-    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:operation-web-error");
+    vi.spyOn(URL, "createObjectURL").mockReturnValue(
+      "blob:operation-web-error",
+    );
     const runtime = getAppRuntime();
     const file = {
       name: "broken.png",

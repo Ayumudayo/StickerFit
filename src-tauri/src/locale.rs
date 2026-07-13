@@ -243,6 +243,7 @@ pub(crate) fn missing_sidecar_reason(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn command_non_zero_exit_message(command_display: &str, locale: UiLocale) -> String {
     match locale {
         UiLocale::En => format!("{command_display} returned a non-zero exit code"),

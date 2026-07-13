@@ -16,11 +16,17 @@ export function editorText(locale: Locale) {
       frameToolbarPasteBelow: "아래 붙여넣기",
       frameToolbarInvert: "선택 반전",
       frameToolbarDelete: "선택 삭제",
-      frameToolbarHint: "프레임을 우클릭하고, 위/아래 키로 프레임 사이를 이동합니다.",
+      frameToolbarHint:
+        "프레임을 우클릭하고, 위/아래 키로 프레임 사이를 이동합니다.",
       frameEmptyPasteHint: "복사한 프레임은 아래 붙여넣기로 복원합니다.",
       frameCount: (selected: number, total: number) => `${selected} / ${total}`,
       frameNumber: "번호",
       frameTime: "프레임 시간",
+      framePreviewLoading: "불러오는 중",
+      framePreviewUnavailable: "미리보기를 불러오지 못했습니다.",
+      framePreviewRetry: "다시 시도",
+      framePreviewRetryLabel: (frameNumber: number) =>
+        `${frameNumber}번 프레임 미리보기 다시 시도`,
       play: "재생",
       pause: "일시정지",
       frameState: "상태",
@@ -55,12 +61,14 @@ export function editorText(locale: Locale) {
       secondsLabel: "초",
       confirm: "확인",
       cancel: "취소",
-      mixedDurationHint: "선택한 프레임마다 시간이 다릅니다. 기준 프레임 값으로 입력됩니다.",
+      mixedDurationHint:
+        "선택한 프레임마다 시간이 다릅니다. 기준 프레임 값으로 입력됩니다.",
       nthFrameDialogTitle: "N번째 프레임 선택",
       nthFrameLabel: "간격",
       noFrames: "표시할 프레임이 없습니다.",
       staticWorkspaceTitle: "정적 이미지 워크스페이스",
-      staticWorkspaceBody: "정적 이미지는 타임라인 대신 현재 크롭과 PNG 변환 흐름만 사용합니다.",
+      staticWorkspaceBody:
+        "정적 이미지는 타임라인 대신 현재 크롭과 PNG 변환 흐름만 사용합니다.",
       latestRun: "최근 실행",
     };
   }
@@ -79,11 +87,17 @@ export function editorText(locale: Locale) {
     frameToolbarPasteBelow: "Paste below",
     frameToolbarInvert: "Invert",
     frameToolbarDelete: "Delete",
-    frameToolbarHint: "Right-click a frame for commands. Use Up/Down to move through frames.",
+    frameToolbarHint:
+      "Right-click a frame for commands. Use Up/Down to move through frames.",
     frameEmptyPasteHint: "Use Paste below to restore copied frames.",
     frameCount: (selected: number, total: number) => `${selected} / ${total}`,
     frameNumber: "No.",
     frameTime: "Frame duration",
+    framePreviewLoading: "Loading",
+    framePreviewUnavailable: "Preview unavailable.",
+    framePreviewRetry: "Retry",
+    framePreviewRetryLabel: (frameNumber: number) =>
+      `Retry preview for frame ${frameNumber}`,
     play: "Play",
     pause: "Pause",
     frameState: "State",
@@ -118,12 +132,14 @@ export function editorText(locale: Locale) {
     secondsLabel: "seconds",
     confirm: "Confirm",
     cancel: "Cancel",
-    mixedDurationHint: "Selected frames have mixed durations. The anchor frame value is shown.",
+    mixedDurationHint:
+      "Selected frames have mixed durations. The anchor frame value is shown.",
     nthFrameDialogTitle: "Select every Nth frame",
     nthFrameLabel: "Step",
     noFrames: "No frame markers available.",
     staticWorkspaceTitle: "Static image workspace",
-    staticWorkspaceBody: "Static images skip the timeline. Use the current crop and PNG conversion flow instead.",
+    staticWorkspaceBody:
+      "Static images skip the timeline. Use the current crop and PNG conversion flow instead.",
     latestRun: "Latest run",
   };
 }

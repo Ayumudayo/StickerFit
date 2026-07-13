@@ -211,6 +211,7 @@ impl OperationContext {
         finalizer()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_publishing(&self) -> bool {
         self.lock_lifecycle().phase == OperationPhase::Publishing
     }
@@ -350,6 +351,7 @@ impl OperationRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn register(
         &self,
         operation_id: &str,
@@ -359,6 +361,7 @@ impl OperationRegistry {
         self.register_at(operation_id, now, bounded_deadline(now, timeout))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn register_at(
         &self,
         operation_id: &str,
@@ -431,6 +434,7 @@ impl OperationRegistry {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_finished_at(&self, operation_id: &str, finished_at: Instant) {
         self.lock_state()
             .record_finished_at(operation_id, finished_at);
@@ -517,6 +521,7 @@ impl PipelineState {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn register(
         &self,
         operation_id: &str,
@@ -532,6 +537,7 @@ impl PipelineState {
         self.reservation_from(self.registry.reserve(operation_id)?)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn reserve_at(
         &self,
         operation_id: &str,
@@ -560,6 +566,7 @@ impl PipelineState {
         Arc::clone(&self.preview_cache)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn acquire_decode(
         &self,
         context: &OperationContext,
@@ -567,6 +574,7 @@ impl PipelineState {
         acquire_permit(Arc::clone(&self.decode), context).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn acquire_output_then_decode(
         &self,
         context: &OperationContext,
@@ -579,6 +587,7 @@ impl PipelineState {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn acquire_estimate_then_decode(
         &self,
         context: &OperationContext,
@@ -642,28 +651,33 @@ impl PreflightReservation {
 
         let permits = match kind.permit_profile() {
             PermitProfile::None => ManagedPermits::None,
-            PermitProfile::Decode => ManagedPermits::Decode(
-                acquire_permit(Arc::clone(&self.decode), self.registration.context()).await?,
-            ),
+            PermitProfile::Decode => ManagedPermits::Decode {
+                _decode: acquire_permit(Arc::clone(&self.decode), self.registration.context())
+                    .await?,
+            },
             PermitProfile::EstimateDecode => {
                 let estimate =
                     acquire_permit(Arc::clone(&self.estimate), self.registration.context()).await?;
                 let decode =
                     acquire_permit(Arc::clone(&self.decode), self.registration.context()).await?;
-                ManagedPermits::EstimateDecode(EstimateDecodePermits {
-                    _estimate: estimate,
-                    _decode: decode,
-                })
+                ManagedPermits::EstimateDecode {
+                    _permits: EstimateDecodePermits {
+                        _estimate: estimate,
+                        _decode: decode,
+                    },
+                }
             }
             PermitProfile::OutputDecode => {
                 let output =
                     acquire_permit(Arc::clone(&self.output), self.registration.context()).await?;
                 let decode =
                     acquire_permit(Arc::clone(&self.decode), self.registration.context()).await?;
-                ManagedPermits::OutputDecode(OutputDecodePermits {
-                    _output: output,
-                    _decode: decode,
-                })
+                ManagedPermits::OutputDecode {
+                    _permits: OutputDecodePermits {
+                        _output: output,
+                        _decode: decode,
+                    },
+                }
             }
         };
 
@@ -676,9 +690,9 @@ impl PreflightReservation {
 
 enum ManagedPermits {
     None,
-    Decode(OwnedSemaphorePermit),
-    EstimateDecode(EstimateDecodePermits),
-    OutputDecode(OutputDecodePermits),
+    Decode { _decode: OwnedSemaphorePermit },
+    EstimateDecode { _permits: EstimateDecodePermits },
+    OutputDecode { _permits: OutputDecodePermits },
 }
 
 pub(crate) struct ManagedOperation {
@@ -791,22 +805,12 @@ impl ProgressSink for ChannelProgressSink {
     }
 }
 
+#[derive(Default)]
 struct ProgressCursor {
     stage: Option<ProgressStage>,
     completed: u32,
     total: Option<u32>,
     sealed: bool,
-}
-
-impl Default for ProgressCursor {
-    fn default() -> Self {
-        Self {
-            stage: None,
-            completed: 0,
-            total: None,
-            sealed: false,
-        }
-    }
 }
 
 impl ProgressCursor {
@@ -1813,7 +1817,9 @@ mod tests {
                 .expect("worker finish signal");
             within_test_timeout(async {
                 loop {
-                    if state.registry.lock_state().active.is_empty() {
+                    let registry_is_empty = state.registry.lock_state().active.is_empty();
+                    let permit_is_fully_returned = state.decode.available_permits() == 2;
+                    if registry_is_empty && permit_is_fully_returned {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -2005,10 +2011,11 @@ mod tests {
             assert_eq!(state.output.available_permits(), 0);
             assert_eq!(state.decode.available_permits(), 0);
             assert_eq!(state.registry.lock_state().active.len(), 1);
-            let queued = recording.values.lock().expect("recording sink lock");
-            assert_eq!(queued.len(), 1);
-            assert_eq!(queued[0].stage, ProgressStage::Queued);
-            drop(queued);
+            {
+                let queued = recording.values.lock().expect("recording sink lock");
+                assert_eq!(queued.len(), 1);
+                assert_eq!(queued[0].stage, ProgressStage::Queued);
+            }
 
             assert!(state.cancel("promote-output-before-decode"));
             let result = within_test_timeout(waiter)
@@ -2067,10 +2074,11 @@ mod tests {
             assert_eq!(state.decode.available_permits(), 0);
             assert_eq!(state.output.available_permits(), 1);
             assert_eq!(state.registry.lock_state().active.len(), 1);
-            let queued = recording.values.lock().expect("recording sink lock");
-            assert_eq!(queued.len(), 1);
-            assert_eq!(queued[0].stage, ProgressStage::Queued);
-            drop(queued);
+            {
+                let queued = recording.values.lock().expect("recording sink lock");
+                assert_eq!(queued.len(), 1);
+                assert_eq!(queued[0].stage, ProgressStage::Queued);
+            }
 
             assert!(state.cancel("promote-estimate-before-decode"));
             let result = within_test_timeout(waiter)

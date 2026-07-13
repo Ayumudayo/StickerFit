@@ -74,9 +74,9 @@ describe("output-size estimate classification", () => {
 
 describe("optimizer stop-reason normalization", () => {
   it("maps the backend best-ranked result to truthful UI copy", () => {
-    expect(
-      normalizeOptimizerStopReason("found-best-ranked-within-limit"),
-    ).toBe("best-ranked-within-limit");
+    expect(normalizeOptimizerStopReason("found-best-ranked-within-limit")).toBe(
+      "best-ranked-within-limit",
+    );
     expect(normalizeOptimizerStopReason("first-fit-within-limit")).toBe(
       "best-ranked-within-limit",
     );
@@ -143,8 +143,21 @@ describe("output-size locale parity", () => {
       }
       expect(copy.estimateExactSummary("512.0 KiB").trim()).not.toBe("");
       expect(
-        copy.estimateRangeSummary("380.0–470.0 KiB", copy.estimateConfidenceHigh).trim(),
+        copy
+          .estimateRangeSummary("380.0–470.0 KiB", copy.estimateConfidenceHigh)
+          .trim(),
       ).not.toBe("");
     },
   );
+
+  it("describes the explicit preview regeneration required after settings change", () => {
+    expect(MESSAGES.en.estimateWaitingForPlan).toContain(
+      "Generate preview candidates",
+    );
+    expect(MESSAGES.en.estimateSettingsHint).toContain(
+      "regenerate preview candidates",
+    );
+    expect(MESSAGES.ko.estimateWaitingForPlan).toContain("후보를 생성");
+    expect(MESSAGES.ko.estimateSettingsHint).toContain("다시 생성");
+  });
 });

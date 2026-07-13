@@ -960,7 +960,7 @@ function Write-DryRunTranscript {
     dryRun = $true
     mode = $Mode
     workspaceRoot = $ResolvedWorkspaceRoot
-    operations = @($script:dryRunOperations)
+    operations = $script:dryRunOperations.ToArray()
   } | ConvertTo-Json -Depth 8
 }
 

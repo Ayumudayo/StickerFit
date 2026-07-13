@@ -5,7 +5,10 @@ type InspectionErrorCardProps = {
   message: string | null;
 };
 
-export function InspectionErrorCard({ copy, message }: InspectionErrorCardProps) {
+export function InspectionErrorCard({
+  copy,
+  message,
+}: InspectionErrorCardProps) {
   return (
     <div className="errorCard" role="alert" aria-live="assertive">
       <p className="panelLabel">{copy.inspectionFailed}</p>

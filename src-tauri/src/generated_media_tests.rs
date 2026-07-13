@@ -114,13 +114,10 @@ fn generated_gif_and_apng_are_inspectable() {
     image::codecs::gif::GifEncoder::new(
         File::create(&gif_path).expect("generated GIF file must be created"),
     )
-    .encode_frames(
-        [
-            Frame::from_parts(first.clone(), 0, 0, Delay::from_numer_denom_ms(100, 1)),
-            Frame::from_parts(second.clone(), 0, 0, Delay::from_numer_denom_ms(200, 1)),
-        ]
-        .into_iter(),
-    )
+    .encode_frames([
+        Frame::from_parts(first.clone(), 0, 0, Delay::from_numer_denom_ms(100, 1)),
+        Frame::from_parts(second.clone(), 0, 0, Delay::from_numer_denom_ms(200, 1)),
+    ])
     .expect("deterministic GIF fixture must encode");
 
     let apng_path = directory.path().join("generated.png");
@@ -272,6 +269,7 @@ fn generated_malformed_png_forms_are_rejected_before_decode() {
 
     let limits = MediaLimits::default();
     let mut oversized = b"\x89PNG\r\n\x1a\n".to_vec();
+    oversized.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
     oversized.extend_from_slice(&(limits.max_png_chunk_bytes + 1).to_be_bytes());
     oversized.extend_from_slice(b"tEXt");
     assert!(matches!(

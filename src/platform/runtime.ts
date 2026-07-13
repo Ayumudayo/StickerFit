@@ -163,9 +163,7 @@ function safeLegacyValue(value: string) {
   const escaped = Array.from(sample, (character) =>
     /^[A-Za-z0-9._\[\]-]$/.test(character)
       ? character
-      : `\\u{${(character.codePointAt(0) ?? 0)
-          .toString(16)
-          .padStart(4, "0")}}`,
+      : `\\u{${(character.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}}`,
   ).join("");
   return escaped.length > 128 || sample.length < value.length
     ? `${escaped.slice(0, 128)}…`
@@ -196,9 +194,7 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
       const isError = raw instanceof Error;
       rawCode = fields.errorCode;
       rawReasonCode = fields.reasonCode;
-      rawErrorMessage = isError
-        ? (raw as Error).message
-        : fields.errorMessage;
+      rawErrorMessage = isError ? (raw as Error).message : fields.errorMessage;
     } else {
       rawCode = raw;
       rawReasonCode = undefined;
@@ -223,10 +219,7 @@ export function normalizeLegacyMediaError(raw: unknown): NormalizedMediaError {
     return {
       errorCode: "internal-task-failed",
       reasonCode: null,
-      diagnostics: withLegacyCodeDiagnostic(
-        null,
-        boundedUnknownValue(rawCode),
-      ),
+      diagnostics: withLegacyCodeDiagnostic(null, boundedUnknownValue(rawCode)),
     };
   }
 
@@ -596,8 +589,7 @@ function createMediaErrorInspection(
     errorMessage:
       diagnosticMessage(
         error instanceof Error ? error.message : boundedUnknownValue(error),
-      ) ??
-      "Browser media inspection failed.",
+      ) ?? "Browser media inspection failed.",
   };
 }
 
@@ -633,11 +625,15 @@ function inferCodecName(file: File) {
   return null;
 }
 
-function createBrowserVideoInspection(file: File, previewSrc: string, metadata: {
-  durationSeconds: number;
-  width: number;
-  height: number;
-}) {
+function createBrowserVideoInspection(
+  file: File,
+  previewSrc: string,
+  metadata: {
+    durationSeconds: number;
+    width: number;
+    height: number;
+  },
+) {
   const estimatedFrames = Math.max(
     1,
     Math.min(
@@ -677,10 +673,14 @@ function createBrowserVideoInspection(file: File, previewSrc: string, metadata: 
   } satisfies MediaInspection;
 }
 
-function createBrowserImageInspection(file: File, previewSrc: string, metadata: {
-  width: number;
-  height: number;
-}) {
+function createBrowserImageInspection(
+  file: File,
+  previewSrc: string,
+  metadata: {
+    width: number;
+    height: number;
+  },
+) {
   return {
     ok: true,
     inputPath: file.name,
@@ -690,7 +690,8 @@ function createBrowserImageInspection(file: File, previewSrc: string, metadata: 
     inputSourceKind: "file",
     toolSource: "browser",
     toolCommand: null,
-    toolDetail: "Browser preview mode supports crop and layout review for local image files.",
+    toolDetail:
+      "Browser preview mode supports crop and layout review for local image files.",
     fallbackReasonCode: null,
     formatName: inferFormatName(file),
     durationSeconds: null,
@@ -713,32 +714,34 @@ function createBrowserImageInspection(file: File, previewSrc: string, metadata: 
 }
 
 function loadVideoMetadata(previewSrc: string) {
-  return new Promise<{ durationSeconds: number; width: number; height: number }>(
-    (resolve, reject) => {
-      const video = document.createElement("video");
-      video.preload = "metadata";
-      video.muted = true;
-      video.playsInline = true;
+  return new Promise<{
+    durationSeconds: number;
+    width: number;
+    height: number;
+  }>((resolve, reject) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.muted = true;
+    video.playsInline = true;
 
-      const cleanup = () => {
-        video.src = "";
-      };
+    const cleanup = () => {
+      video.src = "";
+    };
 
-      video.onloadedmetadata = () => {
-        resolve({
-          durationSeconds: Number.isFinite(video.duration) ? video.duration : 0,
-          width: video.videoWidth,
-          height: video.videoHeight,
-        });
-        cleanup();
-      };
-      video.onerror = () => {
-        reject(new Error("Unable to read video metadata in the browser."));
-        cleanup();
-      };
-      video.src = previewSrc;
-    },
-  );
+    video.onloadedmetadata = () => {
+      resolve({
+        durationSeconds: Number.isFinite(video.duration) ? video.duration : 0,
+        width: video.videoWidth,
+        height: video.videoHeight,
+      });
+      cleanup();
+    };
+    video.onerror = () => {
+      reject(new Error("Unable to read video metadata in the browser."));
+      cleanup();
+    };
+    video.src = previewSrc;
+  });
 }
 
 function loadImageMetadata(previewSrc: string) {
@@ -751,7 +754,8 @@ function loadImageMetadata(previewSrc: string) {
         height: image.naturalHeight,
       });
     };
-    image.onerror = () => reject(new Error("Unable to read image metadata in the browser."));
+    image.onerror = () =>
+      reject(new Error("Unable to read image metadata in the browser."));
     image.src = previewSrc;
   });
 }
@@ -778,13 +782,8 @@ async function loadTauriCore() {
 }
 
 type DesktopMediaOperationBridge = {
-  invoke: <T>(
-    command: string,
-    args?: Record<string, unknown>,
-  ) => Promise<T>;
-  createChannel: (
-    onMessage: (progress: OperationProgress) => void,
-  ) => unknown;
+  invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+  createChannel: (onMessage: (progress: OperationProgress) => void) => unknown;
 };
 
 export async function invokeDesktopMediaOperation<T>(
@@ -802,8 +801,7 @@ export async function invokeDesktopMediaOperation<T>(
           nextCommand: string,
           nextArgs?: Record<string, unknown>,
         ) => invoke<TResult>(nextCommand, nextArgs),
-        createChannel: (onMessage) =>
-          new Channel<OperationProgress>(onMessage),
+        createChannel: (onMessage) => new Channel<OperationProgress>(onMessage),
       };
     })());
   const channel = resolvedBridge.createChannel((progress) => {
@@ -986,19 +984,16 @@ const tauriRuntime: AppRuntime = {
   async buildOptimizerPlan(request, options) {
     const result = await invokeDesktopMediaOperation<
       LegacyMediaResponse<OptimizerPlanResponse>
-    >(
-      "build_optimizer_plan",
-      { request },
-      options,
-    );
+    >("build_optimizer_plan", { request }, options);
     return normalizeLegacyMediaResponse(result);
   },
   async runOptimizerSearch(request, options) {
-    const result = await invokeDesktopMediaOperation<LegacyOptimizerSearchResponse>(
-      "run_optimizer_search",
-      { request },
-      options,
-    );
+    const result =
+      await invokeDesktopMediaOperation<LegacyOptimizerSearchResponse>(
+        "run_optimizer_search",
+        { request },
+        options,
+      );
     return normalizeLegacyOptimizerSearchResponse(
       result,
     ) as OptimizerSearchResponse;
@@ -1006,11 +1001,7 @@ const tauriRuntime: AppRuntime = {
   async convertStaticImageToPng(request, options) {
     const result = await invokeDesktopMediaOperation<
       LegacyMediaResponse<StaticImageConversionResult>
-    >(
-      "convert_static_image_to_png",
-      { request },
-      options,
-    );
+    >("convert_static_image_to_png", { request }, options);
     return normalizeLegacyMediaResponse(result);
   },
   async estimateStaticOutputSize(request, options) {

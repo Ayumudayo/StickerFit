@@ -7,13 +7,13 @@ export type EditorShortcutContext = {
   insideInteractiveSurface: boolean;
 };
 
-export function shouldHandleEditorShortcut(
-  context: EditorShortcutContext,
-) {
-  return !context.defaultPrevented &&
+export function shouldHandleEditorShortcut(context: EditorShortcutContext) {
+  return (
+    !context.defaultPrevented &&
     !context.isComposing &&
     !context.hasModifier &&
     !context.dialogOpen &&
     context.insideEditorSurface &&
-    !context.insideInteractiveSurface;
+    !context.insideInteractiveSurface
+  );
 }

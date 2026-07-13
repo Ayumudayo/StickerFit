@@ -45,7 +45,9 @@ describe("workflow fingerprints", () => {
       buildWorkflowFingerprints(
         input({
           cropRegion: { ...FULL_CROP_REGION },
-          timelineFrames: input().timelineFrames?.map((frame) => ({ ...frame })),
+          timelineFrames: input().timelineFrames?.map((frame) => ({
+            ...frame,
+          })),
         }),
       ),
     );
@@ -82,7 +84,9 @@ describe("workflow fingerprints", () => {
 
   it("changes only export when output directory changes", () => {
     const before = buildWorkflowFingerprints(input());
-    const after = buildWorkflowFingerprints(input({ outputDirectory: "D:/other" }));
+    const after = buildWorkflowFingerprints(
+      input({ outputDirectory: "D:/other" }),
+    );
 
     expect(after.encoding).toBe(before.encoding);
     expect(after.planner).toBe(before.planner);
@@ -100,9 +104,15 @@ describe("workflow fingerprints", () => {
 
   it("keeps a null source revision stable and changes encoding when it appears or changes", () => {
     const missing = buildWorkflowFingerprints(input({ sourceRevision: null }));
-    const missingAgain = buildWorkflowFingerprints(input({ sourceRevision: null }));
-    const first = buildWorkflowFingerprints(input({ sourceRevision: "revision-1" }));
-    const second = buildWorkflowFingerprints(input({ sourceRevision: "revision-2" }));
+    const missingAgain = buildWorkflowFingerprints(
+      input({ sourceRevision: null }),
+    );
+    const first = buildWorkflowFingerprints(
+      input({ sourceRevision: "revision-1" }),
+    );
+    const second = buildWorkflowFingerprints(
+      input({ sourceRevision: "revision-2" }),
+    );
 
     expect(missingAgain.encoding).toBe(missing.encoding);
     expect(first.encoding).not.toBe(missing.encoding);
@@ -165,7 +175,9 @@ describe("currentWorkflowState", () => {
   });
 
   it("gates idle, loading, ready, error, and cancelled states by fingerprint", () => {
-    const states: Array<VersionedWorkflowState<{ id: string }, { step: number }>> = [
+    const states: Array<
+      VersionedWorkflowState<{ id: string }, { step: number }>
+    > = [
       { status: "idle", revision: 1, fingerprint: "current" },
       {
         status: "loading",

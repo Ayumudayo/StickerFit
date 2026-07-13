@@ -201,7 +201,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     customFolderLabel: "Custom folder",
     startHere: "Start here",
     pickSourceTitle: "Choose an input file",
-    pickSourceBody: "StickerFit checks the file first, then optimizes it to fit Discord sticker limits.",
+    pickSourceBody:
+      "StickerFit checks the file first, then optimizes it to fit Discord sticker limits.",
     currentSettings: "Current settings",
     toolStatus: "Tool status",
     saveLocation: "Save location",
@@ -211,9 +212,11 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     latestOutput: "Latest output",
     openOutputFolder: "Open output folder",
     previewSelection: "Preview and selection",
-    previewSelectionBody: "Drag on the source preview to choose the crop area. Drag inside the box to move it, or drag the corners to resize it.",
+    previewSelectionBody:
+      "Drag on the source preview to choose the crop area. Drag inside the box to move it, or drag the corners to resize it.",
     fullFrameSelection: "Full frame",
-    customSelection: (widthPercent, heightPercent) => `${widthPercent}% x ${heightPercent}%`,
+    customSelection: (widthPercent, heightPercent) =>
+      `${widthPercent}% x ${heightPercent}%`,
     resetSelection: "Reset selection",
     previewUnavailable: "Preview is unavailable for this file.",
     previewHint: "",
@@ -250,7 +253,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     outputSizeEstimate: "Estimated output size",
     recommendedCandidateEstimate: "Recommended candidate estimate",
     estimateDesktopOnly: "Available to calculate in the desktop app.",
-    estimateWaitingForPlan: "Waiting for preview candidates.",
+    estimateWaitingForPlan:
+      "Generate preview candidates to calculate the estimated output size.",
     estimateCalculating: "Estimating output size...",
     estimateRetry: "Retry estimate",
     estimateExactLabel: "Exact",
@@ -272,7 +276,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     exactProbeNoOutput: "This check does not create an output file.",
     estimateCancelled: "Size estimate cancelled.",
     operationCancelled: "Operation cancelled.",
-    estimateSettingsHint: "Size estimates update automatically after settings settle.",
+    estimateSettingsHint:
+      "After changing settings, regenerate preview candidates. The estimate then refreshes automatically.",
     actualOutputSize: "Actual size",
     elapsedTime: "Elapsed time",
     representativeError: "Representative error",
@@ -283,12 +288,15 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     estimateProgressEncoding: "Measuring compressed size...",
     estimateProgressFinalizing: "Finalizing the size result...",
     nextStep: "Next step",
-    nextStepBody: "Preview the candidate ladder first, then run the optimizer once the crop and frame selection look right.",
+    nextStepBody:
+      "Preview the candidate ladder first, then run the optimizer once the crop and frame selection look right.",
     guidance: "Guidance",
     optimizerHint: "Discord allows at most 5 seconds and 512 KiB.",
     staticImageSourceTitle: "Static image source",
-    staticImageSourceBody: "This still image can be converted to PNG directly with the current crop applied.",
-    pngAlreadySourceBody: "This source is already a PNG, so conversion is not required.",
+    staticImageSourceBody:
+      "This still image can be converted to PNG directly with the current crop applied.",
+    pngAlreadySourceBody:
+      "This source is already a PNG, so conversion is not required.",
     convertToPng: "Convert to PNG",
     convertingToPng: "Converting...",
     pngConversion: "PNG conversion",
@@ -323,15 +331,18 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     advancedDetails: "Advanced details",
     cspViolationCount: (count) => `CSP violations: ${count}`,
     topPreviewCandidates: "Top preview candidates",
-    previewBudgetNote: (budget, shown) => `Showing only the top ${shown} preview candidates out of ${budget} candidates.`,
+    previewBudgetNote: (budget, shown) =>
+      `Showing only the top ${shown} preview candidates out of ${budget} candidates.`,
     noPlanYet: "Run preview candidates to show the ranked candidates here.",
     attemptLog: "Attempt log",
-    noAttemptsYet: "Optimizer attempts will appear here after you run the search.",
+    noAttemptsYet:
+      "Optimizer attempts will appear here after you run the search.",
     warnings: "Warnings",
     searchSummary: "Result",
     bestOutput: "Limit status",
     sourceMatch: "Source match",
-    sourceMatchHint: "Higher values mean the candidate stays closer to the source settings.",
+    sourceMatchHint:
+      "Higher values mean the candidate stays closer to the source settings.",
     selectionBasis: "Selection basis",
     recommendedCandidate: "Recommended",
     selectedResult: "Selected result",
@@ -344,11 +355,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     inspectionFailed: "Inspection failed",
     mediaFoundationFallbackWarning:
       "Windows Media Foundation could not inspect this file, so StickerFit used the bundled FFmpeg decoder.",
-    statusBestRanked: "Selected the best-ranked result within the Discord limit.",
+    statusBestRanked:
+      "Selected the best-ranked result within the Discord limit.",
     statusExhausted: "Checked the full candidate budget.",
     statusNoOutput: "No successful outputs were produced.",
     statusPlanInvalid: "The optimizer plan was invalid.",
-    statusInvokeFailed: "The optimizer command failed before search could finish.",
+    statusInvokeFailed:
+      "The optimizer command failed before search could finish.",
     statusCancelled: "Optimization cancelled.",
     statusFailed: "Optimization did not complete.",
     skipped: "Skipped",
@@ -378,7 +391,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     customFolderLabel: "사용자 폴더",
     startHere: "시작하기",
     pickSourceTitle: "입력 파일을 선택하세요",
-    pickSourceBody: "StickerFit은 먼저 파일을 확인한 다음, 디스코드 스티커 제한에 맞게 최적화를 진행합니다.",
+    pickSourceBody:
+      "StickerFit은 먼저 파일을 확인한 다음, 디스코드 스티커 제한에 맞게 최적화를 진행합니다.",
     currentSettings: "현재 설정",
     toolStatus: "도구 상태",
     saveLocation: "저장 위치",
@@ -388,9 +402,11 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     latestOutput: "최근 출력",
     openOutputFolder: "출력 폴더 열기",
     previewSelection: "미리보기와 선택 영역",
-    previewSelectionBody: "원본 위에서 드래그해 영역을 선택하세요. 박스 안쪽을 드래그하면 이동하고, 모서리를 드래그하면 크기를 조절합니다.",
+    previewSelectionBody:
+      "원본 위에서 드래그해 영역을 선택하세요. 박스 안쪽을 드래그하면 이동하고, 모서리를 드래그하면 크기를 조절합니다.",
     fullFrameSelection: "전체 프레임",
-    customSelection: (widthPercent, heightPercent) => `${widthPercent}% x ${heightPercent}%`,
+    customSelection: (widthPercent, heightPercent) =>
+      `${widthPercent}% x ${heightPercent}%`,
     resetSelection: "선택 초기화",
     previewUnavailable: "이 파일은 미리보기를 표시할 수 없습니다.",
     previewHint: "",
@@ -427,7 +443,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     outputSizeEstimate: "예상 용량",
     recommendedCandidateEstimate: "추천 후보 예상",
     estimateDesktopOnly: "데스크톱 앱에서 계산 가능",
-    estimateWaitingForPlan: "미리보기 후보를 기다리는 중입니다.",
+    estimateWaitingForPlan:
+      "예상 용량을 계산하려면 미리보기 후보를 생성하세요.",
     estimateCalculating: "예상 용량 계산 중...",
     estimateRetry: "예상 용량 다시 계산",
     estimateExactLabel: "정확",
@@ -449,7 +466,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     exactProbeNoOutput: "이 확인 작업은 출력 파일을 만들지 않습니다.",
     estimateCancelled: "용량 계산을 취소했습니다.",
     operationCancelled: "작업을 취소했습니다.",
-    estimateSettingsHint: "설정 변경이 멈추면 예상 용량이 자동으로 갱신됩니다.",
+    estimateSettingsHint:
+      "설정을 변경한 뒤 미리보기 후보를 다시 생성하면 예상 용량이 자동으로 갱신됩니다.",
     actualOutputSize: "실제 용량",
     elapsedTime: "소요 시간",
     representativeError: "대표 오류",
@@ -460,11 +478,13 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     estimateProgressEncoding: "실제 압축 용량을 측정하는 중...",
     estimateProgressFinalizing: "용량 계산 결과를 마무리하는 중...",
     nextStep: "다음 단계",
-    nextStepBody: "먼저 후보 미리보기를 실행해 정렬된 래더를 확인한 다음, 크롭과 프레임 선택이 괜찮으면 최적화를 실행하세요.",
+    nextStepBody:
+      "먼저 후보 미리보기를 실행해 정렬된 래더를 확인한 다음, 크롭과 프레임 선택이 괜찮으면 최적화를 실행하세요.",
     guidance: "안내",
     optimizerHint: "디스코드는 최대 5초, 512 KiB까지 허용합니다.",
     staticImageSourceTitle: "정적 이미지 소스",
-    staticImageSourceBody: "현재 크롭을 적용한 뒤 이 정적 이미지를 바로 PNG로 변환할 수 있습니다.",
+    staticImageSourceBody:
+      "현재 크롭을 적용한 뒤 이 정적 이미지를 바로 PNG로 변환할 수 있습니다.",
     pngAlreadySourceBody: "이 소스는 이미 PNG이므로 변환이 필요하지 않습니다.",
     convertToPng: "PNG로 변환",
     convertingToPng: "변환 중...",
@@ -500,7 +520,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     advancedDetails: "고급 정보",
     cspViolationCount: (count) => `CSP 위반: ${count}건`,
     topPreviewCandidates: "상위 미리보기 후보",
-    previewBudgetNote: (budget, shown) => `${budget}개 후보 중 상위 ${shown}개 미리보기 후보만 보여줍니다.`,
+    previewBudgetNote: (budget, shown) =>
+      `${budget}개 후보 중 상위 ${shown}개 미리보기 후보만 보여줍니다.`,
     noPlanYet: "후보 미리보기를 실행하면 이곳에 정렬된 후보들이 표시됩니다.",
     attemptLog: "시도 기록",
     noAttemptsYet: "최적화를 실행하면 이곳에 인코드 시도 결과가 표시됩니다.",
@@ -521,7 +542,8 @@ export const MESSAGES: Record<Locale, MessagesForLocale> = {
     inspectionFailed: "입력 검사 실패",
     mediaFoundationFallbackWarning:
       "Windows Media Foundation에서 이 파일을 검사하지 못해 StickerFit이 번들 FFmpeg 디코더를 사용했습니다.",
-    statusBestRanked: "디스코드 제한을 충족한 결과 중 순위가 가장 높은 결과를 선택했습니다.",
+    statusBestRanked:
+      "디스코드 제한을 충족한 결과 중 순위가 가장 높은 결과를 선택했습니다.",
     statusExhausted: "후보 탐색 예산을 모두 확인했습니다.",
     statusNoOutput: "성공적으로 만들어진 출력이 없습니다.",
     statusPlanInvalid: "최적화 계획이 올바르지 않습니다.",
@@ -573,13 +595,17 @@ export const MEDIA_OPERATION_MESSAGES: Record<
       "operation-conflict": "Another media operation is already in progress.",
       "invalid-request": "The media request is not valid.",
       "source-changed": "The source changed while the operation was running.",
-      "media-input-too-large": "The source file is too large to process safely.",
-      "media-dimensions-too-large": "The source dimensions are too large to process safely.",
-      "media-frame-limit": "The source contains too many frames to process safely.",
+      "media-input-too-large":
+        "The source file is too large to process safely.",
+      "media-dimensions-too-large":
+        "The source dimensions are too large to process safely.",
+      "media-frame-limit":
+        "The source contains too many frames to process safely.",
       "decoded-byte-limit": "The decoded media would use too much memory.",
       "png-chunk-limit": "A PNG chunk is too large to process safely.",
       "malformed-media": "The source media could not be read.",
-      "malformed-process-output": "The media tool returned an unreadable result.",
+      "malformed-process-output":
+        "The media tool returned an unreadable result.",
       "tool-missing": "A required media tool is unavailable.",
       "process-failed": "The media tool failed while processing the request.",
       "output-conflict": "The output path conflicts with an existing file.",
@@ -587,18 +613,24 @@ export const MEDIA_OPERATION_MESSAGES: Record<
     },
     reasonCodes: {
       "no-frames-selected": "Select at least one frame before exporting.",
-      "invalid-frame-selection": "The selected frames no longer match the current timeline.",
+      "invalid-frame-selection":
+        "The selected frames no longer match the current timeline.",
       "invalid-frame-duration": "One or more frame durations are invalid.",
-      "duration-too-long": "The selected duration exceeds Discord's 5-second limit.",
+      "duration-too-long":
+        "The selected duration exceeds Discord's 5-second limit.",
       "invalid-crop": "The crop selection is invalid for the current source.",
       "invalid-output-directory": "Choose a valid output folder.",
       "unsupported-source-format": "This source format is not supported.",
-      "unsupported-frame-preview": "A preview is not available for this source format.",
-      "frame-preview-decode-failed": "The selected frame could not be decoded for preview.",
-      "frame-preview-encode-failed": "The selected frame preview could not be encoded.",
+      "unsupported-frame-preview":
+        "A preview is not available for this source format.",
+      "frame-preview-decode-failed":
+        "The selected frame could not be decoded for preview.",
+      "frame-preview-encode-failed":
+        "The selected frame preview could not be encoded.",
       "decode-failed": "The source media could not be decoded.",
       "encode-failed": "The output could not be encoded.",
-      "missing-output": "The media tool completed without creating an output file.",
+      "missing-output":
+        "The media tool completed without creating an output file.",
       "plan-invalid": "The optimizer plan is not valid for the current input.",
       "invoke-failed": "The optimizer command could not be started.",
     },
@@ -610,13 +642,18 @@ export const MEDIA_OPERATION_MESSAGES: Record<
       "operation-conflict": "다른 미디어 작업이 이미 진행 중입니다.",
       "invalid-request": "미디어 요청이 올바르지 않습니다.",
       "source-changed": "작업 중 원본이 변경되었습니다.",
-      "media-input-too-large": "원본 파일이 너무 커서 안전하게 처리할 수 없습니다.",
-      "media-dimensions-too-large": "원본 해상도가 너무 커서 안전하게 처리할 수 없습니다.",
-      "media-frame-limit": "원본 프레임 수가 너무 많아 안전하게 처리할 수 없습니다.",
+      "media-input-too-large":
+        "원본 파일이 너무 커서 안전하게 처리할 수 없습니다.",
+      "media-dimensions-too-large":
+        "원본 해상도가 너무 커서 안전하게 처리할 수 없습니다.",
+      "media-frame-limit":
+        "원본 프레임 수가 너무 많아 안전하게 처리할 수 없습니다.",
       "decoded-byte-limit": "디코딩한 미디어가 너무 많은 메모리를 사용합니다.",
-      "png-chunk-limit": "PNG 청크 하나가 너무 커서 안전하게 처리할 수 없습니다.",
+      "png-chunk-limit":
+        "PNG 청크 하나가 너무 커서 안전하게 처리할 수 없습니다.",
       "malformed-media": "원본 미디어를 읽을 수 없습니다.",
-      "malformed-process-output": "미디어 도구가 읽을 수 없는 결과를 반환했습니다.",
+      "malformed-process-output":
+        "미디어 도구가 읽을 수 없는 결과를 반환했습니다.",
       "tool-missing": "필수 미디어 도구를 사용할 수 없습니다.",
       "process-failed": "요청을 처리하는 동안 미디어 도구가 실패했습니다.",
       "output-conflict": "출력 경로가 기존 파일과 충돌합니다.",
@@ -624,15 +661,19 @@ export const MEDIA_OPERATION_MESSAGES: Record<
     },
     reasonCodes: {
       "no-frames-selected": "내보내기 전에 최소 한 개의 프레임을 선택하세요.",
-      "invalid-frame-selection": "선택한 프레임이 현재 타임라인과 맞지 않습니다.",
+      "invalid-frame-selection":
+        "선택한 프레임이 현재 타임라인과 맞지 않습니다.",
       "invalid-frame-duration": "하나 이상의 프레임 길이가 올바르지 않습니다.",
       "duration-too-long": "선택한 길이가 디스코드의 5초 제한을 초과합니다.",
       "invalid-crop": "현재 원본에 적용할 수 없는 크롭 영역입니다.",
       "invalid-output-directory": "올바른 출력 폴더를 선택하세요.",
       "unsupported-source-format": "지원하지 않는 원본 형식입니다.",
-      "unsupported-frame-preview": "이 원본 형식은 프레임 미리보기를 지원하지 않습니다.",
-      "frame-preview-decode-failed": "선택한 프레임을 미리보기용으로 디코딩하지 못했습니다.",
-      "frame-preview-encode-failed": "선택한 프레임 미리보기를 인코딩하지 못했습니다.",
+      "unsupported-frame-preview":
+        "이 원본 형식은 프레임 미리보기를 지원하지 않습니다.",
+      "frame-preview-decode-failed":
+        "선택한 프레임을 미리보기용으로 디코딩하지 못했습니다.",
+      "frame-preview-encode-failed":
+        "선택한 프레임 미리보기를 인코딩하지 못했습니다.",
       "decode-failed": "원본 미디어를 디코딩하지 못했습니다.",
       "encode-failed": "출력을 인코딩하지 못했습니다.",
       "missing-output": "미디어 도구가 출력 파일을 만들지 않았습니다.",
@@ -657,12 +698,12 @@ export function mediaOperationMessage(
 }
 
 export function detectLocale(): Locale {
-  if (typeof navigator !== "undefined" && navigator.language.toLowerCase().startsWith("ko")) {
+  if (
+    typeof navigator !== "undefined" &&
+    navigator.language.toLowerCase().startsWith("ko")
+  ) {
     return "ko";
   }
 
   return "en";
 }
-
-
-

@@ -2,7 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { Locale } from "../../locales/messages";
 import type { AppRuntime } from "../../platform/runtime";
-import { releaseInspectionPreview, type RuntimeInputSource } from "../../platform/runtime";
+import {
+  releaseInspectionPreview,
+  type RuntimeInputSource,
+} from "../../platform/runtime";
 import { createMediaOperationId } from "../../platform/mediaOperationId";
 import type { MediaInspection } from "../../types/workflow";
 import {
@@ -43,14 +46,14 @@ export function useMediaInputSelector({
   const [outputDirectory, setOutputDirectory] = useState<string | null>(null);
   const inspectionAbortControllerRef = useRef<AbortController | null>(null);
 
-  const requestLifecycleRef = useRef<RequestLifecycleCoordinator<MediaInspection> | null>(
-    null,
-  );
+  const requestLifecycleRef =
+    useRef<RequestLifecycleCoordinator<MediaInspection> | null>(null);
   if (requestLifecycleRef.current === null) {
-    requestLifecycleRef.current = createRequestLifecycleCoordinator<MediaInspection>({
-      publishCurrent: (nextInspection) => setInspection(nextInspection),
-      disposeValue: releaseInspectionPreview,
-    });
+    requestLifecycleRef.current =
+      createRequestLifecycleCoordinator<MediaInspection>({
+        publishCurrent: (nextInspection) => setInspection(nextInspection),
+        disposeValue: releaseInspectionPreview,
+      });
   }
   const requestLifecycle = requestLifecycleRef.current;
 

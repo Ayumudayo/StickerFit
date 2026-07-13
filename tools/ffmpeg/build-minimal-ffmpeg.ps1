@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [string]$WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path,
+  [string]$WorkspaceRoot,
   [string]$ManifestPath = "tools/ffmpeg/ffmpeg-version.json",
   [string]$DownloadCacheRoot = (Join-Path $env:TEMP "stickerfit-ffmpeg-cache"),
   [switch]$VerifySourceOnly,
@@ -20,6 +20,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not $PSBoundParameters.ContainsKey("WorkspaceRoot")) {
+  $WorkspaceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+}
 
 $modulePath = Join-Path $PSScriptRoot "FfmpegSourceVerification.psm1"
 Import-Module -Name $modulePath -Force

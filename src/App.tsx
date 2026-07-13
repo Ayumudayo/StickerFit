@@ -51,7 +51,10 @@ import {
   MESSAGES,
   type Locale,
 } from "./locales/messages";
-import { formatTimelineTime, microsecondsToSeconds } from "./utils/timelineFrames";
+import {
+  formatTimelineTime,
+  microsecondsToSeconds,
+} from "./utils/timelineFrames";
 import { shouldHandleEditorShortcut } from "./utils/keyboardShortcuts";
 import {
   applyFramePreviewBatchResult,
@@ -106,23 +109,30 @@ function filterPathLabel(value: string | null, fallback: string) {
 }
 
 function isSpaceShortcutKey(event: KeyboardEvent) {
-  return event.key === " " || event.key === "Spacebar" || event.code === "Space";
+  return (
+    event.key === " " || event.key === "Spacebar" || event.code === "Space"
+  );
 }
 
 export default function App() {
   const [locale, setLocale] = useState<Locale>(detectLocale());
   const [previewDuration, setPreviewDuration] = useState<number | null>(null);
-  const [previewZoomMode, setPreviewZoomMode] = useState<PreviewZoomMode>("fit");
+  const [previewZoomMode, setPreviewZoomMode] =
+    useState<PreviewZoomMode>("fit");
   const [manualPreviewZoomScale, setManualPreviewZoomScale] = useState(1);
   const [resolvedPreviewZoomScale, setResolvedPreviewZoomScale] = useState(1);
-  const [resolvedFitPreviewZoomScale, setResolvedFitPreviewZoomScale] = useState(1);
+  const [resolvedFitPreviewZoomScale, setResolvedFitPreviewZoomScale] =
+    useState(1);
   const [editorSessionKey, setEditorSessionKey] = useState(0);
-  const [editorWorkspaceMinHeight, setEditorWorkspaceMinHeight] = useState<number | null>(null);
-  const [activeDockPanel, setActiveDockPanel] = useState<EditorDockPanelMode | null>(null);
-  const [framePreviewEntries, setFramePreviewEntries] = useState<PreviewEntryMap>(
-    () => new Map(),
-  );
-  const [framePreviewEntriesFingerprint, setFramePreviewEntriesFingerprint] = useState("");
+  const [editorWorkspaceMinHeight, setEditorWorkspaceMinHeight] = useState<
+    number | null
+  >(null);
+  const [activeDockPanel, setActiveDockPanel] =
+    useState<EditorDockPanelMode | null>(null);
+  const [framePreviewEntries, setFramePreviewEntries] =
+    useState<PreviewEntryMap>(() => new Map());
+  const [framePreviewEntriesFingerprint, setFramePreviewEntriesFingerprint] =
+    useState("");
   const [framePreviewVisibleRange, setFramePreviewVisibleRange] = useState({
     start: 0,
     end: 24,
@@ -132,18 +142,20 @@ export default function App() {
   const shellRef = useRef<HTMLElement | null>(null);
   const editorWorkspaceRef = useRef<HTMLElement | null>(null);
   const framePreviewEntriesRef = useRef<PreviewEntryMap>(new Map());
-  const framePreviewSchedulerRef = useRef<
-    ReturnType<
-      typeof createPreviewBatchScheduler<PreviewBatchDescriptor, FramePreviewRunResult>
-    > | null
-  >(null);
+  const framePreviewSchedulerRef = useRef<ReturnType<
+    typeof createPreviewBatchScheduler<
+      PreviewBatchDescriptor,
+      FramePreviewRunResult
+    >
+  > | null>(null);
   const framePreviewFingerprintRef = useRef("");
   const framePreviewRequestIdRef = useRef(0);
   const workflowFingerprintRef = useRef<WorkflowFingerprints>(
     EMPTY_WORKFLOW_FINGERPRINTS,
   );
-  const invalidatedWorkflowFingerprintRef =
-    useRef<WorkflowFingerprints | null>(null);
+  const invalidatedWorkflowFingerprintRef = useRef<WorkflowFingerprints | null>(
+    null,
+  );
   const getCurrentWorkflowFingerprints = useCallback(
     () => workflowFingerprintRef.current,
     [],
@@ -156,13 +168,14 @@ export default function App() {
     },
     [],
   );
+  const handleCommitEditorSession = useCallback(() => {
+    setEditorSessionKey((current) => current + 1);
+  }, []);
 
   const mediaWorkflow = useMediaWorkflowController({
     locale,
     initialLocale: initialLocaleRef.current,
-    onCommitEditorSession: () => {
-      setEditorSessionKey((current) => current + 1);
-    },
+    onCommitEditorSession: handleCommitEditorSession,
     getCurrentWorkflowFingerprints,
   });
   const {
@@ -383,7 +396,8 @@ export default function App() {
     locale,
   });
   const currentEstimateState =
-    outputSizeEstimate.state.estimate.fingerprint === workflowFingerprints.encoding
+    outputSizeEstimate.state.estimate.fingerprint ===
+    workflowFingerprints.encoding
       ? outputSizeEstimate.state.estimate
       : {
           status: "idle" as const,
@@ -400,13 +414,15 @@ export default function App() {
         };
   const recommendedCandidateId =
     fullPlan?.candidates.find((candidate) => candidate.rank === 1)?.id ??
-    outputSizeEstimate.estimates.find((estimate) => estimate.candidateId !== null)
-      ?.candidateId ??
+    outputSizeEstimate.estimates.find(
+      (estimate) => estimate.candidateId !== null,
+    )?.candidateId ??
     null;
   const primarySizeEstimate = inspection?.isStaticImage
-    ? outputSizeEstimate.estimates[0] ?? null
+    ? (outputSizeEstimate.estimates[0] ?? null)
     : recommendedCandidateId
-      ? outputSizeEstimate.estimateByCandidateId.get(recommendedCandidateId) ?? null
+      ? (outputSizeEstimate.estimateByCandidateId.get(recommendedCandidateId) ??
+        null)
       : null;
   const searchResult =
     currentSearchState?.status === "ready" ? currentSearchState.value : null;
@@ -424,19 +440,21 @@ export default function App() {
     primaryOperationState?.status === "loading"
       ? primaryOperationState.progress
       : null;
-  const primaryOperationCancelled = primaryOperationState?.status === "cancelled";
+  const primaryOperationCancelled =
+    primaryOperationState?.status === "cancelled";
   const latestWorkflowState = latestActiveWorkflowState([
     currentPlanState,
     currentSearchState,
     currentConversionState,
   ]);
-  const plannerError = latestWorkflowState?.status === "error"
-    ? mediaOperationMessage(
-        locale,
-        latestWorkflowState.code,
-        latestWorkflowState.reasonCode,
-      )
-    : null;
+  const plannerError =
+    latestWorkflowState?.status === "error"
+      ? mediaOperationMessage(
+          locale,
+          latestWorkflowState.code,
+          latestWorkflowState.reasonCode,
+        )
+      : null;
 
   useEffect(() => {
     const previous = invalidatedWorkflowFingerprintRef.current;
@@ -486,8 +504,14 @@ export default function App() {
     handleTimelinePointerMove,
     handleTimelinePointerEnd,
   } = playback;
-  const currentTimelineTimeUs = Math.max(0, Math.round(currentTime * 1_000_000));
-  const totalTimelineDurationUs = Math.max(0, Math.round(totalDuration * 1_000_000));
+  const currentTimelineTimeUs = Math.max(
+    0,
+    Math.round(currentTime * 1_000_000),
+  );
+  const totalTimelineDurationUs = Math.max(
+    0,
+    Math.round(totalDuration * 1_000_000),
+  );
   const currentPreviewFrame = useMemo(
     () =>
       timelineFrameViews.find(
@@ -495,13 +519,15 @@ export default function App() {
       ) ?? null,
     [currentFrameInstanceId, timelineFrameViews],
   );
-  const activeFrameInstanceId = selectedInstanceIds[selectedInstanceIds.length - 1] ?? null;
+  const activeFrameInstanceId =
+    selectedInstanceIds[selectedInstanceIds.length - 1] ?? null;
 
   const isWebPreviewMode = runtime.kind === "web";
   const isEditorLayoutActive = inspection?.ok === true;
   const supportsDesktopProcessing = runtime.capabilities.backendProcessing;
   const supportsOutputDirectoryActions =
-    runtime.capabilities.outputDirectorySelection && runtime.capabilities.openOutputFolder;
+    runtime.capabilities.outputDirectorySelection &&
+    runtime.capabilities.openOutputFolder;
   const healthLabel = isWebPreviewMode
     ? copy.webPreviewMode
     : toolReport?.ready
@@ -513,7 +539,9 @@ export default function App() {
     !inspection.isStaticImage &&
     Boolean(inspection.backendInputPath) &&
     Boolean(inspection.sourceRevision) &&
-    /\.(gif|apng|png|mp4|m4v|mov|webm)$/i.test(inspection.backendInputPath ?? "");
+    /\.(gif|apng|png|mp4|m4v|mov|webm)$/i.test(
+      inspection.backendInputPath ?? "",
+    );
   const requiresBackendFramePreview =
     supportsRailFramePreviews &&
     previewKind === "image" &&
@@ -547,11 +575,17 @@ export default function App() {
       timelineFrameViews
         .slice(framePreviewVisibleRange.start, framePreviewVisibleRange.end)
         .map((frame) => frame.sourceFrameId),
-    [framePreviewVisibleRange.end, framePreviewVisibleRange.start, timelineFrameViews],
+    [
+      framePreviewVisibleRange.end,
+      framePreviewVisibleRange.start,
+      timelineFrameViews,
+    ],
   );
   const lookaheadFramePreviewIds = useMemo(() => {
     const currentIndex = currentFrameInstanceId
-      ? timelineFrameViews.findIndex((frame) => frame.instanceId === currentFrameInstanceId)
+      ? timelineFrameViews.findIndex(
+          (frame) => frame.instanceId === currentFrameInstanceId,
+        )
       : -1;
     return currentIndex < 0
       ? []
@@ -566,16 +600,27 @@ export default function App() {
         lookaheadSourceFrameIds: lookaheadFramePreviewIds,
         visibleSourceFrameIds: visibleFramePreviewIds,
       }),
-    [currentPreviewFrame?.sourceFrameId, lookaheadFramePreviewIds, visibleFramePreviewIds],
+    [
+      currentPreviewFrame?.sourceFrameId,
+      lookaheadFramePreviewIds,
+      visibleFramePreviewIds,
+    ],
   );
-  const handleFramePreviewVisibleRange = useCallback((start: number, end: number) => {
-    setFramePreviewVisibleRange((current) =>
-      current.start === start && current.end === end ? current : { start, end },
-    );
-  }, []);
+  const handleFramePreviewVisibleRange = useCallback(
+    (start: number, end: number) => {
+      setFramePreviewVisibleRange((current) =>
+        current.start === start && current.end === end
+          ? current
+          : { start, end },
+      );
+    },
+    [],
+  );
   const handleRetryFramePreview = useCallback(
     (sourceFrameId: number) => {
-      updateFramePreviewEntries((current) => retryFramePreviewEntry(current, sourceFrameId));
+      updateFramePreviewEntries((current) =>
+        retryFramePreviewEntry(current, sourceFrameId),
+      );
     },
     [updateFramePreviewEntries],
   );
@@ -590,14 +635,20 @@ export default function App() {
 
     if (!supportsRailFramePreviews || !framePreviewFingerprint) return;
 
-    const scheduler = createPreviewBatchScheduler<PreviewBatchDescriptor, FramePreviewRunResult>({
+    const scheduler = createPreviewBatchScheduler<
+      PreviewBatchDescriptor,
+      FramePreviewRunResult
+    >({
       prepareBatch: (value) => {
         const prioritized = prioritizeFramePreviewIds({
           currentSourceFrameId: value.currentSourceFrameId,
           lookaheadSourceFrameIds: value.sourceFrameIds,
           visibleSourceFrameIds: [],
         });
-        const available = filterFramePreviewDemand(prioritized, framePreviewEntriesRef.current);
+        const available = filterFramePreviewDemand(
+          prioritized,
+          framePreviewEntriesRef.current,
+        );
         const sourceFrameIds = chunkFramePreviewIds(available)[0] ?? [];
         return sourceFrameIds.length > 0 ? { ...value, sourceFrameIds } : null;
       },
@@ -613,7 +664,11 @@ export default function App() {
         const controller = new AbortController();
         const operationId = createMediaOperationId();
         updateFramePreviewEntries((current) =>
-          markFramePreviewBatchLoading(current, value.sourceFrameIds, operationId),
+          markFramePreviewBatchLoading(
+            current,
+            value.sourceFrameIds,
+            operationId,
+          ),
         );
 
         if (!request) return Promise.resolve({ requestId, result: null });
@@ -640,7 +695,9 @@ export default function App() {
             controller.abort();
             finish(null);
           }
-          schedulerSignal.addEventListener("abort", abortRequest, { once: true });
+          schedulerSignal.addEventListener("abort", abortRequest, {
+            once: true,
+          });
           if (schedulerSignal.aborted) abortRequest();
         });
       },
@@ -651,9 +708,10 @@ export default function App() {
         ) {
           return;
         }
-        const fallbackMessage = locale === "ko"
-          ? "프레임 미리보기를 불러오지 못했습니다."
-          : "Unable to load the frame preview.";
+        const fallbackMessage =
+          locale === "ko"
+            ? "프레임 미리보기를 불러오지 못했습니다."
+            : "Unable to load the frame preview.";
         updateFramePreviewEntries((current) =>
           applyFramePreviewBatchResult(
             current,
@@ -685,7 +743,12 @@ export default function App() {
 
   useEffect(() => {
     const scheduler = framePreviewSchedulerRef.current;
-    if (!scheduler || !framePreviewFingerprint || desiredFramePreviewIds.length === 0) return;
+    if (
+      !scheduler ||
+      !framePreviewFingerprint ||
+      desiredFramePreviewIds.length === 0
+    )
+      return;
     const next: PreviewBatchDescriptor = {
       fingerprint: framePreviewFingerprint,
       currentSourceFrameId: currentPreviewFrame?.sourceFrameId ?? null,
@@ -710,7 +773,9 @@ export default function App() {
     ) {
       return null;
     }
-    const entry = currentFramePreviewEntries.get(currentPreviewFrame.sourceFrameId);
+    const entry = currentFramePreviewEntries.get(
+      currentPreviewFrame.sourceFrameId,
+    );
     return entry?.status === "ready" ? entry.dataUrl : null;
   }, [
     backendInputPath,
@@ -770,7 +835,8 @@ export default function App() {
       }
 
       const selectedAnchorInstanceId =
-        selectedInstanceIds[selectedInstanceIds.length - 1] ?? currentFrameInstanceId;
+        selectedInstanceIds[selectedInstanceIds.length - 1] ??
+        currentFrameInstanceId;
       const didMoveSelection = selectAdjacentFrame(
         event.key === "ArrowDown" ? 1 : -1,
         selectedAnchorInstanceId,
@@ -783,7 +849,11 @@ export default function App() {
 
     window.addEventListener("keydown", handleGlobalKeyboardShortcuts, true);
     return () => {
-      window.removeEventListener("keydown", handleGlobalKeyboardShortcuts, true);
+      window.removeEventListener(
+        "keydown",
+        handleGlobalKeyboardShortcuts,
+        true,
+      );
     };
   }, [
     activeDockPanel,
@@ -852,7 +922,8 @@ export default function App() {
       }
 
       const shellStyles = window.getComputedStyle(shell);
-      const shellBottomPadding = Number.parseFloat(shellStyles.paddingBottom) || 0;
+      const shellBottomPadding =
+        Number.parseFloat(shellStyles.paddingBottom) || 0;
       const workspaceRect = workspace.getBoundingClientRect();
       const nextMinHeight = Math.max(
         0,
@@ -890,13 +961,19 @@ export default function App() {
     setCropRegion(resetCropRegion);
   }
 
-  function handleCropAspectRatioPresetChange(nextPreset: CropAspectRatioPreset) {
+  function handleCropAspectRatioPresetChange(
+    nextPreset: CropAspectRatioPreset,
+  ) {
     setCropAspectRatioPreset(nextPreset);
 
     const nextAspectRatio = cropAspectRatioValue(nextPreset);
     const sourceWidth = inspection?.width ?? null;
     const sourceHeight = inspection?.height ?? null;
-    if (nextAspectRatio === null || sourceWidth === null || sourceHeight === null) {
+    if (
+      nextAspectRatio === null ||
+      sourceWidth === null ||
+      sourceHeight === null
+    ) {
       return;
     }
 
@@ -910,12 +987,7 @@ export default function App() {
     );
   }
 
-  async function handlePreviewCandidatesToggle() {
-    if (activeDockPanel === "preview") {
-      setActiveDockPanel(null);
-      return;
-    }
-
+  async function handleBuildPreviewCandidates() {
     const result = await buildPlan({
       baseFrameCount: sourceFrames.length,
       editedTimelineFramesForRequest,
@@ -928,6 +1000,15 @@ export default function App() {
     ) {
       setActiveDockPanel("preview");
     }
+  }
+
+  async function handlePreviewCandidatesToggle() {
+    if (activeDockPanel === "preview") {
+      setActiveDockPanel(null);
+      return;
+    }
+
+    await handleBuildPreviewCandidates();
   }
 
   async function handleOptimizerRun() {
@@ -946,7 +1027,9 @@ export default function App() {
   }
 
   function handleAdvancedSettingsToggle() {
-    setActiveDockPanel((current) => (current === "settings" ? null : "settings"));
+    setActiveDockPanel((current) =>
+      current === "settings" ? null : "settings",
+    );
   }
 
   function handleResultsPanelToggle() {
@@ -970,7 +1053,8 @@ export default function App() {
           locale,
           searchResult: null,
           conversionResult,
-          onOpenOutputFolder: (path?: string | null) => void openOutputFolder(path),
+          onOpenOutputFolder: (path?: string | null) =>
+            void openOutputFolder(path),
           variant: "page" as const,
         }
       : null;
@@ -992,7 +1076,9 @@ export default function App() {
       candidateId={inspection.isStaticImage ? null : recommendedCandidateId}
       desktopAvailable={supportsDesktopProcessing}
       waitingForPlan={!inspection.isStaticImage && fullPlan === null}
+      planLoading={!inspection.isStaticImage && planLoading}
       probeState={currentProbeState}
+      onRequestPlan={() => void handleBuildPreviewCandidates()}
       onRetryEstimate={outputSizeEstimate.retryEstimate}
       onProbeCandidate={outputSizeEstimate.probeCandidate}
       onCancelProbe={outputSizeEstimate.cancelProbe}
@@ -1011,7 +1097,11 @@ export default function App() {
       )}
       <main
         ref={shellRef}
-        className={isEditorLayoutActive ? "shell desktopShell desktopShellEditing" : "shell desktopShell"}
+        className={
+          isEditorLayoutActive
+            ? "shell desktopShell desktopShellEditing"
+            : "shell desktopShell"
+        }
       >
         <DesktopHeader
           copy={copy}
@@ -1023,7 +1113,10 @@ export default function App() {
 
         <PickerGrid
           copy={copy}
-          inputLabel={filterPathLabel(inspection?.inputPath ?? null, ui.inputPlaceholder)}
+          inputLabel={filterPathLabel(
+            inspection?.inputPath ?? null,
+            ui.inputPlaceholder,
+          )}
           outputLabel={outputDirectory ?? ui.outputPlaceholder}
           hasInputPath={Boolean(inspection?.inputPath)}
           hasOutputDirectory={Boolean(outputDirectory)}
@@ -1041,7 +1134,9 @@ export default function App() {
             <p className="panelLabel">{copy.startHere}</p>
             <h2>{copy.pickSourceTitle}</h2>
             <p className="summaryText">{copy.pickSourceBody}</p>
-            {isWebPreviewMode ? <p className="summaryText">{copy.webPreviewNotice}</p> : null}
+            {isWebPreviewMode ? (
+              <p className="summaryText">{copy.webPreviewNotice}</p>
+            ) : null}
             {toolError ? <p className="errorText">{toolError}</p> : null}
           </section>
         ) : inspection.ok ? (
@@ -1083,7 +1178,8 @@ export default function App() {
                 selectionLabel,
                 cropAspectRatioPreset,
                 isCropSelectionReset,
-                onCropAspectRatioPresetChange: handleCropAspectRatioPresetChange,
+                onCropAspectRatioPresetChange:
+                  handleCropAspectRatioPresetChange,
                 onResetSelection: resetCropSelection,
               }}
               previewProps={{
@@ -1099,9 +1195,13 @@ export default function App() {
                 onResetSelection: resetCropSelection,
                 copy,
                 isPlaying: !inspection.isStaticImage ? isPlaying : undefined,
-                currentTime: !inspection.isStaticImage ? previewCurrentTime : undefined,
+                currentTime: !inspection.isStaticImage
+                  ? previewCurrentTime
+                  : undefined,
                 onCurrentTimeChange: undefined,
-                onDurationChange: !inspection.isStaticImage ? handlePreviewDurationChange : undefined,
+                onDurationChange: !inspection.isStaticImage
+                  ? handlePreviewDurationChange
+                  : undefined,
                 syncVideoTimeToParent: false,
                 showDetails: false,
                 previewZoomMode,
@@ -1153,7 +1253,10 @@ export default function App() {
                 previewZoomMode,
                 previewZoomPercent: Math.round(resolvedPreviewZoomScale * 100),
                 previewZoomSliderValue: resolvedPreviewZoomScale * 100,
-                previewZoomSliderMin: Math.max(0.1, Math.min(10, resolvedFitPreviewZoomScale * 100)),
+                previewZoomSliderMin: Math.max(
+                  0.1,
+                  Math.min(10, resolvedFitPreviewZoomScale * 100),
+                ),
                 onTogglePlayback: togglePlayback,
                 onPointerDown: handleTimelinePointerDown,
                 onPointerMove: handleTimelinePointerMove,
@@ -1183,7 +1286,8 @@ export default function App() {
                 advancedSettingsPanelId: ADVANCED_SETTINGS_PANEL_ID,
                 previewPanelId: EDITOR_PREVIEW_PANEL_ID,
                 resultsPanelId: EDITOR_RESULTS_PANEL_ID,
-                onTogglePreviewCandidates: () => void handlePreviewCandidatesToggle(),
+                onTogglePreviewCandidates: () =>
+                  void handlePreviewCandidatesToggle(),
                 onToggleAdvancedSettings: handleAdvancedSettingsToggle,
                 onToggleResults: handleResultsPanelToggle,
                 onRunOptimizer: () => void handleOptimizerRun(),
@@ -1193,7 +1297,6 @@ export default function App() {
               }}
               staticImageResultsProps={staticImageResultsProps}
             />
-
           </>
         ) : (
           <InspectionErrorCard
@@ -1207,7 +1310,6 @@ export default function App() {
             }
           />
         )}
-
       </main>
 
       <FrameEditingOverlays
@@ -1271,18 +1373,3 @@ export default function App() {
     </>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

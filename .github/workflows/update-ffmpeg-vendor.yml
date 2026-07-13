@@ -95,8 +95,12 @@ jobs:
           }
           foreach ($entry in $tools.GetEnumerator()) {
             if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) { throw "Missing $($entry.Value)." }
-            & $entry.Value --version | Select-Object -First 1
-            if ($LASTEXITCODE -ne 0) { throw "$($entry.Key) version check failed." }
+            $versionOutput = @(& $entry.Value --version 2>&1)
+            $versionExitCode = $LASTEXITCODE
+            if ($versionExitCode -ne 0) { throw "$($entry.Key) version check failed." }
+            $versionLine = @($versionOutput | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -First 1)
+            if ($versionLine.Count -ne 1) { throw "$($entry.Key) did not report a version." }
+            Write-Host $versionLine[0]
             Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)"
           }
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"

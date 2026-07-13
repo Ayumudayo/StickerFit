@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { useFrameDialogState } from "./frameEditor/useFrameDialogState";
 import { useFrameSelectionInteractions } from "./frameEditor/useFrameSelectionInteractions";
@@ -15,7 +22,10 @@ import {
   scaleSelectedFrameDurations,
   splitSelectedFrame,
 } from "../utils/frameEditing";
-import { buildInitialTimelineFrames, buildTimelineFrameViews } from "../utils/timelineFrames";
+import {
+  buildInitialTimelineFrames,
+  buildTimelineFrameViews,
+} from "../utils/timelineFrames";
 
 type UseFrameEditorControllerParams = {
   editorSessionKey?: number;
@@ -107,7 +117,9 @@ export function useFrameEditorController({
   const hasClipboardFrames = clipboardFrames.length > 0;
   const anchorSourceFrameId =
     timelineFrames.find((frame) => frame.instanceId === selectedInstanceIds[0])
-      ?.sourceFrameId ?? timelineFrames[0]?.sourceFrameId ?? 0;
+      ?.sourceFrameId ??
+    timelineFrames[0]?.sourceFrameId ??
+    0;
 
   const createTimelineInstanceId = useCallback((sourceFrameId: number) => {
     frameInstanceCounterRef.current += 1;
@@ -144,14 +156,22 @@ export function useFrameEditorController({
     frameInstanceCounterRef.current = 0;
     setTimelineFrames(buildInitialTimelineFrames(sourceFrames));
     hydratedSessionKeyRef.current = editorSessionKey;
-  }, [editorSessionKey, resetDialogState, resetFrameEditorState, resetSelectionState, sourceFrames]);
+  }, [
+    editorSessionKey,
+    resetDialogState,
+    resetFrameEditorState,
+    resetSelectionState,
+    sourceFrames,
+  ]);
 
   const deleteUnselectedFrames = useCallback(() => {
     if (selectedInstanceIds.length === 0) {
       return;
     }
 
-    setTimelineFrames((current) => deleteUnselectedTimelineFrames(current, selectedInstanceIds));
+    setTimelineFrames((current) =>
+      deleteUnselectedTimelineFrames(current, selectedInstanceIds),
+    );
     setFrameContextMenu(null);
   }, [selectedInstanceIds, setFrameContextMenu]);
 
@@ -171,7 +191,12 @@ export function useFrameEditorController({
   const speedAdjustSelectedFrames = useCallback(
     (factor: number) => {
       setTimelineFrames((current) =>
-        scaleSelectedFrameDurations(current, selectedInstanceIds, factor, minDurationUs),
+        scaleSelectedFrameDurations(
+          current,
+          selectedInstanceIds,
+          factor,
+          minDurationUs,
+        ),
       );
       setFrameContextMenu(null);
     },
@@ -213,8 +238,12 @@ export function useFrameEditorController({
       setTimelineFrames(nextFrames);
       setSelectedInstanceIds(
         boundary === "start"
-          ? nextFrames.slice(0, selectedInstanceIds.length).map((frame) => frame.instanceId)
-          : nextFrames.slice(-selectedInstanceIds.length).map((frame) => frame.instanceId),
+          ? nextFrames
+              .slice(0, selectedInstanceIds.length)
+              .map((frame) => frame.instanceId)
+          : nextFrames
+              .slice(-selectedInstanceIds.length)
+              .map((frame) => frame.instanceId),
       );
       setFrameContextMenu(null);
     },
@@ -229,7 +258,9 @@ export function useFrameEditorController({
   );
 
   const reverseSelectedFrames = useCallback(() => {
-    setTimelineFrames((current) => reverseSelectedFramesInPlace(current, selectedInstanceIds));
+    setTimelineFrames((current) =>
+      reverseSelectedFramesInPlace(current, selectedInstanceIds),
+    );
     setFrameContextMenu(null);
   }, [selectedInstanceIds, setFrameContextMenu]);
 
@@ -244,7 +275,12 @@ export function useFrameEditorController({
     setTimelineFrames(result.timelineFrames);
     setSelectedInstanceIds(clearTimelineSelection());
     setFrameContextMenu(null);
-  }, [selectedInstanceIds, setFrameContextMenu, setSelectedInstanceIds, timelineFrames]);
+  }, [
+    selectedInstanceIds,
+    setFrameContextMenu,
+    setSelectedInstanceIds,
+    timelineFrames,
+  ]);
 
   const pasteClipboard = useCallback(
     (position: "above" | "below") => {
@@ -299,7 +335,9 @@ export function useFrameEditorController({
       const anchorInstanceId =
         selectedInstanceIds.length > 0
           ? selectedInstanceIds[selectedInstanceIds.length - 1]
-          : timelineFrames[position === "below" ? timelineFrames.length - 1 : 0]?.instanceId ?? null;
+          : (timelineFrames[
+              position === "below" ? timelineFrames.length - 1 : 0
+            ]?.instanceId ?? null);
       if (!anchorInstanceId) {
         return;
       }

@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
-  pull-requests: read
 
 defaults:
   run:
@@ -26,72 +24,6 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - name: Classify protected paths before checkout
-        id: protected_paths
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
-          REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          if ($env:EVENT_NAME -ne "pull_request") {
-            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "changed=false"
-            exit 0
-          }
-
-          $headers = @{
-            Accept = "application/vnd.github+json"
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            "X-GitHub-Api-Version" = "2022-11-28"
-          }
-          $protectedExactPaths = @(
-            ".gitattributes",
-            ".github/CODEOWNERS",
-            "tools/ffmpeg/ffmpeg-release-signing-key.asc",
-            "tools/ffmpeg/ffmpeg-version.json",
-            "tools/ffmpeg/FfmpegSourceVerification.psm1",
-            "tools/ffmpeg/build-minimal-ffmpeg.ps1",
-            "tools/bootstrap-build-windows.ps1",
-            "tools/size-report.ps1",
-            "tools/test-ffmpeg-source-contract.ps1",
-            "tools/test-release-sidecar.ps1",
-            "tools/test-tauri-policy.ps1",
-            "tools/test-vendor-diff-policy.ps1",
-            "src-tauri/tauri.conf.json",
-            "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe",
-            "src-tauri/binaries/libwinpthread-1.dll",
-            "src-tauri/binaries/LICENSE-ffmpeg-BtbN.txt",
-            "src-tauri/binaries/LICENSE-ffmpeg.txt",
-            "src-tauri/binaries/LICENSE-libwinpthread.txt",
-            "src-tauri/binaries/ffmpeg-provenance.json"
-          )
-          $protectedExact = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
-          foreach ($protectedPath in $protectedExactPaths) {
-            [void]$protectedExact.Add($protectedPath)
-          }
-          $changed = $false
-          $page = 1
-          do {
-            $uri = "https://api.github.com/repos/$env:REPOSITORY/pulls/$env:PR_NUMBER/files?per_page=100&page=$page"
-            $files = @(Invoke-RestMethod -Uri $uri -Headers $headers -Method Get)
-            foreach ($file in $files) {
-              $paths = @([string]$file.filename)
-              if ($file.PSObject.Properties.Name -contains "previous_filename") {
-                $paths += [string]$file.previous_filename
-              }
-              foreach ($path in $paths) {
-                if ($path.StartsWith(".github/workflows/", [System.StringComparison]::OrdinalIgnoreCase) -or
-                    $path.StartsWith("src-tauri/binaries/", [System.StringComparison]::OrdinalIgnoreCase) -or
-                    $protectedExact.Contains($path)) {
-                  $changed = $true
-                }
-              }
-            }
-            $page++
-          } while ($files.Count -eq 100)
-
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("changed=" + $changed.ToString().ToLowerInvariant())
-
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -141,8 +73,12 @@ jobs:
             if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) {
               throw "Required MSYS2 tool is missing: $($entry.Value)"
             }
-            & $entry.Value --version | Select-Object -First 1
-            if ($LASTEXITCODE -ne 0) { throw "$($entry.Key) version check failed." }
+            $versionOutput = @(& $entry.Value --version 2>&1)
+            $versionExitCode = $LASTEXITCODE
+            if ($versionExitCode -ne 0) { throw "$($entry.Key) version check failed." }
+            $versionLine = @($versionOutput | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -First 1)
+            if ($versionLine.Count -ne 1) { throw "$($entry.Key) did not report a version." }
+            Write-Host $versionLine[0]
             Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)"
           }
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
@@ -180,12 +116,7 @@ jobs:
         run: npm run test:vendor-policy
 
       - name: Verify tracked FFmpeg vendor
-        if: github.event_name != 'pull_request' || steps.protected_paths.outputs.changed != 'true'
         run: npm run ffmpeg:verify-vendor
-
-      - name: Defer protected vendor verification
-        if: github.event_name == 'pull_request' && steps.protected_paths.outputs.changed == 'true'
-        run: Write-Host "Protected vendor paths changed; the base-branch vendor-policy workflow is authoritative."
 
       - name: Check Rust formatting and lints
         run: |

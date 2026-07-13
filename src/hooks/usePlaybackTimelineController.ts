@@ -148,7 +148,9 @@ export function usePlaybackTimelineController({
 }: UsePlaybackTimelineControllerParams) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTimeUs, setCurrentTimeUs] = useState(0);
-  const [timelineDrag, setTimelineDrag] = useState<TimelineDragState | null>(null);
+  const [timelineDrag, setTimelineDrag] = useState<TimelineDragState | null>(
+    null,
+  );
   const lastSessionKeyRef = useRef<number | undefined>(editorSessionKey);
 
   useEffect(() => {
@@ -218,7 +220,9 @@ export function usePlaybackTimelineController({
     scrubTo(nextTime);
   }
 
-  function handleTimelinePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+  function handleTimelinePointerDown(
+    event: React.PointerEvent<HTMLDivElement>,
+  ) {
     if (totalDuration <= 0) {
       return;
     }
@@ -228,7 +232,9 @@ export function usePlaybackTimelineController({
     applyTimelineDrag(event.clientX);
   }
 
-  function handleTimelinePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+  function handleTimelinePointerMove(
+    event: React.PointerEvent<HTMLDivElement>,
+  ) {
     if (!timelineDrag || timelineDrag.pointerId !== event.pointerId) {
       return;
     }
@@ -271,10 +277,19 @@ export function usePlaybackTimelineController({
     }
 
     setCurrentTimeUs(focusedSelectedFrame.startTimeUs);
-  }, [focusedSelectedFrame?.instanceId, focusedSelectedFrame?.startTimeUs, isPlaying]);
+  }, [
+    focusedSelectedFrame?.instanceId,
+    focusedSelectedFrame?.startTimeUs,
+    isPlaying,
+  ]);
 
   function togglePlayback() {
-    if (!inspection?.ok || inspection.isStaticImage || totalDuration <= 0 || playbackTimelineFrames.length === 0) {
+    if (
+      !inspection?.ok ||
+      inspection.isStaticImage ||
+      totalDuration <= 0 ||
+      playbackTimelineFrames.length === 0
+    ) {
       return;
     }
 
@@ -304,22 +319,25 @@ export function usePlaybackTimelineController({
 
     let timeoutId: number;
 
-    timeoutId = window.setTimeout(() => {
-      const nextIndex = (playbackTick.frameIndex + 1) % playbackTimelineFrames.length;
-      setCurrentTimeUs(playbackTimelineFrames[nextIndex].startTimeUs);
-    }, Math.ceil(playbackTick.delayUs / 1_000));
+    timeoutId = window.setTimeout(
+      () => {
+        const nextIndex =
+          (playbackTick.frameIndex + 1) % playbackTimelineFrames.length;
+        setCurrentTimeUs(playbackTimelineFrames[nextIndex].startTimeUs);
+      },
+      Math.ceil(playbackTick.delayUs / 1_000),
+    );
 
     return () => window.clearTimeout(timeoutId);
   }, [isPlaying, playbackTick, playbackTimelineFrames]);
 
-  const timelineProgress = totalDurationUs > 0
-    ? clamp(currentTimeUs / totalDurationUs, 0, 1)
-    : 0;
+  const timelineProgress =
+    totalDurationUs > 0 ? clamp(currentTimeUs / totalDurationUs, 0, 1) : 0;
   const timelineRailStyle = {
     "--timeline-progress": String(timelineProgress),
   } as React.CSSProperties;
   const currentPlaybackFrame = playbackTick
-    ? playbackTimelineFrames[playbackTick.frameIndex] ?? null
+    ? (playbackTimelineFrames[playbackTick.frameIndex] ?? null)
     : null;
   const previewCurrentTime = currentPlaybackFrame?.sourceStartTimeSeconds ?? 0;
   const currentFrameInstanceId = currentPlaybackFrame?.instanceId ?? null;

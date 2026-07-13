@@ -14,7 +14,11 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background:
-    radial-gradient(circle at top left, rgba(88, 101, 242, 0.15), transparent 34%),
+    radial-gradient(
+      circle at top left,
+      rgba(88, 101, 242, 0.15),
+      transparent 34%
+    ),
     linear-gradient(180deg, #2b2d31 0%, #1e1f22 100%);
   color: #f2f3f5;
 }
@@ -182,7 +186,7 @@ h3 {
 
 .rankBadge {
   background: rgba(88, 101, 242, 0.2);
-  color: #5865F2;
+  color: #5865f2;
 }
 
 .localeSwitch {
@@ -201,7 +205,7 @@ h3 {
 }
 
 .localeButton.active {
-  background: #5865F2;
+  background: #5865f2;
   color: #ffffff;
 }
 
@@ -272,13 +276,16 @@ h3 {
   border-radius: 16px;
   padding: 12px 16px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease,
+    transform 0.2s ease;
 }
 
 .primaryAction {
   color: #ffffff;
   border: 0;
-  background: #5865F2;
+  background: #5865f2;
   box-shadow: 0 4px 14px rgba(88, 101, 242, 0.3);
 }
 
@@ -569,8 +576,14 @@ h3 {
   flex: 0 0 auto;
   overflow: hidden;
   border-radius: 0;
-  background: linear-gradient(180deg, rgba(242, 238, 230, 0.96), rgba(225, 220, 210, 0.96));
-  box-shadow: inset 0 0 0 1px rgba(36, 28, 24, 0.24), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  background: linear-gradient(
+    180deg,
+    rgba(242, 238, 230, 0.96),
+    rgba(225, 220, 210, 0.96)
+  );
+  box-shadow:
+    inset 0 0 0 1px rgba(36, 28, 24, 0.24),
+    0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
 .previewMedia,
@@ -620,7 +633,7 @@ h3 {
   overflow: hidden;
 }
 
-.selectionBox:focus-visible {
+.selectionBox[tabindex]:focus-visible {
   outline: 2px solid #f6ead4;
   outline-offset: -5px;
 }
@@ -634,8 +647,28 @@ h3 {
   position: absolute;
   inset: 2px;
   background:
-    linear-gradient(to right, transparent 33.333%, rgba(255, 95, 89, 0.35) 33.333%, rgba(255, 95, 89, 0.35) calc(33.333% + 1px), transparent calc(33.333% + 1px), transparent 66.666%, rgba(255, 95, 89, 0.35) 66.666%, rgba(255, 95, 89, 0.35) calc(66.666% + 1px), transparent calc(66.666% + 1px)),
-    linear-gradient(to bottom, transparent 33.333%, rgba(255, 95, 89, 0.35) 33.333%, rgba(255, 95, 89, 0.35) calc(33.333% + 1px), transparent calc(33.333% + 1px), transparent 66.666%, rgba(255, 95, 89, 0.35) 66.666%, rgba(255, 95, 89, 0.35) calc(66.666% + 1px), transparent calc(66.666% + 1px));
+    linear-gradient(
+      to right,
+      transparent 33.333%,
+      rgba(255, 95, 89, 0.35) 33.333%,
+      rgba(255, 95, 89, 0.35) calc(33.333% + 1px),
+      transparent calc(33.333% + 1px),
+      transparent 66.666%,
+      rgba(255, 95, 89, 0.35) 66.666%,
+      rgba(255, 95, 89, 0.35) calc(66.666% + 1px),
+      transparent calc(66.666% + 1px)
+    ),
+    linear-gradient(
+      to bottom,
+      transparent 33.333%,
+      rgba(255, 95, 89, 0.35) 33.333%,
+      rgba(255, 95, 89, 0.35) calc(33.333% + 1px),
+      transparent calc(33.333% + 1px),
+      transparent 66.666%,
+      rgba(255, 95, 89, 0.35) 66.666%,
+      rgba(255, 95, 89, 0.35) calc(66.666% + 1px),
+      transparent calc(66.666% + 1px)
+    );
 }
 
 .selectionCrosshair {
@@ -929,7 +962,6 @@ h3 {
 }
 
 @media (max-width: 1080px) {
-
   .pickerRow,
   .inlineActions,
   .actionRow,
@@ -976,7 +1008,7 @@ h3 {
   flex-direction: column;
   align-items: center;
   gap: 16px;
-  color: #5865F2;
+  color: #5865f2;
   padding: 40px;
   border-radius: 24px;
   border: 4px dashed rgba(88, 101, 242, 0.6);
@@ -985,7 +1017,7 @@ h3 {
 }
 
 .dragOverlayIcon {
-  color: #5865F2;
+  color: #5865f2;
 }
 
 @keyframes pulseDropzone {
@@ -1025,7 +1057,7 @@ h3 {
 }
 
 .desktopTitleIcon {
-  color: #5865F2;
+  color: #5865f2;
 }
 
 .desktopHeaderActions {
@@ -1123,7 +1155,7 @@ h3 {
 .pickerSurfaceIcon,
 .desktopCardIcon,
 .desktopNoticeIcon {
-  color: #5865F2;
+  color: #5865f2;
 }
 
 .pickerInlineBadge,
@@ -1229,7 +1261,7 @@ h3 {
   gap: 18px;
 }
 
-.desktopCardTitleWithBody>div:first-child {
+.desktopCardTitleWithBody > div:first-child {
   display: grid;
   gap: 8px;
 }
@@ -1274,7 +1306,7 @@ h3 {
 
 .desktopPlayButton {
   color: #ffffff;
-  background: #5865F2;
+  background: #5865f2;
 }
 
 .desktopTimelineBlock {
@@ -1313,8 +1345,8 @@ h3 {
   top: 0;
   bottom: 0;
   background: rgba(88, 101, 242, 0.14);
-  border-left: 2px solid #5865F2;
-  border-right: 2px solid #5865F2;
+  border-left: 2px solid #5865f2;
+  border-right: 2px solid #5865f2;
 }
 
 .desktopTimelinePlayhead {
@@ -1354,7 +1386,7 @@ h3 {
   width: 10px;
   margin-left: -5px;
   border-radius: 999px;
-  background: #5865F2;
+  background: #5865f2;
   box-shadow: 0 0 0 4px rgba(88, 101, 242, 0.14);
   cursor: ew-resize;
 }
@@ -1457,7 +1489,7 @@ h3 {
   border-radius: 999px;
   padding: 4px 10px;
   background: rgba(88, 101, 242, 0.14);
-  color: #5865F2;
+  color: #5865f2;
 }
 
 .desktopErrorCard {
@@ -1469,7 +1501,6 @@ h3 {
 }
 
 @media (max-width: 1180px) {
-
   .desktopPickerGrid,
   .desktopMainGrid,
   .desktopBottomGrid,
@@ -1488,7 +1519,6 @@ h3 {
 }
 
 @media (max-width: 860px) {
-
   .pickerControlRow,
   .desktopSectionHeader,
   .desktopCardTitleWithBody,
@@ -1511,8 +1541,16 @@ h3 {
 
 body {
   background:
-    radial-gradient(circle at top right, rgba(88, 101, 242, 0.12), transparent 30%),
-    radial-gradient(circle at top left, rgba(255, 255, 255, 0.05), transparent 22%),
+    radial-gradient(
+      circle at top right,
+      rgba(88, 101, 242, 0.12),
+      transparent 30%
+    ),
+    radial-gradient(
+      circle at top left,
+      rgba(255, 255, 255, 0.05),
+      transparent 22%
+    ),
     linear-gradient(180deg, #2b2d31 0%, #1e1f22 100%);
   color: #f2f3f5;
 }

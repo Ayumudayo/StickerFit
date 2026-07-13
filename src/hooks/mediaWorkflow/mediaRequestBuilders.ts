@@ -28,9 +28,7 @@ type FramePreviewsFields = Omit<
   "inputPath" | "sourceRevision"
 >;
 
-function sourceIdentity(
-  inspection: PathBackedInspection | null | undefined,
-) {
+function sourceIdentity(inspection: PathBackedInspection | null | undefined) {
   if (
     !inspection?.ok ||
     !inspection.backendInputPath ||

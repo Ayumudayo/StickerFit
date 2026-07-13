@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
@@ -12,9 +12,11 @@ mod tests {
 
     use super::{
         count_full_candidate_apng, estimate_candidate_size, estimate_candidate_size_with_workload,
-        estimate_residual_interval, estimate_static_png, measure_sampled_apng_parts,
-        parse_sample_seed, probe_candidate_size, probe_candidate_size_with_workload,
-        sample_positions_without_replacement, select_extreme_transition_positions, ByteCounter,
+        estimate_proxy_stratified_residual_interval, estimate_residual_interval,
+        estimate_static_png, measure_sampled_apng_parts, parse_sample_seed, probe_candidate_size,
+        probe_candidate_size_with_workload, sample_positions_without_replacement,
+        sample_proxy_stratified_positions_without_replacement, select_extreme_transition_positions,
+        select_extreme_transition_positions_from_proxies, transition_proxy_scores, ByteCounter,
         CountingWriter, EstimateConfidence, EstimateWorkloadCounters, OutputSizeEstimate,
         OutputSizeEstimateError,
     };
@@ -119,7 +121,7 @@ mod tests {
             .map(|frame| {
                 RgbaImage::from_fn(96, 96, |x, y| {
                     let offset = (frame * 3) as u32 % 80;
-                    if x >= offset && x < offset + 16 && y >= 32 && y < 48 {
+                    if (offset..offset + 16).contains(&x) && (32..48).contains(&y) {
                         Rgba([240, 70, 20, 255])
                     } else {
                         Rgba([8, 12, 18, 255])
@@ -146,7 +148,7 @@ mod tests {
                 "solid" => RgbaImage::from_pixel(96, 96, Rgba([12, 34, 56, 255])),
                 "moving-square" => RgbaImage::from_fn(96, 96, |x, y| {
                     let offset = frame * 3 % 80;
-                    if x >= offset && x < offset + 16 && y >= 32 && y < 48 {
+                    if (offset..offset + 16).contains(&x) && (32..48).contains(&y) {
                         Rgba([240, 70, 20, 255])
                     } else {
                         Rgba([8, 12, 18, 255])
@@ -201,7 +203,7 @@ mod tests {
                     } else {
                         let offset = (frame - 130) * 3 % 80;
                         RgbaImage::from_fn(96, 96, |x, y| {
-                            if x >= offset && x < offset + 16 && y >= 32 && y < 48 {
+                            if (offset..offset + 16).contains(&x) && (32..48).contains(&y) {
                                 Rgba([240, 70, 20, 255])
                             } else {
                                 Rgba([25, 35, 45, 255])
@@ -231,11 +233,13 @@ mod tests {
                 sum.checked_add(*contribution)
             })
             .expect("actual generated fixture bytes");
-        let extremes = select_extreme_transition_positions(sequence, context, 2)
-            .expect("generated fixture extremes");
+        let transition_proxies =
+            transition_proxy_scores(sequence, context).expect("generated fixture proxies");
+        let extremes = select_extreme_transition_positions_from_proxies(&transition_proxies, 2);
         let extreme_set = extremes.iter().copied().collect::<BTreeSet<_>>();
-        let residual_positions = (1..sequence.frames.len())
-            .filter(|position| !extreme_set.contains(position))
+        let residual_proxies = transition_proxies
+            .into_iter()
+            .filter(|(position, _)| !extreme_set.contains(position))
             .collect::<Vec<_>>();
         let fixed = extremes
             .iter()
@@ -245,14 +249,22 @@ mod tests {
             .expect("generated fixture fixed bytes");
         let intervals = (0..200_u64)
             .map(|seed| {
-                let sample =
-                    sample_positions_without_replacement(residual_positions.len(), 9, seed)
-                        .expect("arithmetic-only holdout resample")
-                        .into_iter()
-                        .map(|rank| all.transition_bytes[&residual_positions[rank]])
-                        .collect::<Vec<_>>();
-                estimate_residual_interval(&sample, residual_positions.len(), fixed)
-                    .expect("holdout interval")
+                let sampled_positions = sample_proxy_stratified_positions_without_replacement(
+                    &residual_proxies,
+                    9,
+                    seed,
+                )
+                .expect("proxy-stratified holdout resample");
+                let sampled_contributions = sampled_positions
+                    .into_iter()
+                    .map(|position| (position, all.transition_bytes[&position]))
+                    .collect::<BTreeMap<_, _>>();
+                estimate_proxy_stratified_residual_interval(
+                    &residual_proxies,
+                    &sampled_contributions,
+                    fixed,
+                )
+                .expect("holdout interval")
             })
             .collect();
         (actual, intervals)
@@ -510,6 +522,114 @@ mod tests {
     }
 
     #[test]
+    fn all_unchanged_incomplete_stratum_keeps_a_nonzero_interval_at_low_confidence() {
+        let residual_proxies = (1..=10).map(|position| (position, 0)).collect::<Vec<_>>();
+        let sampled_contributions = (1..=7)
+            .map(|position| (position, 100))
+            .collect::<BTreeMap<_, _>>();
+        let interval = estimate_proxy_stratified_residual_interval(
+            &residual_proxies,
+            &sampled_contributions,
+            1_000_000,
+        )
+        .expect("all-unchanged incomplete stratum");
+        let missed_rare_large_actual = 1_000_000 + 7 * 100 + 2 * 100 + 500;
+
+        assert_eq!(interval.predicted_bytes, 1_001_000);
+        assert!(interval.lower_bytes < interval.predicted_bytes);
+        assert!(interval.predicted_bytes < interval.upper_bytes);
+        assert!(missed_rare_large_actual <= interval.upper_bytes);
+        assert_eq!(interval.confidence, EstimateConfidence::Low);
+    }
+
+    #[test]
+    fn non_stratified_interval_uses_sample_degrees_of_freedom() {
+        let three_samples =
+            estimate_residual_interval(&[100; 3], 10, 0).expect("three-sample interval");
+        let seven_samples =
+            estimate_residual_interval(&[100; 7], 10, 0).expect("seven-sample interval");
+
+        assert_eq!(three_samples.upper_bytes, 3_191);
+        assert_eq!(seven_samples.upper_bytes, 1_534);
+        assert_eq!(three_samples.confidence, EstimateConfidence::Low);
+        assert_eq!(seven_samples.confidence, EstimateConfidence::Low);
+    }
+
+    #[test]
+    fn stratified_equal_changed_samples_cover_a_missed_rare_contribution_without_high_confidence() {
+        let residual_proxies = (1..=12)
+            .map(|position| {
+                let proxy = match position {
+                    1 | 2 => 0,
+                    12 => 10_000,
+                    _ => 100,
+                };
+                (position, proxy)
+            })
+            .collect::<Vec<_>>();
+        let sampled_contributions = [(1, 40), (2, 40)]
+            .into_iter()
+            .chain((3..=9).map(|position| (position, 100)))
+            .collect::<BTreeMap<_, _>>();
+        let interval = estimate_proxy_stratified_residual_interval(
+            &residual_proxies,
+            &sampled_contributions,
+            1_000_000,
+        )
+        .expect("stratified equal changed sample");
+        let missed_rare_large_actual = 1_000_000 + 2 * 40 + 7 * 100 + 2 * 100 + 500;
+
+        assert_eq!(interval.predicted_bytes, 1_001_080);
+        assert!(interval.lower_bytes < interval.predicted_bytes);
+        assert!(interval.predicted_bytes < interval.upper_bytes);
+        assert!(missed_rare_large_actual <= interval.upper_bytes);
+        assert_eq!(interval.confidence, EstimateConfidence::Low);
+    }
+
+    #[test]
+    fn incomplete_unchanged_stratum_is_conservative_when_changed_stratum_is_exhaustive() {
+        let residual_proxies = (1..=7)
+            .map(|position| (position, if position >= 6 { 1 } else { 0 }))
+            .collect::<Vec<_>>();
+        let sampled_contributions = [(1, 100), (2, 100), (3, 100), (6, 1_000), (7, 1_000)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let interval = estimate_proxy_stratified_residual_interval(
+            &residual_proxies,
+            &sampled_contributions,
+            0,
+        )
+        .expect("incomplete unchanged stratum");
+        let missed_rare_large_actual = 3 * 100 + 100 + 500 + 2 * 1_000;
+
+        assert_eq!(interval.predicted_bytes, 2_500);
+        assert!(missed_rare_large_actual <= interval.upper_bytes);
+        assert_eq!(interval.confidence, EstimateConfidence::Low);
+
+        let exhaustive_contributions = [
+            (1, 100),
+            (2, 100),
+            (3, 100),
+            (4, 100),
+            (5, 500),
+            (6, 1_000),
+            (7, 1_000),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let exact = estimate_proxy_stratified_residual_interval(
+            &residual_proxies,
+            &exhaustive_contributions,
+            0,
+        )
+        .expect("exhaustive strata");
+        assert_eq!(exact.lower_bytes, missed_rare_large_actual);
+        assert_eq!(exact.predicted_bytes, missed_rare_large_actual);
+        assert_eq!(exact.upper_bytes, missed_rare_large_actual);
+        assert_eq!(exact.confidence, EstimateConfidence::High);
+    }
+
+    #[test]
     fn displayed_relative_half_width_sets_confidence_boundaries() {
         let high = super::confidence_for_interval(750, 1_000, 1_250);
         let medium = super::confidence_for_interval(250, 1_000, 1_750);
@@ -571,6 +691,9 @@ mod tests {
         let fixture = CandidateFixture::new(frames);
         let context = OperationContext::detached(Duration::from_secs(5));
         let sequence = fixture.sequence(&context);
+        let proxies = transition_proxy_scores(&sequence, &context).expect("transition proxies");
+        assert_eq!(proxies.iter().filter(|(_, proxy)| *proxy == 0).count(), 13);
+        assert_eq!(proxies.iter().filter(|(_, proxy)| *proxy > 0).count(), 2);
         let extremes =
             select_extreme_transition_positions(&sequence, &context, 2).expect("proxy extremes");
         assert_eq!(extremes, vec![4, 5]);
@@ -584,6 +707,28 @@ mod tests {
             .map(|rank| residual[rank])
             .collect::<BTreeSet<_>>();
         assert!(sampled.iter().all(|position| !extremes.contains(position)));
+    }
+
+    #[test]
+    fn proxy_stratified_sampling_preserves_rare_changed_transitions_and_budget() {
+        let residual_proxies = (1..=30)
+            .map(|position| (position, if position > 20 { 1 } else { 0 }))
+            .collect::<Vec<_>>();
+        let first = sample_proxy_stratified_positions_without_replacement(
+            &residual_proxies,
+            9,
+            0x0123_4567_89ab_cdef,
+        )
+        .expect("proxy-stratified sample");
+        let repeated = sample_proxy_stratified_positions_without_replacement(
+            &residual_proxies,
+            9,
+            0x0123_4567_89ab_cdef,
+        )
+        .expect("repeated proxy-stratified sample");
+        assert_eq!(first, repeated);
+        assert_eq!(first.len(), 9);
+        assert_eq!(first.iter().filter(|position| **position > 20).count(), 7);
     }
 
     #[test]
@@ -747,23 +892,40 @@ mod tests {
         }
         assert!(command.contains("candidate_ids.len() > 5"));
         assert!(estimator.contains("select_extreme_transition_positions(sequence, context, 2)"));
-        assert!(
-            estimator.contains("sample_positions_without_replacement(residual_positions.len(), 9")
-        );
+        assert!(estimator.contains(
+            "sample_proxy_stratified_positions_without_replacement(&residual_proxies, 9"
+        ));
         assert!(estimator.contains("1 + measured_positions.len()"));
         assert!(command.contains("let loader = DefaultFrameSourceLoader;"));
         assert!(command.contains("estimate_optimizer_candidates_with_loader("));
         assert!(command.contains("probe_optimizer_candidate_with_loader("));
         assert!(command.contains("estimate_optimizer_candidates,"));
         assert!(command.contains("probe_optimizer_candidate_size,"));
-        let oversized_request =
-            serde_json::from_value::<crate::OptimizerSizeEstimateRequest>(json!({
-                "inputPath": "input.gif",
-                "sourceRevision": "revision",
-                "candidateIds": ["a", "b", "c", "d", "e", "f"],
-                "sampleSeed": "0123456789abcdef"
-            }))
-            .expect("semantic limit must be validated inside the typed command");
+        let oversized_request = crate::OptimizerSizeEstimateRequest {
+            input_path: "input.gif".into(),
+            source_revision: "revision".into(),
+            candidate_ids: ["a", "b", "c", "d", "e", "f"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            sample_seed: "0123456789abcdef".into(),
+            plan: crate::OptimizerPlanRequest {
+                locale: None,
+                source_duration_seconds: None,
+                input_width: None,
+                input_height: None,
+                avg_fps: None,
+                fit_mode: None,
+                preset_strategy: None,
+                optimizer_goal: None,
+                quality_frame_drop_interval: None,
+                search_depth: None,
+                crop_region: None,
+                selected_frames: None,
+                base_frame_count: None,
+                timeline_frames: None,
+            },
+        };
         assert_eq!(
             crate::validate_candidate_ids(&oversized_request.candidate_ids),
             Err(PipelineError::InvalidRequestWithoutReason)
@@ -1183,7 +1345,7 @@ impl ByteCounter {
                 current.checked_add(additional)
             })
             .map(|_| ())
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "encoded byte count overflow"))
+            .map_err(|_| io::Error::other("encoded byte count overflow"))
     }
 
     #[cfg(test)]
@@ -1274,6 +1436,104 @@ pub(crate) fn sample_positions_without_replacement(
     Ok(positions)
 }
 
+fn unchanged_proxy_stratum_sample_count(
+    unchanged_population: usize,
+    changed_population: usize,
+    sample_limit: usize,
+) -> Result<usize, PipelineError> {
+    let population = unchanged_population
+        .checked_add(changed_population)
+        .ok_or_else(invalid_estimate_request)?;
+    if unchanged_population == 0
+        || changed_population == 0
+        || sample_limit < 4
+        || sample_limit >= population
+    {
+        return Err(invalid_estimate_request());
+    }
+
+    // Identical-frame transitions are the low-variance stratum, so retain the
+    // two observations needed to estimate its variance and spend the remaining
+    // budget on changed-frame tail risk. If that tail is smaller than its
+    // allocation, measure it exhaustively and return the spare slots here.
+    let unchanged_minimum = unchanged_population.min(2);
+    let changed_minimum = changed_population.min(2);
+    let lower = unchanged_minimum.max(sample_limit.saturating_sub(changed_population));
+    let upper = unchanged_population.min(
+        sample_limit
+            .checked_sub(changed_minimum)
+            .ok_or_else(invalid_estimate_request)?,
+    );
+    if lower > upper {
+        return Err(invalid_estimate_request());
+    }
+    Ok(lower)
+}
+
+fn sample_proxy_stratified_positions_without_replacement(
+    residual_proxies: &[(usize, u64)],
+    sample_limit: usize,
+    seed: u64,
+) -> Result<BTreeSet<usize>, PipelineError> {
+    if residual_proxies.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    if sample_limit == 0 {
+        return Err(invalid_estimate_request());
+    }
+    if sample_limit >= residual_proxies.len() {
+        return Ok(residual_proxies
+            .iter()
+            .map(|(position, _)| *position)
+            .collect());
+    }
+
+    let unchanged = residual_proxies
+        .iter()
+        .filter(|(_, proxy)| *proxy == 0)
+        .map(|(position, _)| *position)
+        .collect::<Vec<_>>();
+    let changed = residual_proxies
+        .iter()
+        .filter(|(_, proxy)| *proxy != 0)
+        .map(|(position, _)| *position)
+        .collect::<Vec<_>>();
+    if unchanged.is_empty() || changed.is_empty() || sample_limit < 4 {
+        return sample_positions_without_replacement(residual_proxies.len(), sample_limit, seed)
+            .map(|ranks| {
+                ranks
+                    .into_iter()
+                    .map(|rank| residual_proxies[rank].0)
+                    .collect()
+            });
+    }
+
+    let unchanged_sample_count =
+        unchanged_proxy_stratum_sample_count(unchanged.len(), changed.len(), sample_limit)?;
+    let changed_sample_count = sample_limit
+        .checked_sub(unchanged_sample_count)
+        .ok_or_else(invalid_estimate_request)?;
+    let mut selected = BTreeSet::new();
+    for rank in sample_positions_without_replacement(
+        unchanged.len(),
+        unchanged_sample_count,
+        seed ^ 0x6a09_e667_f3bc_c909,
+    )? {
+        selected.insert(unchanged[rank]);
+    }
+    for rank in sample_positions_without_replacement(
+        changed.len(),
+        changed_sample_count,
+        seed.rotate_left(29) ^ 0xbb67_ae85_84ca_a73b,
+    )? {
+        selected.insert(changed[rank]);
+    }
+    if selected.len() != sample_limit {
+        return Err(invalid_estimate_request());
+    }
+    Ok(selected)
+}
+
 pub(crate) fn confidence_for_interval(
     lower_bytes: u64,
     predicted_bytes: u64,
@@ -1297,6 +1557,60 @@ pub(crate) fn confidence_for_interval(
     }
 }
 
+fn sampled_variance_with_scale_floor(
+    squared_deviation_sum: f64,
+    sample_count: f64,
+    mean: f64,
+) -> Result<(f64, bool), PipelineError> {
+    let observed_variance = squared_deviation_sum / (sample_count - 1.0);
+    if !observed_variance.is_finite() {
+        return Err(invalid_estimate_request());
+    }
+
+    // Low observed spread in any incomplete stratum does not prove that the
+    // unsampled encoded contributions have no tail. Keep the finite-population
+    // estimator conservative with a scale-relative (CV = 1) variance floor.
+    // This is a policy guard rather than a distribution-free bound, so callers
+    // also report Low confidence whenever the floor is needed.
+    let scale = mean.max(1.0);
+    let variance_floor = scale * scale;
+    if !variance_floor.is_finite() {
+        return Err(invalid_estimate_request());
+    }
+    Ok((
+        observed_variance.max(variance_floor),
+        observed_variance < variance_floor,
+    ))
+}
+
+fn sampled_interval_confidence(
+    lower_bytes: u64,
+    predicted_bytes: u64,
+    upper_bytes: u64,
+    used_scale_floor: bool,
+) -> EstimateConfidence {
+    let confidence = confidence_for_interval(lower_bytes, predicted_bytes, upper_bytes);
+    if used_scale_floor {
+        EstimateConfidence::Low
+    } else {
+        confidence
+    }
+}
+
+fn conservative_t_critical_value(degrees_of_freedom: usize) -> Result<f64, PipelineError> {
+    match degrees_of_freedom {
+        0 => Err(invalid_estimate_request()),
+        1 => Ok(12.706),
+        2 => Ok(4.303),
+        3 => Ok(3.182),
+        4 => Ok(2.776),
+        5 => Ok(2.571),
+        6 => Ok(2.447),
+        7 => Ok(2.365),
+        _ => Ok(2.306),
+    }
+}
+
 fn finite_u64(value: f64, rounding: fn(f64) -> f64) -> Result<u64, PipelineError> {
     if !value.is_finite() || value < 0.0 || value >= u64::MAX as f64 {
         return Err(invalid_estimate_request());
@@ -1309,6 +1623,14 @@ fn finite_u64(value: f64, rounding: fn(f64) -> f64) -> Result<u64, PipelineError
 }
 
 pub(crate) fn estimate_residual_interval(
+    frame_contributions: &[u64],
+    population: usize,
+    fixed_overhead: u64,
+) -> Result<ByteInterval, PipelineError> {
+    estimate_residual_interval_with_scale_floor(frame_contributions, population, fixed_overhead)
+}
+
+fn estimate_residual_interval_with_scale_floor(
     frame_contributions: &[u64],
     population: usize,
     fixed_overhead: u64,
@@ -1365,11 +1687,12 @@ pub(crate) fn estimate_residual_interval(
             .then_some(next)
             .ok_or_else(invalid_estimate_request)
     })?;
-    let variance = squared_deviation_sum / (sample_count - 1.0);
+    let (variance, used_scale_floor) =
+        sampled_variance_with_scale_floor(squared_deviation_sum, sample_count, mean)?;
     let correction = ((population_count - sample_count) / (population_count - 1.0)).sqrt();
     let standard_error = population_count * (variance / sample_count).sqrt() * correction;
     let residual_prediction = population_count * mean;
-    let half_width = 2.306 * standard_error;
+    let half_width = conservative_t_critical_value(sampled - 1)? * standard_error;
     if !variance.is_finite()
         || !correction.is_finite()
         || !standard_error.is_finite()
@@ -1398,7 +1721,147 @@ pub(crate) fn estimate_residual_interval(
         lower_bytes,
         predicted_bytes,
         upper_bytes,
-        confidence: confidence_for_interval(lower_bytes, predicted_bytes, upper_bytes),
+        confidence: sampled_interval_confidence(
+            lower_bytes,
+            predicted_bytes,
+            upper_bytes,
+            used_scale_floor,
+        ),
+    })
+}
+
+fn estimate_proxy_stratified_residual_interval(
+    residual_proxies: &[(usize, u64)],
+    sampled_contributions: &BTreeMap<usize, u64>,
+    fixed_overhead: u64,
+) -> Result<ByteInterval, PipelineError> {
+    if residual_proxies.is_empty() {
+        return estimate_residual_interval(&[], 0, fixed_overhead);
+    }
+
+    let mut unchanged_population = 0_usize;
+    let mut changed_population = 0_usize;
+    let mut unchanged_samples = Vec::new();
+    let mut changed_samples = Vec::new();
+    for (position, proxy) in residual_proxies {
+        let (population, samples) = if *proxy == 0 {
+            (&mut unchanged_population, &mut unchanged_samples)
+        } else {
+            (&mut changed_population, &mut changed_samples)
+        };
+        *population = population
+            .checked_add(1)
+            .ok_or_else(invalid_estimate_request)?;
+        if let Some(contribution) = sampled_contributions.get(position) {
+            samples.push(*contribution);
+        }
+    }
+    if unchanged_samples.len() + changed_samples.len() != sampled_contributions.len() {
+        return Err(invalid_estimate_request());
+    }
+    if unchanged_population == 0 || changed_population == 0 {
+        let samples = if unchanged_population == 0 {
+            &changed_samples
+        } else {
+            &unchanged_samples
+        };
+        return estimate_residual_interval_with_scale_floor(
+            samples,
+            residual_proxies.len(),
+            fixed_overhead,
+        );
+    }
+
+    let strata = [
+        (unchanged_population, unchanged_samples.as_slice()),
+        (changed_population, changed_samples.as_slice()),
+    ];
+    let mut residual_prediction = 0.0_f64;
+    let mut residual_variance = 0.0_f64;
+    let mut minimum_degrees_of_freedom = usize::MAX;
+    let mut used_scale_floor = false;
+    for (population, samples) in strata {
+        let sampled = samples.len();
+        if sampled == 0 || sampled > population || (sampled < population && sampled < 2) {
+            return Err(invalid_estimate_request());
+        }
+        let sample_count = sampled as f64;
+        let population_count = population as f64;
+        let sum = samples.iter().try_fold(0_u64, |total, contribution| {
+            total
+                .checked_add(*contribution)
+                .ok_or_else(invalid_estimate_request)
+        })?;
+        let mean = sum as f64 / sample_count;
+        let stratum_prediction = population_count * mean;
+        if !mean.is_finite() || !stratum_prediction.is_finite() {
+            return Err(invalid_estimate_request());
+        }
+        residual_prediction += stratum_prediction;
+
+        if sampled < population {
+            let squared_deviation_sum = samples.iter().try_fold(0.0, |total, value| {
+                let deviation = *value as f64 - mean;
+                let next = total + deviation * deviation;
+                next.is_finite()
+                    .then_some(next)
+                    .ok_or_else(invalid_estimate_request)
+            })?;
+            let (sample_variance, stratum_used_scale_floor) =
+                sampled_variance_with_scale_floor(squared_deviation_sum, sample_count, mean)?;
+            let finite_population_correction =
+                (population_count - sample_count) / (population_count - 1.0);
+            let stratum_variance = population_count * population_count * sample_variance
+                / sample_count
+                * finite_population_correction;
+            if !sample_variance.is_finite()
+                || !finite_population_correction.is_finite()
+                || !stratum_variance.is_finite()
+            {
+                return Err(invalid_estimate_request());
+            }
+            residual_variance += stratum_variance;
+            used_scale_floor |= stratum_used_scale_floor;
+            minimum_degrees_of_freedom = minimum_degrees_of_freedom.min(sampled - 1);
+        }
+    }
+    if !residual_prediction.is_finite() || !residual_variance.is_finite() {
+        return Err(invalid_estimate_request());
+    }
+
+    // A lower-bound Welch degree of freedom keeps the combined interval
+    // conservative without requiring another pass over the encoded frames.
+    let critical_value = conservative_t_critical_value(minimum_degrees_of_freedom)?;
+    let half_width = critical_value * residual_variance.sqrt();
+    if !half_width.is_finite() {
+        return Err(invalid_estimate_request());
+    }
+
+    let predicted_residual = finite_u64(residual_prediction, f64::round)?;
+    let lower_residual = finite_u64((residual_prediction - half_width).max(0.0), f64::floor)?;
+    let upper_residual = finite_u64(residual_prediction + half_width, f64::ceil)?;
+    let predicted_bytes = fixed_overhead
+        .checked_add(predicted_residual)
+        .ok_or_else(invalid_estimate_request)?;
+    let lower_bytes = fixed_overhead
+        .checked_add(lower_residual)
+        .ok_or_else(invalid_estimate_request)?;
+    let upper_bytes = fixed_overhead
+        .checked_add(upper_residual)
+        .ok_or_else(invalid_estimate_request)?;
+    if lower_bytes > predicted_bytes || predicted_bytes > upper_bytes {
+        return Err(invalid_estimate_request());
+    }
+    Ok(ByteInterval {
+        lower_bytes,
+        predicted_bytes,
+        upper_bytes,
+        confidence: sampled_interval_confidence(
+            lower_bytes,
+            predicted_bytes,
+            upper_bytes,
+            used_scale_floor,
+        ),
     })
 }
 
@@ -1419,6 +1882,7 @@ pub(crate) struct EstimateWorkloadCounters {
 }
 
 impl EstimateWorkloadCounters {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sampled_transform_count(self) -> usize {
         self.proxy_transforms + self.measurement_transforms
     }
@@ -1456,28 +1920,42 @@ fn scaled_sequence_frame(
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn select_extreme_transition_positions(
     sequence: &PreparedCandidateSequence<'_, '_>,
     context: &OperationContext,
     limit: usize,
 ) -> Result<Vec<usize>, PipelineError> {
-    select_extreme_transition_positions_with_workload(
+    let proxies = transition_proxy_scores_with_workload(
         sequence,
         context,
-        limit,
+        &mut EstimateWorkloadCounters::default(),
+    )?;
+    Ok(select_extreme_transition_positions_from_proxies(
+        &proxies, limit,
+    ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn transition_proxy_scores(
+    sequence: &PreparedCandidateSequence<'_, '_>,
+    context: &OperationContext,
+) -> Result<Vec<(usize, u64)>, PipelineError> {
+    transition_proxy_scores_with_workload(
+        sequence,
+        context,
         &mut EstimateWorkloadCounters::default(),
     )
 }
 
-fn select_extreme_transition_positions_with_workload(
+fn transition_proxy_scores_with_workload(
     sequence: &PreparedCandidateSequence<'_, '_>,
     context: &OperationContext,
-    limit: usize,
     workload: &mut EstimateWorkloadCounters,
-) -> Result<Vec<usize>, PipelineError> {
+) -> Result<Vec<(usize, u64)>, PipelineError> {
     context.checkpoint()?;
     let frame_count = sequence.frames.len();
-    if frame_count <= 1 || limit == 0 {
+    if frame_count <= 1 {
         return Ok(Vec::new());
     }
     let mut previous = scaled_sequence_frame(sequence, 0)?;
@@ -1502,28 +1980,41 @@ fn select_extreme_transition_positions_with_workload(
             .try_fold(0_u64, |count, _| {
                 count.checked_add(1).ok_or_else(invalid_estimate_request)
             })?;
-        let proxy = region_area
-            .checked_add(changed_bytes)
-            .ok_or_else(invalid_estimate_request)?;
+        let proxy = if changed_bytes == 0 {
+            0
+        } else {
+            region_area
+                .checked_add(changed_bytes)
+                .ok_or_else(invalid_estimate_request)?
+        };
         proxies.push((position, proxy));
         previous = current;
     }
-    proxies.sort_by(
+    Ok(proxies)
+}
+
+fn select_extreme_transition_positions_from_proxies(
+    proxies: &[(usize, u64)],
+    limit: usize,
+) -> Vec<usize> {
+    let mut ranked = proxies.to_vec();
+    ranked.sort_by(
         |(left_position, left_proxy), (right_position, right_proxy)| {
             right_proxy
                 .cmp(left_proxy)
                 .then_with(|| left_position.cmp(right_position))
         },
     );
-    let mut selected = proxies
+    let mut selected = ranked
         .into_iter()
-        .take(limit.min(frame_count - 1))
+        .take(limit.min(proxies.len()))
         .map(|(position, _)| position)
         .collect::<Vec<_>>();
     selected.sort_unstable();
-    Ok(selected)
+    selected
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn measure_sampled_apng_parts(
     sequence: &PreparedCandidateSequence<'_, '_>,
     measured_transition_positions: &BTreeSet<usize>,
@@ -1604,6 +2095,7 @@ fn measure_sampled_apng_parts_with_workload(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn count_full_candidate_apng(
     sequence: &PreparedCandidateSequence<'_, '_>,
     context: &OperationContext,
@@ -1688,21 +2180,18 @@ pub(crate) fn estimate_candidate_size_with_workload(
         ));
     }
 
-    let extremes =
-        select_extreme_transition_positions_with_workload(sequence, context, 2, workload)?;
+    let transition_proxies = transition_proxy_scores_with_workload(sequence, context, workload)?;
+    let extremes = select_extreme_transition_positions_from_proxies(&transition_proxies, 2);
     if extremes.len() != 2 {
         return Err(invalid_estimate_request());
     }
     let extreme_set = extremes.iter().copied().collect::<BTreeSet<_>>();
-    let residual_positions = (1..frame_count)
-        .filter(|position| !extreme_set.contains(position))
-        .collect::<Vec<_>>();
-    let sampled_ranks =
-        sample_positions_without_replacement(residual_positions.len(), 9, sample_seed)?;
-    let sampled_positions = sampled_ranks
+    let residual_proxies = transition_proxies
         .into_iter()
-        .map(|rank| residual_positions[rank])
-        .collect::<BTreeSet<_>>();
+        .filter(|(position, _)| !extreme_set.contains(position))
+        .collect::<Vec<_>>();
+    let sampled_positions =
+        sample_proxy_stratified_positions_without_replacement(&residual_proxies, 9, sample_seed)?;
     if sampled_positions
         .iter()
         .any(|position| extreme_set.contains(position))
@@ -1734,12 +2223,13 @@ pub(crate) fn estimate_candidate_size_with_workload(
                 .transition_bytes
                 .get(position)
                 .copied()
+                .map(|contribution| (*position, contribution))
                 .ok_or_else(invalid_estimate_request)
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let interval = estimate_residual_interval(
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let interval = estimate_proxy_stratified_residual_interval(
+        &residual_proxies,
         &sampled_contributions,
-        residual_positions.len(),
         fixed_bytes,
     )?;
     let measured_contribution_count =
@@ -1777,6 +2267,7 @@ pub(crate) fn probe_candidate_size_with_workload(
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn estimate_static_png(
     input_path: &Path,
     crop: Option<&CropRegion>,

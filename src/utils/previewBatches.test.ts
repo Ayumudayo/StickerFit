@@ -25,7 +25,10 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function descriptor(currentSourceFrameId: number, sourceFrameIds: number[]): PreviewBatchDescriptor {
+function descriptor(
+  currentSourceFrameId: number,
+  sourceFrameIds: number[],
+): PreviewBatchDescriptor {
   return {
     fingerprint: "source-a",
     currentSourceFrameId,
@@ -45,7 +48,9 @@ describe("chunkFramePreviewIds", () => {
   });
 
   it("drops invalid IDs without reordering the remaining demand", () => {
-    expect(chunkFramePreviewIds([3, 0, -1, 3, 2, Number.NaN, 1])).toEqual([[3, 2, 1]]);
+    expect(chunkFramePreviewIds([3, 0, -1, 3, 2, Number.NaN, 1])).toEqual([
+      [3, 2, 1],
+    ]);
   });
 });
 
@@ -89,13 +94,23 @@ describe("preview entry transitions", () => {
     const initial: PreviewEntryMap = new Map();
     const loading = markFramePreviewBatchLoading(initial, [1, 2], "batch-a");
 
-    expect(loading.get(1)).toMatchObject({ status: "loading", batchToken: "batch-a" });
-    expect(loading.get(2)).toMatchObject({ status: "loading", batchToken: "batch-a" });
+    expect(loading.get(1)).toMatchObject({
+      status: "loading",
+      batchToken: "batch-a",
+    });
+    expect(loading.get(2)).toMatchObject({
+      status: "loading",
+      batchToken: "batch-a",
+    });
     expect(loading.has(3)).toBe(false);
   });
 
   it("terminates missing success items as errors instead of stranding loading state", () => {
-    const loading = markFramePreviewBatchLoading(new Map(), [1, 2, 3], "batch-a");
+    const loading = markFramePreviewBatchLoading(
+      new Map(),
+      [1, 2, 3],
+      "batch-a",
+    );
     const settled = applyFramePreviewBatchResult(
       loading,
       [1, 2, 3],
@@ -104,7 +119,10 @@ describe("preview entry transitions", () => {
     );
 
     expect(settled.get(1)).toMatchObject({ status: "ready" });
-    expect(settled.get(2)).toEqual({ status: "error", message: "Preview unavailable" });
+    expect(settled.get(2)).toEqual({
+      status: "error",
+      message: "Preview unavailable",
+    });
     expect(settled.get(3)).toMatchObject({ status: "ready" });
   });
 
@@ -142,7 +160,9 @@ describe("preview entry transitions", () => {
       message: "decoder failed",
     });
     expect(filterFramePreviewDemand([7], failed)).toEqual([]);
-    expect(filterFramePreviewDemand([7], retryFramePreviewEntry(failed, 7))).toEqual([7]);
+    expect(
+      filterFramePreviewDemand([7], retryFramePreviewEntry(failed, 7)),
+    ).toEqual([7]);
   });
 
   it("derives preview errors from the closed workflow result without casts", () => {
@@ -150,7 +170,9 @@ describe("preview entry transitions", () => {
       /type FramePreviewBatchResult\s*=\s*Pick<\s*FramePreviewsResult,/,
     );
     expect(previewBatchesSource).not.toMatch(/errorCode:\s*string\s*\|\s*null/);
-    expect(previewBatchesSource).not.toMatch(/reasonCode:\s*string\s*\|\s*null/);
+    expect(previewBatchesSource).not.toMatch(
+      /reasonCode:\s*string\s*\|\s*null/,
+    );
     const previewErrorEntrySource = previewBatchesSource.match(
       /function previewErrorEntry\([\s\S]*?\n\}/,
     )?.[0];
@@ -179,7 +201,10 @@ describe("createPreviewBatchScheduler", () => {
     let active = 0;
     let maxActive = 0;
     const scheduler = createPreviewBatchScheduler({
-      prepareBatch: (value) => ({ ...value, sourceFrameIds: value.sourceFrameIds.slice(0, 24) }),
+      prepareBatch: (value) => ({
+        ...value,
+        sourceFrameIds: value.sourceFrameIds.slice(0, 24),
+      }),
       runBatch: async (value) => {
         operations.push(`operation-${operations.length + 1}`);
         runs.push(value);
@@ -218,7 +243,9 @@ describe("createPreviewBatchScheduler", () => {
     const runs: number[][] = [];
     const scheduler = createPreviewBatchScheduler({
       prepareBatch: (value) => {
-        const sourceFrameIds = value.sourceFrameIds.filter((id) => !blocked.has(id)).slice(0, 24);
+        const sourceFrameIds = value.sourceFrameIds
+          .filter((id) => !blocked.has(id))
+          .slice(0, 24);
         return sourceFrameIds.length > 0 ? { ...value, sourceFrameIds } : null;
       },
       runBatch: async (value) => {
@@ -241,7 +268,9 @@ describe("createPreviewBatchScheduler", () => {
     const runs: number[][] = [];
     const scheduler = createPreviewBatchScheduler({
       prepareBatch: (value) => {
-        const sourceFrameIds = value.sourceFrameIds.filter((id) => !ready.has(id)).slice(0, 24);
+        const sourceFrameIds = value.sourceFrameIds
+          .filter((id) => !ready.has(id))
+          .slice(0, 24);
         return sourceFrameIds.length > 0 ? { ...value, sourceFrameIds } : null;
       },
       runBatch: async (value) => {
@@ -250,11 +279,18 @@ describe("createPreviewBatchScheduler", () => {
       },
     });
 
-    scheduler.schedule(descriptor(1, Array.from({ length: 50 }, (_, index) => index + 1)));
+    scheduler.schedule(
+      descriptor(
+        1,
+        Array.from({ length: 50 }, (_, index) => index + 1),
+      ),
+    );
     await scheduler.whenIdle();
 
     expect(runs.map((ids) => ids.length)).toEqual([24, 24, 2]);
-    expect(runs.flat()).toEqual(Array.from({ length: 50 }, (_, index) => index + 1));
+    expect(runs.flat()).toEqual(
+      Array.from({ length: 50 }, (_, index) => index + 1),
+    );
   });
 
   it("aborts active work and blocks stale commit without clearing a fresh active generation", async () => {
@@ -277,8 +313,15 @@ describe("createPreviewBatchScheduler", () => {
     scheduler.schedule(descriptor(2, [2]));
     scheduler.reset("source-b");
     expect(activeSignals[0]?.aborted).toBe(true);
-    expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, pendingCount: 0 });
-    scheduler.schedule({ fingerprint: "source-b", currentSourceFrameId: 9, sourceFrameIds: [9] });
+    expect(scheduler.snapshot()).toMatchObject({
+      activeCount: 0,
+      pendingCount: 0,
+    });
+    scheduler.schedule({
+      fingerprint: "source-b",
+      currentSourceFrameId: 9,
+      sourceFrameIds: [9],
+    });
 
     stale.resolve("stale-a");
     await vi.waitFor(() => expect(runs).toEqual(["source-a", "source-b"]));

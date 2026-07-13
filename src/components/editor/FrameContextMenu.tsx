@@ -52,9 +52,9 @@ type ContextMenuItem = {
 
 function findAnchorFrameElement(instanceId: string) {
   return (
-    Array.from(document.querySelectorAll<HTMLElement>("[data-instance-id]")).find(
-      (element) => element.dataset.instanceId === instanceId,
-    ) ?? null
+    Array.from(
+      document.querySelectorAll<HTMLElement>("[data-instance-id]"),
+    ).find((element) => element.dataset.instanceId === instanceId) ?? null
   );
 }
 
@@ -144,14 +144,16 @@ export function FrameContextMenu({
     ],
   ];
   const items = sections.flat();
-  const enabledIndices = items.flatMap((item, index) => (item.disabled ? [] : [index]));
+  const enabledIndices = items.flatMap((item, index) =>
+    item.disabled ? [] : [index],
+  );
   const enabledIndicesKey = enabledIndices.join(":");
   const [activeIndex, setActiveIndex] = useState(() => enabledIndices[0] ?? -1);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const openerRef = useRef<HTMLElement | null>(null);
   const rovingIndex = enabledIndices.includes(activeIndex)
     ? activeIndex
-    : enabledIndices[0] ?? -1;
+    : (enabledIndices[0] ?? -1);
 
   useLayoutEffect(() => {
     const menu = frameContextMenuRef.current;
@@ -179,7 +181,9 @@ export function FrameContextMenu({
 
         const fallback =
           findAnchorFrameElement(frameContextMenu.anchorInstanceId) ??
-          document.querySelector<HTMLElement>("[role='option'][tabindex='0']") ??
+          document.querySelector<HTMLElement>(
+            "[role='option'][tabindex='0']",
+          ) ??
           document.querySelector<HTMLElement>(
             ".frameRailEmptyState button:not(:disabled)",
           ) ??
@@ -210,7 +214,8 @@ export function FrameContextMenu({
     }
     const currentPosition = Math.max(0, enabledIndices.indexOf(rovingIndex));
     const nextPosition =
-      (currentPosition + direction + enabledIndices.length) % enabledIndices.length;
+      (currentPosition + direction + enabledIndices.length) %
+      enabledIndices.length;
     const nextIndex = enabledIndices[nextPosition];
     if (nextIndex !== undefined) {
       focusItem(nextIndex);
@@ -281,7 +286,9 @@ export function FrameContextMenu({
           sectionOffset += section.length;
           return (
             <div role="presentation" key={sectionIndex}>
-              {sectionIndex > 0 ? <div className="contextMenuDivider" role="separator" /> : null}
+              {sectionIndex > 0 ? (
+                <div className="contextMenuDivider" role="separator" />
+              ) : null}
               <div className="contextMenuGrid" role="presentation">
                 {section.map((item, itemIndex) => {
                   const index = startIndex + itemIndex;

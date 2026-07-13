@@ -9,7 +9,9 @@ import selectorSource from "./useMediaInputSelector.ts?raw";
 
 function sourceBlock(source: string, startMarker: string, endMarker: string) {
   const start = source.indexOf(startMarker);
-  expect(start, `missing start marker: ${startMarker}`).toBeGreaterThanOrEqual(0);
+  expect(start, `missing start marker: ${startMarker}`).toBeGreaterThanOrEqual(
+    0,
+  );
   const end = source.indexOf(endMarker, start + startMarker.length);
   expect(end, `missing end marker: ${endMarker}`).toBeGreaterThan(start);
   return source.slice(start, end);
@@ -30,15 +32,19 @@ describe("media operation AbortController ownership", () => {
       "const runBoundedSearch = useCallback",
     );
     expect(block).toContain("planAbortControllerRef.current?.abort()");
-    expect(block.indexOf("planAbortControllerRef.current?.abort()")).toBeLessThan(
-      block.indexOf("const controller = new AbortController()"),
-    );
+    expect(
+      block.indexOf("planAbortControllerRef.current?.abort()"),
+    ).toBeLessThan(block.indexOf("const controller = new AbortController()"));
     expect(block).toContain("searchAbortControllerRef.current?.abort()");
     expect(block).toContain("const operationId = createMediaOperationId()");
-    expect(block).toMatch(/buildOptimizerPlan\(request,\s*\{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/);
+    expect(block).toMatch(
+      /buildOptimizerPlan\(request,\s*\{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/,
+    );
     expect(block).toContain("onProgress:");
     expect(block).toContain("isCurrentProgressUpdate");
-    expect(block).toMatch(/if \(planAbortControllerRef\.current === controller\) \{\s*planAbortControllerRef\.current = null;\s*\}/);
+    expect(block).toMatch(
+      /if \(planAbortControllerRef\.current === controller\) \{\s*planAbortControllerRef\.current = null;\s*\}/,
+    );
   });
 
   it("replaces same-kind search ownership and gates progress before exact-owner cleanup", () => {
@@ -48,14 +54,23 @@ describe("media operation AbortController ownership", () => {
       "const cancelOptimizerSearch = useCallback",
     );
     expect(block).toContain("searchAbortControllerRef.current?.abort()");
-    expect(block.indexOf("searchAbortControllerRef.current?.abort()")).toBeLessThan(
-      block.indexOf("const controller = new AbortController()"),
-    );
+    expect(block).toContain("planAbortControllerRef.current?.abort()");
+    expect(block).toContain("planTicketRef.current += 1");
+    expect(
+      block.indexOf("planAbortControllerRef.current?.abort()"),
+    ).toBeLessThan(block.indexOf("const controller = new AbortController()"));
+    expect(
+      block.indexOf("searchAbortControllerRef.current?.abort()"),
+    ).toBeLessThan(block.indexOf("const controller = new AbortController()"));
     expect(block).toContain("const operationId = createMediaOperationId()");
-    expect(block).toMatch(/runOptimizerSearch\(request,\s*\{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/);
+    expect(block).toMatch(
+      /runOptimizerSearch\(request,\s*\{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/,
+    );
     expect(block).toContain("onProgress:");
     expect(block).toContain("isCurrentProgressUpdate");
-    expect(block).toMatch(/if \(searchAbortControllerRef\.current === controller\) \{\s*searchAbortControllerRef\.current = null;\s*\}/);
+    expect(block).toMatch(
+      /if \(searchAbortControllerRef\.current === controller\) \{\s*searchAbortControllerRef\.current = null;\s*\}/,
+    );
   });
 
   it("replaces same-kind conversion ownership and cleans only the exact owner", () => {
@@ -65,14 +80,18 @@ describe("media operation AbortController ownership", () => {
       "    runtime,",
     );
     expect(block).toContain("conversionAbortControllerRef.current?.abort()");
-    expect(block.indexOf("conversionAbortControllerRef.current?.abort()")).toBeLessThan(
-      block.indexOf("const controller = new AbortController()"),
-    );
+    expect(
+      block.indexOf("conversionAbortControllerRef.current?.abort()"),
+    ).toBeLessThan(block.indexOf("const controller = new AbortController()"));
     expect(block).toContain("const operationId = createMediaOperationId()");
-    expect(block).toMatch(/convertStaticImageToPng\(request,\s*\{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/);
+    expect(block).toMatch(
+      /convertStaticImageToPng\(request,\s*\{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/,
+    );
     expect(block).toContain("onProgress:");
     expect(block).toContain("isCurrentProgressUpdate");
-    expect(block).toMatch(/if \(conversionAbortControllerRef\.current === controller\) \{\s*conversionAbortControllerRef\.current = null;\s*\}/);
+    expect(block).toMatch(
+      /if \(conversionAbortControllerRef\.current === controller\) \{\s*conversionAbortControllerRef\.current = null;\s*\}/,
+    );
   });
 
   it("gates progress by owner, ticket, fingerprint, mount, and loading revision", () => {
@@ -89,18 +108,35 @@ describe("media operation AbortController ownership", () => {
     expect(block).toContain("getCurrentWorkflowFingerprints()[kind]");
 
     for (const [start, end, stateName] of [
-      ["const buildPlan = useCallback", "const runBoundedSearch = useCallback", "setPlanState"],
-      ["const runBoundedSearch = useCallback", "const cancelOptimizerSearch = useCallback", "setSearchState"],
-      ["const convertStaticImageToPng = useCallback", "    runtime,", "setConversionState"],
+      [
+        "const buildPlan = useCallback",
+        "const runBoundedSearch = useCallback",
+        "setPlanState",
+      ],
+      [
+        "const runBoundedSearch = useCallback",
+        "const cancelOptimizerSearch = useCallback",
+        "setSearchState",
+      ],
+      [
+        "const convertStaticImageToPng = useCallback",
+        "    runtime,",
+        "setConversionState",
+      ],
     ] as const) {
       const operation = sourceBlock(controllerSource, start, end);
       const callbackStart = operation.indexOf(`${stateName}((current) =>`);
-      expect(callbackStart, `${stateName} progress callback`).toBeGreaterThanOrEqual(0);
+      expect(
+        callbackStart,
+        `${stateName} progress callback`,
+      ).toBeGreaterThanOrEqual(0);
       const callback = operation.slice(callbackStart);
       expect(callback).toContain('current.status === "loading"');
       expect(callback).toContain("current.revision === stateRevision");
       expect(callback).toContain("current.fingerprint === fingerprint");
-      expect(callback).toContain("progress,");
+      expect(callback).toMatch(
+        /\?\s*\{\s*\.\.\.current,\s*progress,?\s*\}\s*:\s*current/,
+      );
     }
   });
 
@@ -112,7 +148,9 @@ describe("media operation AbortController ownership", () => {
     );
     expect(invalidation).toContain("planAbortControllerRef.current?.abort()");
     expect(invalidation).toContain("searchAbortControllerRef.current?.abort()");
-    expect(invalidation).toContain("conversionAbortControllerRef.current?.abort()");
+    expect(invalidation).toContain(
+      "conversionAbortControllerRef.current?.abort()",
+    );
 
     const reset = sourceBlock(
       controllerSource,
@@ -150,20 +188,47 @@ describe("media operation AbortController ownership", () => {
       "useEffect(() =>",
     );
     expect(inspect).toContain("inspectionAbortControllerRef.current?.abort()");
-    expect(inspect.indexOf("inspectionAbortControllerRef.current?.abort()")).toBeLessThan(
-      inspect.indexOf("const controller = new AbortController()"),
-    );
+    expect(
+      inspect.indexOf("inspectionAbortControllerRef.current?.abort()"),
+    ).toBeLessThan(inspect.indexOf("const controller = new AbortController()"));
     expect(inspect).toContain("const operationId = createMediaOperationId()");
-    expect(inspect).toMatch(/runtime\.inspectInput\(source, locale, \{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/);
-    expect(inspect).toMatch(/if \(inspectionAbortControllerRef\.current === controller\) \{\s*inspectionAbortControllerRef\.current = null;\s*\}/);
+    expect(inspect).toMatch(
+      /runtime\.inspectInput\(source, locale, \{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/,
+    );
+    expect(inspect).toMatch(
+      /if \(inspectionAbortControllerRef\.current === controller\) \{\s*inspectionAbortControllerRef\.current = null;\s*\}/,
+    );
 
-    const invalidateIndex = selectorSource.indexOf("requestLifecycle.invalidate()");
+    const invalidateIndex = selectorSource.indexOf(
+      "requestLifecycle.invalidate()",
+    );
     expect(invalidateIndex).toBeGreaterThanOrEqual(0);
     const unmount = selectorSource.slice(
       Math.max(0, invalidateIndex - 200),
       selectorSource.indexOf("const pickInputFile", invalidateIndex),
     );
     expect(unmount).toContain("inspectionAbortControllerRef.current?.abort()");
+  });
+
+  it("keeps the editor-session commit callback stable across ordinary App renders", () => {
+    const callback = sourceBlock(
+      appSource,
+      "const handleCommitEditorSession = useCallback",
+      "const mediaWorkflow = useMediaWorkflowController",
+    );
+    expect(callback).toContain("setEditorSessionKey((current) => current + 1)");
+    expect(callback).toMatch(/\}, \[\]\);\s*$/);
+
+    const wiring = sourceBlock(
+      appSource,
+      "const mediaWorkflow = useMediaWorkflowController",
+      "const {",
+    );
+    expect(wiring).toContain(
+      "onCommitEditorSession: handleCommitEditorSession",
+    );
+    expect(wiring).not.toMatch(/onCommitEditorSession:\s*\(\)\s*=>/);
+    expect(selectorSource).toContain("}, [inspectSource, runtime]);");
   });
 
   it("keeps App preview request IDs and effect-owned operation cancellation", () => {
@@ -175,7 +240,9 @@ describe("media operation AbortController ownership", () => {
     expect(effect).toContain("framePreviewRequestIdRef");
     expect(effect).toContain("const controller = new AbortController()");
     expect(effect).toContain("const operationId = createMediaOperationId()");
-    expect(effect).toMatch(/extractFramePreviews\(request, \{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/);
+    expect(effect).toMatch(
+      /extractFramePreviews\(request, \{[\s\S]*?operationId,[\s\S]*?signal: controller\.signal/,
+    );
     expect(effect).toContain("window.clearTimeout(timeoutId)");
     expect(effect).toContain("controller.abort()");
   });
@@ -209,7 +276,7 @@ describe("media operation AbortController ownership", () => {
     );
     expectCentralCommand(inspect, "inspect_input_media");
     expect(inspect).toMatch(
-      /"inspect_input_media",\s*\{\s*inputPath: source\.path,\s*locale,\s*\},\s*options,/,
+      /"inspect_input_media",\s*\{\s*inputPath: source\.path,\s*locale,\s*\},\s*options,?\s*\)/,
     );
 
     const plan = sourceBlock(
@@ -218,7 +285,9 @@ describe("media operation AbortController ownership", () => {
       "async runOptimizerSearch(",
     );
     expectCentralCommand(plan, "build_optimizer_plan");
-    expect(plan).toMatch(/"build_optimizer_plan",\s*\{ request \},\s*options,/);
+    expect(plan).toMatch(
+      /"build_optimizer_plan",\s*\{ request \},\s*options,?\s*\)/,
+    );
 
     const search = sourceBlock(
       desktop,
@@ -226,7 +295,9 @@ describe("media operation AbortController ownership", () => {
       "async convertStaticImageToPng(",
     );
     expectCentralCommand(search, "run_optimizer_search");
-    expect(search).toMatch(/"run_optimizer_search",\s*\{ request \},\s*options,/);
+    expect(search).toMatch(
+      /"run_optimizer_search",\s*\{ request \},\s*options,?\s*\)/,
+    );
 
     const conversion = sourceBlock(
       desktop,
@@ -235,7 +306,7 @@ describe("media operation AbortController ownership", () => {
     );
     expectCentralCommand(conversion, "convert_static_image_to_png");
     expect(conversion).toMatch(
-      /"convert_static_image_to_png",\s*\{ request \},\s*options,/,
+      /"convert_static_image_to_png",\s*\{ request \},\s*options,?\s*\)/,
     );
 
     const preview = sourceBlock(
@@ -245,7 +316,7 @@ describe("media operation AbortController ownership", () => {
     );
     expectCentralCommand(preview, "extract_frame_preview");
     expect(preview).toMatch(
-      /"extract_frame_preview",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameId: request\.sourceFrameId,\s*sourceWidth: request\.sourceWidth,\s*sourceHeight: request\.sourceHeight,\s*locale: request\.locale,\s*\},\s*options,/,
+      /"extract_frame_preview",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameId: request\.sourceFrameId,\s*sourceWidth: request\.sourceWidth,\s*sourceHeight: request\.sourceHeight,\s*locale: request\.locale,\s*\},\s*options,?\s*\)/,
     );
 
     const previews = sourceBlock(
@@ -255,7 +326,7 @@ describe("media operation AbortController ownership", () => {
     );
     expectCentralCommand(previews, "extract_frame_previews");
     expect(previews).toMatch(
-      /"extract_frame_previews",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameIds: request\.sourceFrameIds,\s*sourceWidth: request\.sourceWidth,\s*sourceHeight: request\.sourceHeight,\s*locale: request\.locale,\s*\},\s*options,/,
+      /"extract_frame_previews",\s*\{\s*inputPath: request\.inputPath,\s*sourceRevision: request\.sourceRevision,\s*sourceFrameIds: request\.sourceFrameIds,\s*sourceWidth: request\.sourceWidth,\s*sourceHeight: request\.sourceHeight,\s*locale: request\.locale,\s*\},\s*options,?\s*\)/,
     );
 
     const folder = sourceBlock(
@@ -281,6 +352,17 @@ describe("media operation AbortController ownership", () => {
     );
     expect(plannerError).toContain('latestWorkflowState?.status === "error"');
     expect(plannerError).not.toContain('status === "cancelled"');
-    expect(plannerError).not.toContain('mediaOperationMessage(locale, "cancelled"');
+    expect(plannerError).not.toContain(
+      'mediaOperationMessage(locale, "cancelled"',
+    );
+  });
+
+  it("returns result envelopes only for canonical ready settlements", () => {
+    expect(
+      controllerSource.match(/return nextState\.status === "ready"/g),
+    ).toHaveLength(3);
+    expect(controllerSource).not.toContain(
+      'return nextState.status === "cancelled"',
+    );
   });
 });

@@ -70,7 +70,9 @@ export function PreviewUtilityActions({
     : timelineFrameCount === 0
       ? copy.selectFramesFirst
       : undefined;
-  const staticImageDisabledReason = !canConvertToPng ? copy.desktopOnlyFeature : undefined;
+  const staticImageDisabledReason = !canConvertToPng
+    ? copy.desktopOnlyFeature
+    : undefined;
 
   if (isStaticImage) {
     return (
@@ -114,7 +116,9 @@ export function PreviewUtilityActions({
             }
             onClick={onConvertToPng}
           >
-            <span>{conversionLoading ? copy.convertingToPng : copy.convertToPng}</span>
+            <span>
+              {conversionLoading ? copy.convertingToPng : copy.convertToPng}
+            </span>
             <ExpandIcon size={18} className="ctaIcon gapIcon" />
           </button>
         </div>
@@ -128,7 +132,11 @@ export function PreviewUtilityActions({
         <button
           className="secondaryAction previewUtilityButton"
           type="button"
-          disabled={!supportsDesktopProcessing || planLoading || timelineFrameCount === 0}
+          disabled={
+            !supportsDesktopProcessing ||
+            planLoading ||
+            timelineFrameCount === 0
+          }
           title={previewCandidatesDisabledReason}
           aria-label={
             previewCandidatesDisabledReason
@@ -152,7 +160,9 @@ export function PreviewUtilityActions({
           aria-controls={advancedSettingsPanelId}
           onClick={onToggleAdvancedSettings}
         >
-          {activeDockPanel === "settings" ? copy.hideAdvancedSettings : copy.showAdvancedSettings}
+          {activeDockPanel === "settings"
+            ? copy.hideAdvancedSettings
+            : copy.showAdvancedSettings}
         </button>
         {hasSearchResult ? (
           <button
@@ -162,7 +172,9 @@ export function PreviewUtilityActions({
             aria-controls={resultsPanelId}
             onClick={onToggleResults}
           >
-            {activeDockPanel === "results" ? copy.hideResults : copy.viewResults}
+            {activeDockPanel === "results"
+              ? copy.hideResults
+              : copy.viewResults}
           </button>
         ) : null}
       </div>
@@ -211,7 +223,9 @@ export function PreviewUtilityActions({
           }
           onClick={searchLoading ? onCancelOptimizer : onRunOptimizer}
         >
-          <span>{searchLoading ? copy.cancelOptimizer : copy.runOptimizer}</span>
+          <span>
+            {searchLoading ? copy.cancelOptimizer : copy.runOptimizer}
+          </span>
           <ExpandIcon size={18} className="ctaIcon gapIcon" />
         </button>
       </div>

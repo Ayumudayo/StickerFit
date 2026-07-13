@@ -100,7 +100,10 @@ export function inputMediaLabel(inputPath: string | null, fallback: string) {
   }
 
   const lastDot = inputPath.lastIndexOf(".");
-  const lastSlash = Math.max(inputPath.lastIndexOf("\\"), inputPath.lastIndexOf("/"));
+  const lastSlash = Math.max(
+    inputPath.lastIndexOf("\\"),
+    inputPath.lastIndexOf("/"),
+  );
 
   if (lastDot < 0 || lastDot < lastSlash) {
     return fallback;
@@ -132,7 +135,10 @@ export function stopReasonLabel(reason: string | null, copy: StopReasonCopy) {
   }
 }
 
-export function selectionReasonLabel(reason: string | null, copy: SelectionReasonCopy) {
+export function selectionReasonLabel(
+  reason: string | null,
+  copy: SelectionReasonCopy,
+) {
   switch (reason) {
     case "best_within_limit":
       return copy.selectionReasonBestWithinLimit;
@@ -145,7 +151,10 @@ export function selectionReasonLabel(reason: string | null, copy: SelectionReaso
   }
 }
 
-export function statusText(attempt: AttemptStatusFields, copy: AttemptStatusCopy) {
+export function statusText(
+  attempt: AttemptStatusFields,
+  copy: AttemptStatusCopy,
+) {
   if (attempt.skipped) {
     return copy.skipped;
   }
@@ -172,4 +181,3 @@ export function statusClassName(attempt: AttemptStatusFields) {
 
   return "badge badgeWarn";
 }
-

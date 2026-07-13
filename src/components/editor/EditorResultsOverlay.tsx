@@ -39,16 +39,20 @@ export function EditorResultsOverlay({
     );
   }
 
-  const selectedCandidateId = searchResult.winningCandidateId ?? searchResult.closestCandidateId;
+  const selectedCandidateId =
+    searchResult.winningCandidateId ?? searchResult.closestCandidateId;
   const selectedAttempt = selectedCandidateId
-    ? searchResult.attempts.find((attempt) => attempt.candidateId === selectedCandidateId) ?? null
+    ? (searchResult.attempts.find(
+        (attempt) => attempt.candidateId === selectedCandidateId,
+      ) ?? null)
     : null;
   const bestOutputPathLabel = searchResult.bestOutputPath
     ? compactPathLabel(searchResult.bestOutputPath, 72)
     : null;
-  const representativeFailure = searchResult.attempts.find(
-    (attempt) => !attempt.skipped && attempt.errorCode !== null,
-  ) ?? null;
+  const representativeFailure =
+    searchResult.attempts.find(
+      (attempt) => !attempt.skipped && attempt.errorCode !== null,
+    ) ?? null;
 
   return (
     <section className="editorResultsOverlay" aria-live="polite">
@@ -66,7 +70,10 @@ export function EditorResultsOverlay({
       ) : null}
 
       {representativeFailure ? (
-        <section className="editorResultsSection resultRepresentativeError" role="alert">
+        <section
+          className="editorResultsSection resultRepresentativeError"
+          role="alert"
+        >
           <p className="metaLabel">{copy.representativeError}</p>
           <p className="detailText">
             {mediaOperationMessage(
@@ -82,13 +89,17 @@ export function EditorResultsOverlay({
         <section className="editorResultsSection">
           <p className="panelLabel">{copy.selectionBasis}</p>
           <article className="editorResultsCard editorResultsCardSelected">
-            <p className="detailText">{selectionReasonLabel(searchResult.selectionReason, copy)}</p>
+            <p className="detailText">
+              {selectionReasonLabel(searchResult.selectionReason, copy)}
+            </p>
             <p className="summaryText">{selectedAttempt.summary}</p>
 
             <div className="editorResultsMetrics">
               <article className="metricPill">
                 <span className="metaLabel">{copy.bestOutput}</span>
-                <strong>{searchResult.bestWithinLimit ? copy.fits : copy.over}</strong>
+                <strong>
+                  {searchResult.bestWithinLimit ? copy.fits : copy.over}
+                </strong>
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.actualOutputSize}</span>
@@ -96,15 +107,21 @@ export function EditorResultsOverlay({
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.duration}</span>
-                <strong>{formatDuration(searchResult.selectedDurationSeconds, locale)}</strong>
+                <strong>
+                  {formatDuration(searchResult.selectedDurationSeconds, locale)}
+                </strong>
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.sourceMatch}</span>
-                <strong>{formatSimilarityScore(selectedAttempt.sourceSimilarityScore)}</strong>
+                <strong>
+                  {formatSimilarityScore(selectedAttempt.sourceSimilarityScore)}
+                </strong>
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.elapsedTime}</span>
-                <strong>{formatElapsedTime(selectedAttempt.elapsedMs, locale)}</strong>
+                <strong>
+                  {formatElapsedTime(selectedAttempt.elapsedMs, locale)}
+                </strong>
               </article>
             </div>
 
@@ -116,7 +133,9 @@ export function EditorResultsOverlay({
                 <button
                   className="secondaryAction"
                   type="button"
-                  onClick={() => onOpenOutputFolder(searchResult.bestOutputPath)}
+                  onClick={() =>
+                    onOpenOutputFolder(searchResult.bestOutputPath)
+                  }
                 >
                   {copy.openOutputFolder}
                 </button>
@@ -128,8 +147,12 @@ export function EditorResultsOverlay({
 
       <section className="editorResultsSection">
         <p className="panelLabel">{copy.attemptLog}</p>
-        <p className="summaryText">{selectionReasonLabel(searchResult.selectionReason, copy)}</p>
-        <p className="detailText">{stopReasonLabel(searchResult.stopReason, copy)}</p>
+        <p className="summaryText">
+          {selectionReasonLabel(searchResult.selectionReason, copy)}
+        </p>
+        <p className="detailText">
+          {stopReasonLabel(searchResult.stopReason, copy)}
+        </p>
 
         <div className="editorResultsAttempts">
           {searchResult.attempts.map((attempt) => {
@@ -138,13 +161,20 @@ export function EditorResultsOverlay({
               : null;
 
             return (
-              <article className="editorResultsAttemptCard" key={attempt.candidateId}>
+              <article
+                className="editorResultsAttemptCard"
+                key={attempt.candidateId}
+              >
                 <div className="editorResultsAttemptHeader">
                   <span className="rankBadge">#{attempt.rank}</span>
                   {attempt.candidateId === selectedCandidateId ? (
-                    <span className="badge badgeNeutral">{copy.selectedResult}</span>
+                    <span className="badge badgeNeutral">
+                      {copy.selectedResult}
+                    </span>
                   ) : null}
-                  <span className={statusClassName(attempt)}>{statusText(attempt, copy)}</span>
+                  <span className={statusClassName(attempt)}>
+                    {statusText(attempt, copy)}
+                  </span>
                 </div>
 
                 <h3>{attempt.summary}</h3>
@@ -160,11 +190,15 @@ export function EditorResultsOverlay({
                   </div>
                   <div>
                     <span className="metaLabel">{copy.sourceMatch}</span>
-                    <strong>{formatSimilarityScore(attempt.sourceSimilarityScore)}</strong>
+                    <strong>
+                      {formatSimilarityScore(attempt.sourceSimilarityScore)}
+                    </strong>
                   </div>
                   <div>
                     <span className="metaLabel">{copy.elapsedTime}</span>
-                    <strong>{formatElapsedTime(attempt.elapsedMs, locale)}</strong>
+                    <strong>
+                      {formatElapsedTime(attempt.elapsedMs, locale)}
+                    </strong>
                   </div>
                 </div>
 

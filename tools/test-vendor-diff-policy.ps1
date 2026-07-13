@@ -482,7 +482,7 @@ function Get-GitHubRunArtifacts {
 function Add-ProtectedGitTreeEntry {
   param(
     [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Result,
-    [Parameter(Mandatory = $true)][System.Collections.Generic.HashSet[string]]$CaseFoldedPaths,
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$CaseFoldedPaths,
     [Parameter(Mandatory = $true)]$Entry
   )
 

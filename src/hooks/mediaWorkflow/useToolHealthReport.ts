@@ -1,9 +1,6 @@
 import { useEffect, useState } from "react";
 
-import {
-  MEDIA_OPERATION_MESSAGES,
-  type Locale,
-} from "../../locales/messages";
+import { MEDIA_OPERATION_MESSAGES, type Locale } from "../../locales/messages";
 import type { AppRuntime } from "../../platform/runtime";
 import type { ToolHealthReport } from "../../types/workflow";
 
@@ -17,7 +14,10 @@ export function canonicalToolHealthFailureMessage(
   ];
 }
 
-export function useToolHealthReport(runtime: AppRuntime, initialLocale: Locale) {
+export function useToolHealthReport(
+  runtime: AppRuntime,
+  initialLocale: Locale,
+) {
   const [toolReport, setToolReport] = useState<ToolHealthReport | null>(null);
   const [toolError, setToolError] = useState<string | null>(null);
 

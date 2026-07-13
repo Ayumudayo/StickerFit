@@ -1,16 +1,25 @@
 [CmdletBinding()]
 param(
-  [string]$WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+  [string]$WorkspaceRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not $PSBoundParameters.ContainsKey("WorkspaceRoot")) {
+  $WorkspaceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+}
 
 $modulePath = Join-Path $WorkspaceRoot "tools\ffmpeg\FfmpegSourceVerification.psm1"
 Import-Module -Name $modulePath -Force
 
 $expectedEolPolicy = @(
   '/.gitattributes text eol=lf',
+  '/src-tauri/Cargo.toml text eol=lf',
+  '/src-tauri/tauri.conf.json text eol=lf',
+  '/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe -text',
+  '/tools/test-release-sidecar.ps1 text eol=lf',
+  '/tools/ffmpeg/FfmpegSourceVerification.psm1 text eol=lf',
   '/tools/ffmpeg/ffmpeg-release-signing-key.asc text eol=lf',
   '/tools/ffmpeg/ffmpeg-version.json text eol=lf',
   '/src-tauri/binaries/ffmpeg-provenance.json text eol=lf',
@@ -120,6 +129,27 @@ function Assert-NoReparsePointInTestTree {
       }
     }
   }
+}
+
+$unlaunchableNativePath = Join-Path (
+  [System.IO.Path]::GetTempPath()
+) "stickerfit-unlaunchable-$([guid]::NewGuid().ToString('N')).exe"
+try {
+  [System.IO.File]::WriteAllText(
+    $unlaunchableNativePath,
+    'This is deliberately not a native executable.',
+    (New-Object System.Text.UTF8Encoding($false))
+  )
+  Assert-Throws `
+    -Action {
+      Invoke-StrictNativeCommand `
+        -Executable $unlaunchableNativePath `
+        -FailureMessage 'Unlaunchable native fixture was rejected.' | Out-Null
+    } `
+    -MessagePattern 'Unlaunchable native fixture was rejected\. Exit code: unavailable\.'
+}
+finally {
+  Remove-Item -LiteralPath $unlaunchableNativePath -Force -ErrorAction SilentlyContinue
 }
 
 $manifest = Get-FfmpegManifest -WorkspaceRoot $WorkspaceRoot

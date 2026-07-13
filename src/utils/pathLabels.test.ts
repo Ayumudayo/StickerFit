@@ -4,7 +4,9 @@ import { compactPathLabel } from "./pathLabels";
 
 describe("compactPathLabel", () => {
   it("keeps short paths unchanged", () => {
-    expect(compactPathLabel("C:\\tmp\\sticker.png", 28)).toBe("C:\\tmp\\sticker.png");
+    expect(compactPathLabel("C:\\tmp\\sticker.png", 28)).toBe(
+      "C:\\tmp\\sticker.png",
+    );
   });
 
   it("compresses long paths around the extension", () => {

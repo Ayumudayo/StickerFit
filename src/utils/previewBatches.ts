@@ -31,14 +31,8 @@ type PreviewBatchSchedulerOptions<
   TResult,
 > = {
   prepareBatch: (descriptor: TDescriptor) => TDescriptor | null;
-  runBatch: (
-    descriptor: TDescriptor,
-    signal: AbortSignal,
-  ) => Promise<TResult>;
-  commitBatch?: (
-    descriptor: TDescriptor,
-    result: TResult,
-  ) => void;
+  runBatch: (descriptor: TDescriptor, signal: AbortSignal) => Promise<TResult>;
+  commitBatch?: (descriptor: TDescriptor, result: TResult) => void;
 };
 
 export type PreviewBatchSchedulerSnapshot = {
@@ -48,12 +42,13 @@ export type PreviewBatchSchedulerSnapshot = {
   fingerprint: string | null;
 };
 
-export type PreviewBatchScheduler<TDescriptor extends PreviewBatchDescriptor> = {
-  schedule: (descriptor: TDescriptor) => void;
-  reset: (fingerprint: string | null) => void;
-  snapshot: () => PreviewBatchSchedulerSnapshot;
-  whenIdle: () => Promise<void>;
-};
+export type PreviewBatchScheduler<TDescriptor extends PreviewBatchDescriptor> =
+  {
+    schedule: (descriptor: TDescriptor) => void;
+    reset: (fingerprint: string | null) => void;
+    snapshot: () => PreviewBatchSchedulerSnapshot;
+    whenIdle: () => Promise<void>;
+  };
 
 function isValidSourceFrameId(value: number) {
   return Number.isSafeInteger(value) && value > 0;
@@ -79,8 +74,14 @@ export function chunkFramePreviewIds(values: readonly number[]) {
   const sourceFrameIds = stableUniqueSourceFrameIds(values);
   const chunks: number[][] = [];
 
-  for (let index = 0; index < sourceFrameIds.length; index += MAX_FRAME_PREVIEW_BATCH_SIZE) {
-    chunks.push(sourceFrameIds.slice(index, index + MAX_FRAME_PREVIEW_BATCH_SIZE));
+  for (
+    let index = 0;
+    index < sourceFrameIds.length;
+    index += MAX_FRAME_PREVIEW_BATCH_SIZE
+  ) {
+    chunks.push(
+      sourceFrameIds.slice(index, index + MAX_FRAME_PREVIEW_BATCH_SIZE),
+    );
   }
 
   return chunks;
@@ -144,14 +145,20 @@ export function applyFramePreviewBatchResult(
 
   if (!result) {
     for (const sourceFrameId of requestedIds) {
-      nextEntries.set(sourceFrameId, { status: "error", message: fallbackMessage });
+      nextEntries.set(sourceFrameId, {
+        status: "error",
+        message: fallbackMessage,
+      });
     }
     return nextEntries;
   }
 
   if (!result.ok) {
     for (const sourceFrameId of requestedIds) {
-      nextEntries.set(sourceFrameId, previewErrorEntry(result, fallbackMessage));
+      nextEntries.set(
+        sourceFrameId,
+        previewErrorEntry(result, fallbackMessage),
+      );
     }
     return nextEntries;
   }
@@ -206,7 +213,10 @@ export function createPreviewBatchScheduler<
   prepareBatch,
   runBatch,
   commitBatch,
-}: PreviewBatchSchedulerOptions<TDescriptor, TResult>): PreviewBatchScheduler<TDescriptor> {
+}: PreviewBatchSchedulerOptions<
+  TDescriptor,
+  TResult
+>): PreviewBatchScheduler<TDescriptor> {
   type DrainState = {
     descriptor: TDescriptor;
     consumedSourceFrameIds: Set<number>;
@@ -242,12 +252,14 @@ export function createPreviewBatchScheduler<
   const descriptorWithSourceFrameIds = (
     descriptor: TDescriptor,
     sourceFrameIds: number[],
-  ) => ({ ...descriptor, sourceFrameIds } as TDescriptor);
+  ) => ({ ...descriptor, sourceFrameIds }) as TDescriptor;
 
   const prepareNextBatch = (state: DrainState) => {
     const remainingSourceFrameIds = stableUniqueSourceFrameIds(
       state.descriptor.sourceFrameIds,
-    ).filter((sourceFrameId) => !state.consumedSourceFrameIds.has(sourceFrameId));
+    ).filter(
+      (sourceFrameId) => !state.consumedSourceFrameIds.has(sourceFrameId),
+    );
     if (remainingSourceFrameIds.length === 0) {
       return null;
     }
@@ -260,7 +272,9 @@ export function createPreviewBatchScheduler<
     }
 
     const remainingSet = new Set(remainingSourceFrameIds);
-    const batchSourceFrameIds = stableUniqueSourceFrameIds(prepared.sourceFrameIds)
+    const batchSourceFrameIds = stableUniqueSourceFrameIds(
+      prepared.sourceFrameIds,
+    )
       .filter((sourceFrameId) => remainingSet.has(sourceFrameId))
       .slice(0, MAX_FRAME_PREVIEW_BATCH_SIZE);
     return batchSourceFrameIds.length > 0
