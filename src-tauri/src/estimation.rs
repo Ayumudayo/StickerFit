@@ -1120,8 +1120,8 @@ mod tests {
             .expect("estimate command");
         let tail = &source[start..];
         let end = tail
-            .find("\n}\n\n")
-            .expect("estimate command closing brace");
+            .find("async fn estimate_optimizer_candidates(")
+            .expect("next estimate command");
         let command = &tail[..end];
 
         assert!(command.contains("MediaOperationKind::StaticEstimate"));

@@ -89,7 +89,7 @@ jobs:
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo-audit installation failed." }
-          $version = (& cargo audit --version)
+          $version = (& cargo-audit --version)
           if ($LASTEXITCODE -ne 0 -or $version -ne "cargo-audit 0.22.2") {
             throw "Expected cargo-audit 0.22.2, got '$version'."
           }
