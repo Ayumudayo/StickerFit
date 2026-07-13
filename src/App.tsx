@@ -51,7 +51,8 @@ import {
   MESSAGES,
   type Locale,
 } from "./locales/messages";
-import { formatTimelineTime } from "./utils/timelineFrames";
+import { formatTimelineTime, microsecondsToSeconds } from "./utils/timelineFrames";
+import { shouldHandleEditorShortcut } from "./utils/keyboardShortcuts";
 import {
   applyFramePreviewBatchResult,
   chunkFramePreviewIds,
@@ -78,6 +79,22 @@ const EMPTY_WORKFLOW_FINGERPRINTS: WorkflowFingerprints = {
 const MIN_DURATION_US = 10_000;
 const FRAME_PREVIEW_LOOKAHEAD = 8;
 const EMPTY_FRAME_PREVIEW_ENTRIES: PreviewEntryMap = new Map();
+const EDITOR_INTERACTIVE_SELECTOR = [
+  "[data-editor-interactive]",
+  "input",
+  "select",
+  "textarea",
+  "button",
+  "a",
+  "[contenteditable]:not([contenteditable='false'])",
+  "[role='dialog']",
+  "[role='slider']",
+  "[role='listbox']",
+  "[role='option']",
+  "[role='menu']",
+  "[role='menuitem']",
+  "[tabindex]:not([data-editor-shortcut-surface])",
+].join(",");
 
 type FramePreviewRunResult = {
   requestId: number;
@@ -86,10 +103,6 @@ type FramePreviewRunResult = {
 
 function filterPathLabel(value: string | null, fallback: string) {
   return value?.trim() ? value : fallback;
-}
-
-function isPlainGlobalShortcut(event: KeyboardEvent) {
-  return !event.altKey && !event.ctrlKey && !event.metaKey && !event.isComposing;
 }
 
 function isSpaceShortcutKey(event: KeyboardEvent) {
@@ -187,6 +200,11 @@ export default function App() {
 
   const copy = MESSAGES[locale];
   const ui = useMemo(() => editorText(locale), [locale]);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
+
   const {
     previewKind,
     sourceDuration,
@@ -229,6 +247,7 @@ export default function App() {
     handleFramePointerDown,
     handleFrameKeyDown,
     handleFrameContextMenu,
+    closeFrameContextMenu,
     selectSingleFrame,
     selectAdjacentFrame,
     selectAllFrames,
@@ -240,6 +259,7 @@ export default function App() {
     moveSelectedFramesTo,
     moveSelectedFrames,
     reverseSelectedFrames,
+    deleteSelectedFrames,
     deleteUnselectedFrames,
     selectOddFrames,
     selectEvenFrames,
@@ -466,6 +486,8 @@ export default function App() {
     handleTimelinePointerMove,
     handleTimelinePointerEnd,
   } = playback;
+  const currentTimelineTimeUs = Math.max(0, Math.round(currentTime * 1_000_000));
+  const totalTimelineDurationUs = Math.max(0, Math.round(totalDuration * 1_000_000));
   const currentPreviewFrame = useMemo(
     () =>
       timelineFrameViews.find(
@@ -700,10 +722,27 @@ export default function App() {
 
   useEffect(() => {
     function handleGlobalKeyboardShortcuts(event: KeyboardEvent) {
+      const target = event.target instanceof Element ? event.target : null;
+      const insideEditorSurface = Boolean(
+        target?.closest("[data-editor-shortcut-surface]"),
+      );
+      const insideInteractiveSurface = Boolean(
+        target?.closest(EDITOR_INTERACTIVE_SELECTOR),
+      );
       if (
         !inspection?.ok ||
         inspection.isStaticImage ||
-        !isPlainGlobalShortcut(event)
+        !shouldHandleEditorShortcut({
+          defaultPrevented: event.defaultPrevented,
+          isComposing: event.isComposing,
+          hasModifier: event.altKey || event.ctrlKey || event.metaKey,
+          dialogOpen:
+            activeDockPanel !== null ||
+            frameDurationDialog !== null ||
+            showNthSelectionDialog,
+          insideEditorSurface,
+          insideInteractiveSurface,
+        })
       ) {
         return;
       }
@@ -713,6 +752,15 @@ export default function App() {
         event.stopPropagation();
         if (!event.repeat) {
           togglePlayback();
+        }
+        return;
+      }
+
+      if (event.key === "Delete") {
+        if (selectedInstanceIds.length > 0) {
+          event.preventDefault();
+          event.stopPropagation();
+          deleteSelectedFrames();
         }
         return;
       }
@@ -738,11 +786,15 @@ export default function App() {
       window.removeEventListener("keydown", handleGlobalKeyboardShortcuts, true);
     };
   }, [
+    activeDockPanel,
     currentFrameInstanceId,
+    deleteSelectedFrames,
+    frameDurationDialog,
     inspection?.isStaticImage,
     inspection?.ok,
     selectAdjacentFrame,
     selectedInstanceIds,
+    showNthSelectionDialog,
     togglePlayback,
   ]);
 
@@ -999,6 +1051,7 @@ export default function App() {
               editorWorkspaceStyle={editorWorkspaceStyle}
               inspection={inspection}
               previewKey={inspection.previewSrc}
+              shortcutSurfaceLabel={ui.previewTitle}
               isWebPreviewMode={isWebPreviewMode}
               webPreviewNotice={copy.webPreviewNotice}
               plannerError={plannerError}
@@ -1090,6 +1143,8 @@ export default function App() {
                 isStaticImage: inspection.isStaticImage,
                 currentTime,
                 totalDuration,
+                currentTimeUs: currentTimelineTimeUs,
+                totalDurationUs: totalTimelineDurationUs,
                 timelineFrameViews,
                 selection: selectionModel,
                 isPlaying,
@@ -1104,6 +1159,8 @@ export default function App() {
                 onPointerMove: handleTimelinePointerMove,
                 onPointerUp: handleTimelinePointerEnd,
                 onPointerCancel: handleTimelinePointerEnd,
+                onTimelineTimeChangeUs: (nextTimeUs) =>
+                  scrubTo(microsecondsToSeconds(nextTimeUs)),
                 onPreviewZoomFit: () => handlePreviewZoomModeChange("fit"),
                 onPreviewZoomStep: handlePreviewZoomStep,
                 onPreviewZoomChange: handlePreviewZoomSliderChange,
@@ -1163,6 +1220,7 @@ export default function App() {
                 hasSingleFrameSelection,
                 canDeleteUnselectedFrames,
                 hasClipboardFrames,
+                onClose: closeFrameContextMenu,
                 onOpenFrameDurationDialog: openFrameDurationDialog,
                 onSplitCurrentFrame: splitCurrentFrame,
                 onSpeedUpFrames: () => speedAdjustSelectedFrames(1 / 1.1),

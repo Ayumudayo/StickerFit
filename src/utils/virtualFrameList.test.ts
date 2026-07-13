@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  computeRovingFrameIndex,
   computeScrollTopToRevealIndex,
   computeVirtualWindow,
+  normalizeRovingFrameIndex,
 } from "./virtualFrameList";
 
 describe("computeVirtualWindow", () => {
@@ -88,6 +90,31 @@ describe("computeVirtualWindow", () => {
       expect(computeVirtualWindow(params)).toEqual({ start: 0, end: 0, offsetTop: 0 });
     }
   });
+
+  it("keeps a 1,000-item rail within the visible-plus-overscan bound", () => {
+    const viewportHeight = 8 * 48;
+    const overscan = 4;
+    const scrollTop = computeScrollTopToRevealIndex({
+      scrollTop: 0,
+      viewportHeight,
+      rowHeight: 48,
+      itemCount: 1_000,
+      index: 500,
+    });
+    const window = computeVirtualWindow({
+      scrollTop,
+      viewportHeight,
+      rowHeight: 48,
+      itemCount: 1_000,
+      overscan,
+    });
+
+    expect(scrollTop).toBe(23_664);
+    expect(window).toEqual({ start: 489, end: 505, offsetTop: 23_472 });
+    expect(window.end - window.start).toBeLessThanOrEqual(8 + overscan * 2);
+    expect(window.start).toBeLessThanOrEqual(500);
+    expect(window.end).toBeGreaterThan(500);
+  });
 });
 
 describe("computeScrollTopToRevealIndex", () => {
@@ -130,5 +157,47 @@ describe("computeScrollTopToRevealIndex", () => {
         index: 3,
       }),
     ).toBe(40);
+  });
+});
+
+describe("roving frame index", () => {
+  it("normalizes the single active tab stop without wrapping", () => {
+    expect(normalizeRovingFrameIndex(-1, 10)).toBe(0);
+    expect(normalizeRovingFrameIndex(4, 10)).toBe(4);
+    expect(normalizeRovingFrameIndex(99, 10)).toBe(9);
+    expect(normalizeRovingFrameIndex(0, 0)).toBe(-1);
+  });
+
+  it("moves with arrows and clamps at the first and last option", () => {
+    expect(
+      computeRovingFrameIndex({ activeIndex: 4, itemCount: 10, key: "ArrowUp" }),
+    ).toBe(3);
+    expect(
+      computeRovingFrameIndex({ activeIndex: 4, itemCount: 10, key: "ArrowDown" }),
+    ).toBe(5);
+    expect(
+      computeRovingFrameIndex({ activeIndex: 0, itemCount: 10, key: "ArrowUp" }),
+    ).toBe(0);
+    expect(
+      computeRovingFrameIndex({ activeIndex: 9, itemCount: 10, key: "ArrowDown" }),
+    ).toBe(9);
+  });
+
+  it("supports Home, End, and a missing active option", () => {
+    expect(
+      computeRovingFrameIndex({ activeIndex: 7, itemCount: 10, key: "Home" }),
+    ).toBe(0);
+    expect(
+      computeRovingFrameIndex({ activeIndex: 2, itemCount: 10, key: "End" }),
+    ).toBe(9);
+    expect(
+      computeRovingFrameIndex({ activeIndex: -1, itemCount: 10, key: "ArrowDown" }),
+    ).toBe(0);
+    expect(
+      computeRovingFrameIndex({ activeIndex: -1, itemCount: 10, key: "ArrowUp" }),
+    ).toBe(9);
+    expect(
+      computeRovingFrameIndex({ activeIndex: 0, itemCount: 0, key: "End" }),
+    ).toBe(-1);
   });
 });

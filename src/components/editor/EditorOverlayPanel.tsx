@@ -1,3 +1,5 @@
+import { useId, useRef } from "react";
+
 import { AdvancedDetailsPanel } from "../AdvancedDetailsPanel";
 import { CloseIcon } from "../AppIcons";
 import { EditorResultsOverlay } from "./EditorResultsOverlay";
@@ -13,6 +15,7 @@ import type {
 } from "../../types/workflow";
 import type { VersionedWorkflowState } from "../../hooks/mediaWorkflow/workflowFingerprint";
 import type { VersionedProbeState } from "../../hooks/outputSizeEstimateCoordinator";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 
 export type EditorDockPanelMode = "preview" | "results" | "settings";
 
@@ -67,6 +70,15 @@ export function EditorOverlayPanel({
   onOpenOutputFolder,
   onClose,
 }: EditorOverlayPanelProps) {
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const panelTitleId = useId();
+
+  useDialogFocus({
+    isOpen: activePanel !== null,
+    dialogRef,
+    onClose,
+  });
+
   if (!activePanel) {
     return null;
   }
@@ -93,14 +105,24 @@ export function EditorOverlayPanel({
         onClick={onClose}
       />
       <section
+        ref={dialogRef}
         className={`editorDockPanel editorDockPanel--${activePanel}`}
         aria-live="polite"
         role="dialog"
         aria-modal="true"
+        aria-labelledby={panelTitleId}
+        tabIndex={-1}
         id={panelId}
       >
         <div className="editorDockPanelHeader">
-          <p className="panelLabel">{panelLabel}</p>
+          <p
+            id={panelTitleId}
+            className="panelLabel"
+            data-dialog-initial-focus
+            tabIndex={-1}
+          >
+            {panelLabel}
+          </p>
           <button
             className="subtleAction editorDockCloseButton"
             type="button"
@@ -114,7 +136,6 @@ export function EditorOverlayPanel({
         <div className="editorDockPanelBody">
           {activePanel === "settings" ? (
             <AdvancedOptimizerSettingsPanel
-              panelId={advancedSettingsPanelId}
               layout="dock"
               copy={copy}
               optimizerGoal={optimizerGoal}

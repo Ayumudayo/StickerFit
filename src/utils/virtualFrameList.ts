@@ -17,6 +17,18 @@ type RevealIndexParams = {
   index: number;
 };
 
+export type FrameRailNavigationKey =
+  | "ArrowUp"
+  | "ArrowDown"
+  | "Home"
+  | "End";
+
+type RovingFrameIndexParams = {
+  activeIndex: number;
+  itemCount: number;
+  key: FrameRailNavigationKey;
+};
+
 export type VirtualWindow = {
   start: number;
   end: number;
@@ -47,6 +59,56 @@ function validListGeometry(
     viewportHeight > 0 &&
     rowHeight > 0 &&
     itemCount > 0
+  );
+}
+
+function normalizedItemCount(itemCount: number) {
+  if (!Number.isFinite(itemCount)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.floor(itemCount));
+}
+
+export function normalizeRovingFrameIndex(
+  activeIndex: number,
+  itemCount: number,
+) {
+  const count = normalizedItemCount(itemCount);
+  if (count === 0) {
+    return -1;
+  }
+  if (!Number.isFinite(activeIndex) || activeIndex < 0) {
+    return 0;
+  }
+
+  return clamp(Math.floor(activeIndex), 0, count - 1);
+}
+
+export function computeRovingFrameIndex({
+  activeIndex,
+  itemCount,
+  key,
+}: RovingFrameIndexParams) {
+  const count = normalizedItemCount(itemCount);
+  if (count === 0) {
+    return -1;
+  }
+  if (key === "Home") {
+    return 0;
+  }
+  if (key === "End") {
+    return count - 1;
+  }
+  if (!Number.isFinite(activeIndex) || activeIndex < 0) {
+    return key === "ArrowUp" ? count - 1 : 0;
+  }
+
+  const currentIndex = normalizeRovingFrameIndex(activeIndex, count);
+  return clamp(
+    currentIndex + (key === "ArrowDown" ? 1 : -1),
+    0,
+    count - 1,
   );
 }
 

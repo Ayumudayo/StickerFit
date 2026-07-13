@@ -21,13 +21,20 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
 button:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible,
+a[href]:focus-visible,
+[role="slider"]:focus-visible,
+[role="option"]:focus-visible,
+[role="menuitem"]:focus-visible,
+[tabindex]:not([tabindex="-1"]):focus-visible {
   outline: 2px solid rgba(246, 234, 212, 0.95);
   outline-offset: 2px;
 }
@@ -613,10 +620,14 @@ h3 {
   overflow: hidden;
 }
 
-.selectionBox:focus-visible,
+.selectionBox:focus-visible {
+  outline: 2px solid #f6ead4;
+  outline-offset: -5px;
+}
+
 .selectionHandle:focus-visible {
   outline: 2px solid #f6ead4;
-  outline-offset: 3px;
+  outline-offset: -3px;
 }
 
 .selectionGrid {

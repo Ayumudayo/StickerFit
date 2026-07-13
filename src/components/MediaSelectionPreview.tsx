@@ -1,9 +1,11 @@
 import {
   type CSSProperties,
   type DragEvent,
+  type KeyboardEvent,
   type PointerEvent,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -99,6 +101,7 @@ export function MediaSelectionPreview({
   manualZoomScale,
   onResolvedZoomChange,
 }: MediaSelectionPreviewProps) {
+  const selectionSummaryId = useId();
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -477,6 +480,124 @@ export function MediaSelectionPreview({
     setDragState(null);
   }
 
+  function keyboardCropDelta(event: KeyboardEvent<HTMLElement>) {
+    if (
+      event.nativeEvent.isComposing ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.metaKey
+    ) {
+      return null;
+    }
+
+    const bounds = overlayRef.current?.getBoundingClientRect();
+    if (!bounds || bounds.width === 0 || bounds.height === 0) {
+      return null;
+    }
+
+    const step = event.shiftKey ? 10 : 1;
+    switch (event.key) {
+      case "ArrowLeft":
+        return { x: -step / bounds.width, y: 0 };
+      case "ArrowRight":
+        return { x: step / bounds.width, y: 0 };
+      case "ArrowUp":
+        return { x: 0, y: -step / bounds.height };
+      case "ArrowDown":
+        return { x: 0, y: step / bounds.height };
+      default:
+        return null;
+    }
+  }
+
+  function handleSelectionMoveKeyDown(event: KeyboardEvent<HTMLFieldSetElement>) {
+    if (event.currentTarget !== event.target) {
+      return;
+    }
+
+    const delta = keyboardCropDelta(event);
+    if (!delta) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    onCropRegionChange(
+      nextCropRegionFromDrag({
+        dragKind: "move",
+        startX: 0,
+        startY: 0,
+        initialRegion: cropRegion,
+        pointX: delta.x,
+        pointY: delta.y,
+        lockedAspectRatio,
+        sourceWidth,
+        sourceHeight,
+      }),
+    );
+  }
+
+  function handleSelectionResizeKeyDown(
+    event: KeyboardEvent<HTMLButtonElement>,
+    resizeHandle: NonNullable<PreviewDragState["resizeHandle"]>,
+  ) {
+    const delta = keyboardCropDelta(event);
+    if (!delta) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    let resizeDelta = delta;
+    if (lockedAspectRatio && sourceWidth && sourceHeight) {
+      const horizontalDirection = resizeHandle.endsWith("e") ? 1 : -1;
+      const verticalDirection = resizeHandle.startsWith("s") ? 1 : -1;
+      if (delta.x !== 0) {
+        const signedWidthChangePx = delta.x * sourceWidth * horizontalDirection;
+        resizeDelta = {
+          x: delta.x,
+          y:
+            (signedWidthChangePx / lockedAspectRatio) * verticalDirection /
+            sourceHeight,
+        };
+      } else if (delta.y !== 0) {
+        const signedHeightChangePx = delta.y * sourceHeight * verticalDirection;
+        resizeDelta = {
+          x:
+            (signedHeightChangePx * lockedAspectRatio) * horizontalDirection /
+            sourceWidth,
+          y: delta.y,
+        };
+      }
+    }
+    const handleX = resizeHandle.endsWith("e")
+      ? cropRegion.x + cropRegion.width
+      : cropRegion.x;
+    const handleY = resizeHandle.startsWith("s")
+      ? cropRegion.y + cropRegion.height
+      : cropRegion.y;
+    onCropRegionChange(
+      nextCropRegionFromDrag({
+        dragKind: "resize",
+        startX: handleX,
+        startY: handleY,
+        initialRegion: cropRegion,
+        pointX: handleX + resizeDelta.x,
+        pointY: handleY + resizeDelta.y,
+        lockedAspectRatio,
+        sourceWidth,
+        sourceHeight,
+        resizeHandle,
+      }),
+    );
+  }
+
+  const cropSummary = selectionSummary(cropRegion, copy, sourceWidth, sourceHeight);
+  const cropPositionSummary =
+    `x ${(cropRegion.x * 100).toFixed(4)}%, ` +
+    `y ${(cropRegion.y * 100).toFixed(4)}%`;
+  const cropAccessibleSummary = `${cropSummary}; ${cropPositionSummary}`;
+
   const previewFooterText = previewFailed
     ? copy.previewUnavailable
     : [copy.previewHint, copy.previewKeyboardHint]
@@ -624,7 +745,11 @@ export function MediaSelectionPreview({
                     <fieldset
                       className="selectionBox"
                       data-selection-box="true"
+                      data-editor-interactive="true"
+                      tabIndex={0}
                       aria-label={copy.selectionRegionLabel}
+                      aria-describedby={selectionSummaryId}
+                      onKeyDown={handleSelectionMoveKeyDown}
                       style={{
                         left: `${cropRegion.x * 100}%`,
                         top: `${cropRegion.y * 100}%`,
@@ -634,33 +759,61 @@ export function MediaSelectionPreview({
                     >
                       <div className="selectionGrid" aria-hidden="true" />
                       <div className="selectionCrosshair" aria-hidden="true" />
+                      <output
+                        id={selectionSummaryId}
+                        role="status"
+                        aria-live="polite"
+                        aria-atomic="true"
+                        style={{
+                          position: "absolute",
+                          width: "1px",
+                          height: "1px",
+                          padding: 0,
+                          margin: "-1px",
+                          overflow: "hidden",
+                          clip: "rect(0, 0, 0, 0)",
+                          whiteSpace: "nowrap",
+                          border: 0,
+                          pointerEvents: "none",
+                        }}
+                      >
+                        {cropAccessibleSummary}
+                      </output>
                       <button
                         className="selectionCorner selectionCornerTopLeft selectionHandle"
                         data-handle="nw"
                         type="button"
-                        tabIndex={-1}
+                        tabIndex={0}
                         aria-label={copy.selectionHandleTopLeft}
+                        aria-describedby={selectionSummaryId}
+                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "nw")}
                       />
                       <button
                         className="selectionCorner selectionCornerTopRight selectionHandle"
                         data-handle="ne"
                         type="button"
-                        tabIndex={-1}
+                        tabIndex={0}
                         aria-label={copy.selectionHandleTopRight}
+                        aria-describedby={selectionSummaryId}
+                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "ne")}
                       />
                       <button
                         className="selectionCorner selectionCornerBottomLeft selectionHandle"
                         data-handle="sw"
                         type="button"
-                        tabIndex={-1}
+                        tabIndex={0}
                         aria-label={copy.selectionHandleBottomLeft}
+                        aria-describedby={selectionSummaryId}
+                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "sw")}
                       />
                       <button
                         className="selectionCorner selectionCornerBottomRight selectionHandle"
                         data-handle="se"
                         type="button"
-                        tabIndex={-1}
+                        tabIndex={0}
                         aria-label={copy.selectionHandleBottomRight}
+                        aria-describedby={selectionSummaryId}
+                        onKeyDown={(event) => handleSelectionResizeKeyDown(event, "se")}
                       />
                     </fieldset>
                   ) : null}

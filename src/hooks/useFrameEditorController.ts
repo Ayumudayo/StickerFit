@@ -8,6 +8,7 @@ import {
   copySelectedFrames,
   copySelectedFramesToBoundary,
   cutSelectedFrames,
+  deleteSelectedTimelineFrames,
   deleteUnselectedTimelineFrames,
   pasteClipboardFrames,
   reverseSelectedFramesInPlace,
@@ -51,6 +52,7 @@ export function useFrameEditorController({
     canDeleteUnselectedFrames,
     frameContextMenu,
     setFrameContextMenu,
+    closeFrameContextMenu,
     frameDropTarget,
     frameReorderState,
     frameTableBodyRef,
@@ -77,7 +79,7 @@ export function useFrameEditorController({
     minDurationUs,
     setTimelineFrames,
     setSelectedInstanceIds,
-    closeFrameContextMenu: () => setFrameContextMenu(null),
+    closeFrameContextMenu,
   });
   const {
     frameDurationDialog,
@@ -152,6 +154,19 @@ export function useFrameEditorController({
     setTimelineFrames((current) => deleteUnselectedTimelineFrames(current, selectedInstanceIds));
     setFrameContextMenu(null);
   }, [selectedInstanceIds, setFrameContextMenu]);
+
+  const deleteSelectedFrames = useCallback(() => {
+    if (selectedInstanceIds.length === 0) {
+      return false;
+    }
+
+    setTimelineFrames((current) =>
+      deleteSelectedTimelineFrames(current, selectedInstanceIds),
+    );
+    setSelectedInstanceIds([]);
+    setFrameContextMenu(null);
+    return true;
+  }, [selectedInstanceIds, setFrameContextMenu, setSelectedInstanceIds]);
 
   const speedAdjustSelectedFrames = useCallback(
     (factor: number) => {
@@ -389,6 +404,7 @@ export function useFrameEditorController({
     handleFramePointerDown,
     handleFrameKeyDown,
     handleFrameContextMenu,
+    closeFrameContextMenu,
     selectSingleFrame,
     selectAdjacentFrame,
     selectAllFrames,
@@ -400,6 +416,7 @@ export function useFrameEditorController({
     moveSelectedFramesTo,
     moveSelectedFrames,
     reverseSelectedFrames,
+    deleteSelectedFrames,
     deleteUnselectedFrames,
     selectOddFrames,
     selectEvenFrames,

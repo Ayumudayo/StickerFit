@@ -92,6 +92,10 @@
   opacity: 0.28;
 }
 
+.timelineSegment.is-current {
+  box-shadow: inset 0 0 0 1px rgba(246, 234, 212, 0.72);
+}
+
 .timelineTrimRange {
   position: absolute;
   top: 0;
@@ -271,7 +275,6 @@
 .framePreviewRetry:hover,
 .framePreviewRetry:focus-visible {
   background: rgba(153, 27, 27, 0.7);
-  outline: none;
 }
 
 .frameRow::before,
@@ -302,9 +305,8 @@
   background: rgba(255, 255, 255, 0.04);
 }
 
-.frameRow:focus,
 .frameRow:focus-visible {
-  outline: none;
+  outline-offset: -2px;
 }
 
 .frameRow.is-selected {

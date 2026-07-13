@@ -65,6 +65,7 @@ test("loads a still image in web preview mode", async ({ page }) => {
 
 test("does not expose a redundant image fitting mode", async ({ page }) => {
   await page.goto("/");
+  await expect(page.locator("html")).toHaveAttribute("lang", "en");
 
   await chooseInputFile(page, {
     name: "fit-mode-smoke.png",
@@ -76,6 +77,7 @@ test("does not expose a redundant image fitting mode", async ({ page }) => {
   await expect(page.getByLabel("Image fitting")).toHaveCount(0);
 
   await page.getByRole("button", { name: "KO" }).click();
+  await expect(page.locator("html")).toHaveAttribute("lang", "ko");
   await expect(
     page.getByRole("heading", { name: "디스코드용 스티커 컨버터" }),
   ).toBeVisible();
@@ -98,9 +100,185 @@ test("opens and closes the advanced settings overlay for video preview", async (
     await expect(
       overlayDialog.getByRole("heading", { name: "Advanced settings" }),
     ).toBeVisible();
+    await expect(overlayDialog.locator("[data-dialog-initial-focus]")).toBeFocused();
 
-    await overlayDialog.getByRole("button", { name: "Close panel" }).click();
+    const closeButton = overlayDialog.getByRole("button", { name: "Close panel" });
+    const lastSelect = overlayDialog.locator("select").last();
+    await page.keyboard.press("Shift+Tab");
+    await expect(lastSelect).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(closeButton).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(lastSelect).toBeFocused();
+
+    const duplicateIds = await page.evaluate(() => {
+      const counts = new Map<string, number>();
+      for (const element of document.querySelectorAll<HTMLElement>("[id]")) {
+        counts.set(element.id, (counts.get(element.id) ?? 0) + 1);
+      }
+      return [...counts.entries()].filter(([, count]) => count > 1);
+    });
+    expect(duplicateIds).toEqual([]);
+
+    await page.keyboard.press("Escape");
     await expect(overlayDialog).toHaveCount(0);
+    await expect(settingsToggle).toBeFocused();
+  } finally {
+    await rm(path.dirname(videoPath), { force: true, recursive: true });
+  }
+});
+
+test("supports keyboard timeline and crop movement without global shortcut leakage", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const videoPath = await createSmokeVideoPath();
+  try {
+    await chooseInputFile(page, videoPath);
+
+    const timeline = page.getByRole("slider", { name: "Timeline & frame controls" });
+    await expect(timeline).toHaveAttribute("aria-valuenow", "0");
+    await timeline.press("ArrowRight");
+    await expect.poll(async () => Number(await timeline.getAttribute("aria-valuenow")))
+      .toBeGreaterThan(0);
+    await timeline.press("End");
+    const maximumTimeUs = Number(await timeline.getAttribute("aria-valuemax"));
+    await expect(timeline).toHaveAttribute("aria-valuenow", String(maximumTimeUs));
+    await timeline.press("PageDown");
+    await expect(timeline).toHaveAttribute(
+      "aria-valuenow",
+      String(Math.max(0, maximumTimeUs - 1_000_000)),
+    );
+    await timeline.press("PageUp");
+    await expect(timeline).toHaveAttribute(
+      "aria-valuenow",
+      String(maximumTimeUs),
+    );
+    await timeline.press("Home");
+    await expect(timeline).toHaveAttribute("aria-valuenow", "0");
+    await timeline.press("ArrowUp");
+    await expect.poll(async () => Number(await timeline.getAttribute("aria-valuenow")))
+      .toBeGreaterThan(0);
+    await timeline.press("ArrowDown");
+    await expect(timeline).toHaveAttribute("aria-valuenow", "0");
+
+    const selectionBox = page.locator(".selectionBox");
+    const topRightHandle = page.getByRole("button", {
+      name: "Resize selection from the top right",
+    });
+    await expect(selectionBox).toHaveAttribute("tabindex", "0");
+    await expect(topRightHandle).toHaveAttribute("tabindex", "0");
+    const initialHandleBox = await topRightHandle.boundingBox();
+    expect(initialHandleBox).not.toBeNull();
+    await topRightHandle.press("Shift+ArrowLeft");
+    const resizedHandleBox = await topRightHandle.boundingBox();
+    expect(resizedHandleBox).not.toBeNull();
+    expect(resizedHandleBox!.x).toBeLessThan(initialHandleBox!.x);
+
+    const beforeMove = await selectionBox.boundingBox();
+    const liveSummary = selectionBox.locator("[role='status']");
+    const beforeMoveSummary = await liveSummary.textContent();
+    expect(beforeMove).not.toBeNull();
+    await selectionBox.press("ArrowRight");
+    const afterMove = await selectionBox.boundingBox();
+    expect(afterMove).not.toBeNull();
+    expect(afterMove!.x).toBeGreaterThan(beforeMove!.x);
+    await expect(liveSummary).not.toHaveText(beforeMoveSummary ?? "");
+
+    await page.getByLabel("Crop ratio").selectOption("1:1");
+    const lockedHandleBox = await topRightHandle.boundingBox();
+    expect(lockedHandleBox).not.toBeNull();
+    await topRightHandle.press("ArrowRight");
+    const expandedLockedHandleBox = await topRightHandle.boundingBox();
+    expect(expandedLockedHandleBox).not.toBeNull();
+    expect(expandedLockedHandleBox!.x).toBeGreaterThan(lockedHandleBox!.x);
+
+    await selectionBox.press("ArrowLeft");
+    const cropFocusStyle = await selectionBox.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { outlineStyle: style.outlineStyle, outlineOffset: style.outlineOffset };
+    });
+    expect(cropFocusStyle.outlineStyle).not.toBe("none");
+    expect(Number.parseFloat(cropFocusStyle.outlineOffset)).toBeLessThan(0);
+    await expect(page.getByRole("button", { name: "Play" })).toBeVisible();
+  } finally {
+    await rm(path.dirname(videoPath), { force: true, recursive: true });
+  }
+});
+
+test("uses menu semantics, roving focus, and Escape opener restoration", async ({ page }) => {
+  await page.goto("/");
+
+  const videoPath = await createSmokeVideoPath();
+  try {
+    await chooseInputFile(page, videoPath);
+
+    const frame2 = page.locator('[data-instance-id="frame-2"]');
+    await frame2.click({ button: "right" });
+    const menu = page.getByRole("menu");
+    const menuItems = menu.getByRole("menuitem");
+    await expect(menu).toBeVisible();
+    await expect(menuItems.first()).toBeFocused();
+    await menuItems.first().press("End");
+    await expect(menuItems.last()).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(menu).toHaveCount(0);
+    await expect(frame2).toBeFocused();
+
+    await frame2.click({ button: "right" });
+    await expect(menuItems.first()).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await expect(frame2).toBeFocused();
+
+    const frame1 = page.locator('[data-instance-id="frame-1"]');
+    const frame5 = page.locator('[data-instance-id="frame-5"]');
+    await frame1.click();
+    await frame5.click({ modifiers: ["Shift"] });
+    await frame2.click({ button: "right" });
+    await menu.getByRole("menuitem", { name: "Cut", exact: true }).click();
+    await expect(page.locator("[data-instance-id]")).toHaveCount(0);
+    await expect(page.locator(".frameRailEmptyState button:not(:disabled)")).toBeFocused();
+  } finally {
+    await rm(path.dirname(videoPath), { force: true, recursive: true });
+  }
+});
+
+test("bounds a synthetic 240-frame rail and keeps one roving tab stop", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(HTMLMediaElement.prototype, "duration", {
+      configurable: true,
+      get: () => 20,
+    });
+  });
+  await page.goto("/");
+  await page.addStyleTag({
+    content: ".frameTableBody { max-height: 384px !important; }",
+  });
+
+  const videoPath = await createSmokeVideoPath();
+  try {
+    await chooseInputFile(page, videoPath);
+
+    const frameTableBody = page.locator(".frameTableBody");
+    const options = frameTableBody.getByRole("option");
+    await expect(options.first()).toHaveAttribute("aria-setsize", "240");
+    const initialMetrics = await frameTableBody.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      optionCount: element.querySelectorAll("[role='option']").length,
+      activeCount: element.querySelectorAll("[role='option'][tabindex='0']").length,
+    }));
+    expect(initialMetrics.optionCount).toBeLessThanOrEqual(
+      Math.ceil(initialMetrics.clientHeight / 48) + 8,
+    );
+    expect(initialMetrics.activeCount).toBe(1);
+
+    await options.first().press("End");
+    const lastFrame = page.locator('[data-instance-id="frame-240"]');
+    await expect(lastFrame).toBeFocused();
+    await expect(lastFrame).toHaveAttribute("tabindex", "0");
+    await expect(frameTableBody.locator("[role='option'][tabindex='0']")).toHaveCount(1);
   } finally {
     await rm(path.dirname(videoPath), { force: true, recursive: true });
   }
@@ -235,7 +413,7 @@ test("drags an unselected frame as a single selected item", async ({ page }) => 
   }
 });
 
-test("wraps keyboard frame navigation and scrolls the selected frame into view", async ({
+test("clamps roving frame navigation and scrolls Home and End into view", async ({
   page,
 }) => {
   await page.goto("/");
@@ -249,6 +427,7 @@ test("wraps keyboard frame navigation and scrolls the selected frame into view",
 
     const frameTableBody = page.locator(".frameTableBody");
     const frame1 = page.locator('[data-instance-id="frame-1"]');
+    const frame2 = page.locator('[data-instance-id="frame-2"]');
     const frame5 = page.locator('[data-instance-id="frame-5"]');
 
     await frame5.click();
@@ -257,6 +436,10 @@ test("wraps keyboard frame navigation and scrolls the selected frame into view",
       .toBeGreaterThan(0);
 
     await frame5.press("ArrowDown");
+    await expect(frame5).toHaveAttribute("aria-selected", "true");
+    await expect(frame5).toBeFocused();
+
+    await frame5.press("Home");
     await expect(frame1).toHaveAttribute("aria-selected", "true");
     await expect(frame5).toHaveAttribute("aria-selected", "false");
     await expect(frame1).toBeFocused();
@@ -264,6 +447,15 @@ test("wraps keyboard frame navigation and scrolls the selected frame into view",
       .toBe(0);
 
     await frame1.press("ArrowUp");
+    await expect(frame1).toHaveAttribute("aria-selected", "true");
+    await expect(frame1).toBeFocused();
+
+    await frame1.press("Shift+ArrowDown");
+    await expect(frame1).toHaveAttribute("aria-selected", "true");
+    await expect(frame2).toHaveAttribute("aria-selected", "true");
+    await expect(frame2).toBeFocused();
+
+    await frame2.press("End");
     await expect(frame5).toHaveAttribute("aria-selected", "true");
     await expect(frame1).toHaveAttribute("aria-selected", "false");
     await expect(frame5).toBeFocused();
@@ -274,7 +466,7 @@ test("wraps keyboard frame navigation and scrolls the selected frame into view",
   }
 });
 
-test("uses Space and vertical arrows as global playback and frame shortcuts", async ({
+test("limits global shortcuts to editor background and ignores interactive controls", async ({
   page,
 }) => {
   await page.goto("/");
@@ -294,49 +486,68 @@ test("uses Space and vertical arrows as global playback and frame shortcuts", as
     await settingsToggle.focus();
     await expect(settingsToggle).toBeFocused();
     await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Delete");
 
+    await expect(frame2).toHaveAttribute("aria-selected", "true");
+    await expect(frame3).toHaveAttribute("aria-selected", "false");
+
+    await page.keyboard.press("Space");
+    await expect(overlayDialog).toBeVisible();
+    await expect(page.getByRole("button", { name: "Play" })).toBeVisible();
+
+    const settingsSelect = overlayDialog.getByLabel("Optimization goal");
+    await settingsSelect.focus();
+    await settingsSelect.dispatchEvent("keydown", {
+      key: " ",
+      code: "Space",
+      bubbles: true,
+    });
+    await expect(page.getByRole("button", { name: "Play" })).toBeVisible();
+    await expect(overlayDialog).toBeVisible();
+
+    await overlayDialog.getByRole("button", { name: "Close panel" }).click();
+    const editorSurface = page.locator("[data-editor-shortcut-surface]");
+    await expect(editorSurface).toHaveAttribute("tabindex", "0");
+    await editorSurface.focus();
+    await expect(editorSurface).toBeFocused();
+    await page.keyboard.press("ArrowDown");
     await expect(frame2).toHaveAttribute("aria-selected", "false");
     await expect(frame3).toHaveAttribute("aria-selected", "true");
-    await expect(frame3).toBeFocused();
 
-    await settingsToggle.focus();
+    await editorSurface.focus();
+    await page.keyboard.press("Delete");
+    await expect(frame3).toHaveCount(0);
+
+    await editorSurface.focus();
     await page.keyboard.press("Space");
     await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
-    await expect(overlayDialog).toHaveCount(0);
-
-    await page.keyboard.press("Space");
-    await expect(page.getByRole("button", { name: "Play" })).toBeVisible();
-    await expect(overlayDialog).toHaveCount(0);
   } finally {
     await rm(path.dirname(videoPath), { force: true, recursive: true });
   }
 });
 
-test("does not render a separate frame focus visual state", async ({ page }) => {
+test("renders a visible focus indicator for the active frame option", async ({ page }) => {
   await page.goto("/");
 
   const videoPath = await createSmokeVideoPath();
   try {
     await chooseInputFile(page, videoPath);
 
-    const visibleFrameFocusRules = await page.evaluate(() =>
-      Array.from(document.styleSheets)
-        .flatMap((styleSheet) => {
-          try {
-            return Array.from(styleSheet.cssRules);
-          } catch {
-            return [];
-          }
-        })
-        .map((rule) => rule.cssText)
-        .filter(
-          (ruleText) =>
-            ruleText.includes(".frameRow:focus") &&
-            !ruleText.includes("outline: none"),
-        ),
-    );
+    const frame1 = page.locator('[data-instance-id="frame-1"]');
+    for (let step = 0; step < 20; step += 1) {
+      if (await frame1.evaluate((element) => document.activeElement === element)) {
+        break;
+      }
+      await page.keyboard.press("Tab");
+    }
+    await expect(frame1).toBeFocused();
+    const focusStyle = await frame1.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth };
+    });
 
-    expect(visibleFrameFocusRules).toEqual([]);
+    expect(focusStyle.outlineStyle).not.toBe("none");
+    expect(focusStyle.outlineWidth).not.toBe("0px");
   } finally {
     await rm(path.dirname(videoPath), { force: true, recursive: true });
   }
@@ -359,9 +570,7 @@ test("tracks playback in the frame rail with a single active selection", async (
 
     await frame1.click();
     await expect(frame1).toHaveAttribute("aria-selected", "true");
-    await frame1.focus();
-    await expect(frame1).toBeFocused();
-    await page.keyboard.press("Space");
+    await page.getByRole("button", { name: "Play" }).click();
 
     await expect
       .poll(

@@ -14,6 +14,7 @@ type EditorWorkspaceProps = {
   editorWorkspaceStyle?: CSSProperties;
   inspection: MediaInspection;
   previewKey: string;
+  shortcutSurfaceLabel: string;
   isWebPreviewMode: boolean;
   webPreviewNotice: string;
   plannerError: string | null;
@@ -31,6 +32,7 @@ export function EditorWorkspace({
   editorWorkspaceStyle,
   inspection,
   previewKey,
+  shortcutSurfaceLabel,
   isWebPreviewMode,
   webPreviewNotice,
   plannerError,
@@ -47,6 +49,9 @@ export function EditorWorkspace({
       <section
         ref={editorWorkspaceRef}
         className={inspection.isStaticImage ? "editorWorkspace editorWorkspaceStatic" : "editorWorkspace"}
+        data-editor-shortcut-surface="true"
+        tabIndex={0}
+        aria-label={shortcutSurfaceLabel}
         style={editorWorkspaceStyle}
       >
         {!inspection.isStaticImage ? <FrameRail {...frameRailProps} /> : null}

@@ -19,7 +19,11 @@ import {
 } from "../../utils/frameDnD";
 import { buildFramePointerSelection } from "../../utils/frameSelection";
 import { moveSelectedFramesAroundAnchor } from "../../utils/frameEditing";
-import { FRAME_RAIL_ROW_HEIGHT } from "../../utils/virtualFrameList";
+import {
+  computeRovingFrameIndex,
+  FRAME_RAIL_ROW_HEIGHT,
+  type FrameRailNavigationKey,
+} from "../../utils/virtualFrameList";
 import { useFrameContextMenuState } from "./useFrameContextMenuState";
 import { useFrameSelectionCommands } from "./useFrameSelectionCommands";
 import type {
@@ -49,6 +53,13 @@ function findFrameRowElement(container: HTMLDivElement | null, instanceId: strin
     Array.from(container.querySelectorAll<HTMLButtonElement>("[data-instance-id]"))
       .find((element) => element.dataset.instanceId === instanceId) ?? null
   );
+}
+
+function isFrameRailNavigationKey(key: string): key is FrameRailNavigationKey {
+  return key === "ArrowUp" ||
+    key === "ArrowDown" ||
+    key === "Home" ||
+    key === "End";
 }
 
 export function useFrameSelectionInteractions({
@@ -286,7 +297,14 @@ export function useFrameSelectionInteractions({
 
   const handleFrameKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") {
+      if (
+        event.defaultPrevented ||
+        event.nativeEvent.isComposing ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.metaKey ||
+        !isFrameRailNavigationKey(event.key)
+      ) {
         return;
       }
 
@@ -298,15 +316,47 @@ export function useFrameSelectionInteractions({
         return;
       }
 
+      const targetIndex = computeRovingFrameIndex({
+        activeIndex: currentIndex,
+        itemCount: orderedFrameIds.length,
+        key: event.key,
+      });
+      const targetInstanceId = orderedFrameIds[targetIndex];
+      if (!targetInstanceId) {
+        return;
+      }
+
       event.preventDefault();
-      selectAdjacentFrame(
-        event.key === "ArrowDown" ? 1 : -1,
-        currentInstanceId,
-      );
+      updateFrameReorderState(null);
+      updateFrameDropTarget(null);
+
+      if (!event.shiftKey) {
+        setSelectedInstanceIds([targetInstanceId]);
+        selectionAnchorInstanceIdRef.current = targetInstanceId;
+        return;
+      }
+
+      const existingAnchorIndex =
+        selectionAnchorInstanceIdRef.current &&
+        selectedInstanceIdSet.has(selectionAnchorInstanceIdRef.current)
+          ? orderedFrameIds.indexOf(selectionAnchorInstanceIdRef.current)
+          : -1;
+      const anchorIndex = existingAnchorIndex >= 0 ? existingAnchorIndex : currentIndex;
+      const anchorInstanceId = orderedFrameIds[anchorIndex];
+      const rangeStart = Math.min(anchorIndex, targetIndex);
+      const rangeEnd = Math.max(anchorIndex, targetIndex);
+      const rangeIds = orderedFrameIds.slice(rangeStart, rangeEnd + 1);
+      setSelectedInstanceIds([
+        ...rangeIds.filter((instanceId) => instanceId !== targetInstanceId),
+        targetInstanceId,
+      ]);
+      selectionAnchorInstanceIdRef.current = anchorInstanceId ?? targetInstanceId;
     },
     [
       orderedFrameIds,
-      selectAdjacentFrame,
+      selectedInstanceIdSet,
+      updateFrameDropTarget,
+      updateFrameReorderState,
     ],
   );
 
@@ -492,6 +542,7 @@ export function useFrameSelectionInteractions({
     handleFramePointerDown,
     handleFrameKeyDown,
     handleFrameContextMenu,
+    closeFrameContextMenu,
     selectSingleFrame,
     selectAdjacentFrame,
     selectAllFrames,

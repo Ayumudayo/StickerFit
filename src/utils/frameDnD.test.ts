@@ -135,6 +135,28 @@ describe("resolveFrameDropTargetFromVirtualGeometry", () => {
     expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientX: 10, clientY: 120 })).toBeNull();
     expect(resolveFrameDropTargetFromVirtualGeometry({ ...params, clientX: 60, clientY: 220 })).toBeNull();
   });
+
+  it("resolves a far-offscreen anchor from the full 1,000-frame index space", () => {
+    const longTimelineIds = Array.from(
+      { length: 1_000 },
+      (_, index) => `frame-${index + 1}`,
+    );
+
+    expect(
+      resolveFrameDropTargetFromVirtualGeometry({
+        listBounds: { left: 20, right: 220, top: 100, bottom: 340 },
+        scrollTop: 750 * 48,
+        rowHeight: 48,
+        orderedInstanceIds: longTimelineIds,
+        draggedInstanceIds: [],
+        clientX: 60,
+        clientY: 124,
+      }),
+    ).toEqual({
+      anchorInstanceId: "frame-751",
+      position: "below",
+    });
+  });
 });
 
 describe("frame rail edge autoscroll math", () => {

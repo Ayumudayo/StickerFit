@@ -4,7 +4,7 @@ import type {
   PointerEvent,
   RefObject,
 } from "react";
-import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { EditorText } from "../../locales/editorText";
 import type { Locale } from "../../locales/messages";
@@ -17,10 +17,13 @@ import type {
 import type { FramePreviewLoadState } from "../../types/workflow";
 import { formatTimelineTime } from "../../utils/timelineFrames";
 import {
+  computeRovingFrameIndex,
   computeScrollTopToRevealIndex,
   computeVirtualWindow,
   FRAME_RAIL_OVERSCAN,
   FRAME_RAIL_ROW_HEIGHT,
+  normalizeRovingFrameIndex,
+  type FrameRailNavigationKey,
 } from "../../utils/virtualFrameList";
 import { GridIcon } from "../AppIcons";
 
@@ -45,6 +48,13 @@ type FrameRailProps = {
   onPasteFramesBelow: () => void;
 };
 
+function isFrameRailNavigationKey(key: string): key is FrameRailNavigationKey {
+  return key === "ArrowUp" ||
+    key === "ArrowDown" ||
+    key === "Home" ||
+    key === "End";
+}
+
 export function FrameRail({
   ui,
   locale,
@@ -68,6 +78,7 @@ export function FrameRail({
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(FRAME_RAIL_ROW_HEIGHT * 8);
   const [railViewportTop, setRailViewportTop] = useState(0);
+  const pendingKeyboardFocusInstanceIdRef = useRef<string | null>(null);
   const draggedInstanceIdSet = useMemo(
     () => new Set(frameReorderState?.draggedInstanceIds ?? []),
     [frameReorderState?.draggedInstanceIds],
@@ -87,6 +98,14 @@ export function FrameRail({
   const activeIndex = activeInstanceId
     ? timelineFrameViews.findIndex((frame) => frame.instanceId === activeInstanceId)
     : -1;
+  const rovingActiveIndex = normalizeRovingFrameIndex(
+    activeIndex,
+    timelineFrameViews.length,
+  );
+  const renderedTabStopIndex =
+    rovingActiveIndex >= virtualWindow.start && rovingActiveIndex < virtualWindow.end
+      ? rovingActiveIndex
+      : virtualWindow.start;
   const dragPreviewFrame = frameReorderState?.active
     ? timelineFrameViews.find(
         (frame) => frame.instanceId === frameReorderState.draggedInstanceIds[0],
@@ -148,27 +167,81 @@ export function FrameRail({
 
   useLayoutEffect(() => {
     const element = frameTableBodyRef.current;
+    const pendingInstanceId = pendingKeyboardFocusInstanceIdRef.current;
+    const pendingIndex = pendingInstanceId
+      ? timelineFrameViews.findIndex((frame) => frame.instanceId === pendingInstanceId)
+      : -1;
+    if (pendingInstanceId && pendingIndex < 0) {
+      pendingKeyboardFocusInstanceIdRef.current = null;
+      return;
+    }
     if (
       !element ||
-      !activeInstanceId ||
-      activeIndex < virtualWindow.start ||
-      activeIndex >= virtualWindow.end
+      !pendingInstanceId ||
+      pendingIndex < virtualWindow.start ||
+      pendingIndex >= virtualWindow.end
     ) {
       return;
     }
     const target = Array.from(
       element.querySelectorAll<HTMLButtonElement>("[data-instance-id]"),
-    ).find((row) => row.dataset.instanceId === activeInstanceId);
+    ).find((row) => row.dataset.instanceId === pendingInstanceId);
     if (target && document.activeElement !== target) {
       target.focus({ preventScroll: true });
     }
+    if (target) {
+      pendingKeyboardFocusInstanceIdRef.current = null;
+    }
   }, [
-    activeIndex,
     activeInstanceId,
     frameTableBodyRef,
+    timelineFrameViews,
     virtualWindow.end,
     virtualWindow.start,
   ]);
+
+  const handleFrameRowKeyDown: KeyboardEventHandler<HTMLButtonElement> = (event) => {
+    if (
+      !event.defaultPrevented &&
+      !event.nativeEvent.isComposing &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      isFrameRailNavigationKey(event.key)
+    ) {
+      const currentIndex = Number(event.currentTarget.dataset.frameIndex);
+      if (Number.isInteger(currentIndex)) {
+        const targetIndex = computeRovingFrameIndex({
+          activeIndex: currentIndex,
+          itemCount: timelineFrameViews.length,
+          key: event.key,
+        });
+        const targetInstanceId = timelineFrameViews[targetIndex]?.instanceId ?? null;
+        if (
+          targetInstanceId !== null &&
+          targetInstanceId !== event.currentTarget.dataset.instanceId
+        ) {
+          pendingKeyboardFocusInstanceIdRef.current = targetInstanceId;
+          const element = frameTableBodyRef.current;
+          if (element) {
+            const nextScrollTop = computeScrollTopToRevealIndex({
+              scrollTop: element.scrollTop,
+              viewportHeight: element.clientHeight,
+              rowHeight: FRAME_RAIL_ROW_HEIGHT,
+              itemCount: timelineFrameViews.length,
+              index: targetIndex,
+            });
+            if (nextScrollTop !== element.scrollTop) {
+              element.scrollTop = nextScrollTop;
+              setScrollTop(nextScrollTop);
+            }
+          }
+        }
+      }
+    }
+
+    onFrameKeyDown(event);
+  };
 
   return (
     <aside className="frameRail">
@@ -204,6 +277,7 @@ export function FrameRail({
                   style={{ transform: `translateY(${virtualWindow.offsetTop}px)` }}
                 >
               {visibleFrames.map((frame, visibleIndex) => {
+                const frameIndex = virtualWindow.start + visibleIndex;
                 const isSelected = selection.selectedInstanceIdSet.has(frame.instanceId);
                 const isDropTarget = frameDropTarget?.anchorInstanceId === frame.instanceId;
                 const isDragged =
@@ -225,12 +299,14 @@ export function FrameRail({
                     role="option"
                     aria-selected={isSelected}
                     aria-setsize={timelineFrameViews.length}
-                    aria-posinset={virtualWindow.start + visibleIndex + 1}
+                    aria-posinset={frameIndex + 1}
+                    tabIndex={frameIndex === renderedTabStopIndex ? 0 : -1}
                     data-instance-id={frame.instanceId}
+                    data-frame-index={frameIndex}
                     aria-grabbed={isDragged}
                     onPointerDown={(event) => onFramePointerDown(frame.instanceId, event)}
                     onContextMenu={(event) => onFrameContextMenu(frame.instanceId, event)}
-                    onKeyDown={onFrameKeyDown}
+                    onKeyDown={handleFrameRowKeyDown}
                     onFocus={() => onFrameFocus(frame.startTimeSeconds)}
                   >
                     {showFramePreviews ? (

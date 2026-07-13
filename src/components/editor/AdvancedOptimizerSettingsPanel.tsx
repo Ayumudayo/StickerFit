@@ -1,3 +1,5 @@
+import { useId } from "react";
+
 import type { MessagesForLocale } from "../../locales/messages";
 import type {
   OptimizerGoal,
@@ -7,7 +9,6 @@ import type {
 import { ChevronDownIcon, SettingsIcon } from "../AppIcons";
 
 type AdvancedOptimizerSettingsPanelProps = {
-  panelId: string;
   copy: MessagesForLocale;
   layout?: "floating" | "dock";
   optimizerGoal: OptimizerGoal;
@@ -19,7 +20,6 @@ type AdvancedOptimizerSettingsPanelProps = {
 };
 
 export function AdvancedOptimizerSettingsPanel({
-  panelId,
   copy,
   layout = "floating",
   optimizerGoal,
@@ -29,25 +29,31 @@ export function AdvancedOptimizerSettingsPanel({
   onQualityFrameDropIntervalChange,
   onOptimizerSearchDepthChange,
 }: AdvancedOptimizerSettingsPanelProps) {
+  const idPrefix = useId();
+  const headingId = `${idPrefix}-heading`;
+  const optimizerGoalId = `${idPrefix}-goal`;
+  const frameDropId = `${idPrefix}-frame-drop`;
+  const searchDepthId = `${idPrefix}-search-depth`;
   const panelClassName =
     layout === "dock"
       ? "appCard settingsCard advancedOptimizerPanel advancedOptimizerPanelInline"
       : "appCard settingsCard advancedOptimizerPanel";
 
   return (
-    <section id={panelId} className={panelClassName}>
+    <section className={panelClassName} aria-labelledby={headingId}>
       <div className="cardHeading">
-        <h3>
+        <h3 id={headingId}>
           <SettingsIcon size={16} className="cardHeadingIcon" />
           {copy.advancedSettings}
         </h3>
       </div>
 
       <div className="advancedOptimizerGrid">
-        <label className="field">
+        <label className="field" htmlFor={optimizerGoalId}>
           <span className="metaLabel">{copy.optimizerGoal}</span>
           <div className="selectShell">
             <select
+              id={optimizerGoalId}
               className="fieldSelect"
               value={optimizerGoal}
               onChange={(event) =>
@@ -63,10 +69,11 @@ export function AdvancedOptimizerSettingsPanel({
         </label>
 
         {optimizerGoal === "quality" ? (
-          <label className="field">
+          <label className="field" htmlFor={frameDropId}>
             <span className="metaLabel">{copy.qualityFrameDropInterval}</span>
             <div className="selectShell">
               <select
+                id={frameDropId}
                 className="fieldSelect"
                 value={qualityFrameDropInterval}
                 onChange={(event) =>
@@ -84,10 +91,11 @@ export function AdvancedOptimizerSettingsPanel({
           </label>
         ) : null}
 
-        <label className="field">
+        <label className="field" htmlFor={searchDepthId}>
           <span className="metaLabel">{copy.advancedSearchDepth}</span>
           <div className="selectShell">
             <select
+              id={searchDepthId}
               className="fieldSelect"
               value={optimizerSearchDepth}
               onChange={(event) =>

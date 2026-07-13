@@ -1,4 +1,10 @@
-import type { RefObject } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type RefObject,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import type { EditorText } from "../../locales/editorText";
 import type { FrameContextMenuState } from "../../types/editor";
@@ -10,6 +16,7 @@ type FrameContextMenuProps = {
   hasSingleFrameSelection: boolean;
   canDeleteUnselectedFrames: boolean;
   hasClipboardFrames: boolean;
+  onClose: () => void;
   onOpenFrameDurationDialog: () => void;
   onSplitCurrentFrame: () => void;
   onSpeedUpFrames: () => void;
@@ -35,6 +42,22 @@ type FrameContextMenuProps = {
   onPasteFramesBelow: () => void;
 };
 
+type ContextMenuItem = {
+  label: string;
+  onSelect: () => void;
+  disabled?: boolean;
+  fullWidth?: boolean;
+  danger?: boolean;
+};
+
+function findAnchorFrameElement(instanceId: string) {
+  return (
+    Array.from(document.querySelectorAll<HTMLElement>("[data-instance-id]")).find(
+      (element) => element.dataset.instanceId === instanceId,
+    ) ?? null
+  );
+}
+
 export function FrameContextMenu({
   ui,
   frameContextMenu,
@@ -42,6 +65,7 @@ export function FrameContextMenu({
   hasSingleFrameSelection,
   canDeleteUnselectedFrames,
   hasClipboardFrames,
+  onClose,
   onOpenFrameDurationDialog,
   onSplitCurrentFrame,
   onSpeedUpFrames,
@@ -66,124 +90,233 @@ export function FrameContextMenu({
   onPasteFramesAbove,
   onPasteFramesBelow,
 }: FrameContextMenuProps) {
+  const sections: ContextMenuItem[][] = [
+    [
+      { label: ui.setFrameTime, onSelect: onOpenFrameDurationDialog },
+      {
+        label: ui.splitFrame,
+        onSelect: onSplitCurrentFrame,
+        disabled: !hasSingleFrameSelection,
+      },
+      { label: ui.speedUpFrames, onSelect: onSpeedUpFrames },
+      { label: ui.slowDownFrames, onSelect: onSlowDownFrames },
+    ],
+    [
+      { label: ui.moveFramesUp, onSelect: onMoveFramesUp },
+      { label: ui.moveFramesDown, onSelect: onMoveFramesDown },
+      { label: ui.moveFramesToStart, onSelect: onMoveFramesToStart },
+      { label: ui.moveFramesToEnd, onSelect: onMoveFramesToEnd },
+      { label: ui.copyFramesToStart, onSelect: onCopyFramesToStart },
+      { label: ui.copyFramesToEnd, onSelect: onCopyFramesToEnd },
+      { label: ui.reverseFrames, onSelect: onReverseFrames, fullWidth: true },
+    ],
+    [
+      { label: ui.selectAll, onSelect: onSelectAllFrames },
+      { label: ui.clearAll, onSelect: onClearAllFrames },
+      { label: ui.selectOddFrames, onSelect: onSelectOddFrames },
+      { label: ui.selectEvenFrames, onSelect: onSelectEvenFrames },
+      { label: ui.selectNthFrames, onSelect: onOpenNthFrameDialog },
+      { label: ui.invertSelection, onSelect: onInvertSelection },
+      { label: ui.renumberFrames, onSelect: onRenumberFrames, fullWidth: true },
+    ],
+    [
+      { label: ui.copyFrames, onSelect: onCopyFrames },
+      { label: ui.cutFrames, onSelect: onCutFrames },
+      {
+        label: ui.pasteFramesAbove,
+        onSelect: onPasteFramesAbove,
+        disabled: !hasClipboardFrames,
+      },
+      {
+        label: ui.pasteFramesBelow,
+        onSelect: onPasteFramesBelow,
+        disabled: !hasClipboardFrames,
+      },
+    ],
+    [
+      {
+        label: ui.deleteUnselectedFrames,
+        onSelect: onDeleteUnselectedFrames,
+        disabled: !canDeleteUnselectedFrames,
+        fullWidth: true,
+        danger: true,
+      },
+    ],
+  ];
+  const items = sections.flat();
+  const enabledIndices = items.flatMap((item, index) => (item.disabled ? [] : [index]));
+  const enabledIndicesKey = enabledIndices.join(":");
+  const [activeIndex, setActiveIndex] = useState(() => enabledIndices[0] ?? -1);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const rovingIndex = enabledIndices.includes(activeIndex)
+    ? activeIndex
+    : enabledIndices[0] ?? -1;
+
+  useLayoutEffect(() => {
+    const menu = frameContextMenuRef.current;
+    const activeElement = document.activeElement;
+    openerRef.current =
+      findAnchorFrameElement(frameContextMenu.anchorInstanceId) ??
+      (activeElement instanceof HTMLElement && !menu?.contains(activeElement)
+        ? activeElement
+        : null);
+
+    return () => {
+      const opener = openerRef.current;
+      if (opener?.isConnected) {
+        opener.focus({ preventScroll: true });
+      }
+      window.requestAnimationFrame(() => {
+        const activeElementAfterCommit = document.activeElement;
+        if (
+          activeElementAfterCommit instanceof HTMLElement &&
+          activeElementAfterCommit !== document.body &&
+          activeElementAfterCommit !== document.documentElement
+        ) {
+          return;
+        }
+
+        const fallback =
+          findAnchorFrameElement(frameContextMenu.anchorInstanceId) ??
+          document.querySelector<HTMLElement>("[role='option'][tabindex='0']") ??
+          document.querySelector<HTMLElement>(
+            ".frameRailEmptyState button:not(:disabled)",
+          ) ??
+          document.querySelector<HTMLElement>("[data-editor-shortcut-surface]");
+        fallback?.focus({ preventScroll: true });
+      });
+    };
+  }, [frameContextMenu.anchorInstanceId, frameContextMenuRef]);
+
+  useLayoutEffect(() => {
+    const firstEnabledIndex = enabledIndices[0] ?? -1;
+    setActiveIndex(firstEnabledIndex);
+    if (firstEnabledIndex >= 0) {
+      itemRefs.current[firstEnabledIndex]?.focus({ preventScroll: true });
+    } else {
+      frameContextMenuRef.current?.focus({ preventScroll: true });
+    }
+  }, [enabledIndicesKey, frameContextMenuRef]);
+
+  const focusItem = (index: number) => {
+    setActiveIndex(index);
+    itemRefs.current[index]?.focus({ preventScroll: true });
+  };
+
+  const focusRelativeItem = (direction: -1 | 1) => {
+    if (enabledIndices.length === 0) {
+      return;
+    }
+    const currentPosition = Math.max(0, enabledIndices.indexOf(rovingIndex));
+    const nextPosition =
+      (currentPosition + direction + enabledIndices.length) % enabledIndices.length;
+    const nextIndex = enabledIndices[nextPosition];
+    if (nextIndex !== undefined) {
+      focusItem(nextIndex);
+    }
+  };
+
+  const handleMenuKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    switch (event.key) {
+      case "ArrowDown":
+      case "ArrowRight":
+        event.preventDefault();
+        focusRelativeItem(1);
+        break;
+      case "ArrowUp":
+      case "ArrowLeft":
+        event.preventDefault();
+        focusRelativeItem(-1);
+        break;
+      case "Home":
+        event.preventDefault();
+        if (enabledIndices[0] !== undefined) {
+          focusItem(enabledIndices[0]);
+        }
+        break;
+      case "End": {
+        event.preventDefault();
+        const lastIndex = enabledIndices[enabledIndices.length - 1];
+        if (lastIndex !== undefined) {
+          focusItem(lastIndex);
+        }
+        break;
+      }
+      case "Escape":
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+        break;
+      case "Tab":
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+        break;
+    }
+  };
+
+  let sectionOffset = 0;
   return (
-    <div className="overlayBackdrop">
+    <div
+      className="overlayBackdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
       <section
         ref={frameContextMenuRef}
         className="frameContextMenu"
-        role="dialog"
-        aria-modal="true"
+        role="menu"
+        aria-label={ui.frameTitle}
+        aria-orientation="vertical"
+        tabIndex={-1}
         style={{ left: frameContextMenu.x, top: frameContextMenu.y }}
+        onKeyDown={handleMenuKeyDown}
       >
-        <div className="contextMenuGrid">
-          <button type="button" className="contextMenuItem" onClick={onOpenFrameDurationDialog}>
-            {ui.setFrameTime}
-          </button>
-          <button
-            type="button"
-            className="contextMenuItem"
-            onClick={onSplitCurrentFrame}
-            disabled={!hasSingleFrameSelection}
-          >
-            {ui.splitFrame}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onSpeedUpFrames}>
-            {ui.speedUpFrames}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onSlowDownFrames}>
-            {ui.slowDownFrames}
-          </button>
-        </div>
-        <div className="contextMenuDivider" />
-        <div className="contextMenuGrid">
-          <button type="button" className="contextMenuItem" onClick={onMoveFramesUp}>
-            {ui.moveFramesUp}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onMoveFramesDown}>
-            {ui.moveFramesDown}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onMoveFramesToStart}>
-            {ui.moveFramesToStart}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onMoveFramesToEnd}>
-            {ui.moveFramesToEnd}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onCopyFramesToStart}>
-            {ui.copyFramesToStart}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onCopyFramesToEnd}>
-            {ui.copyFramesToEnd}
-          </button>
-          <button
-            type="button"
-            className="contextMenuItem contextMenuItemFull"
-            onClick={onReverseFrames}
-          >
-            {ui.reverseFrames}
-          </button>
-        </div>
-        <div className="contextMenuDivider" />
-        <div className="contextMenuGrid">
-          <button type="button" className="contextMenuItem" onClick={onSelectAllFrames}>
-            {ui.selectAll}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onClearAllFrames}>
-            {ui.clearAll}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onSelectOddFrames}>
-            {ui.selectOddFrames}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onSelectEvenFrames}>
-            {ui.selectEvenFrames}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onOpenNthFrameDialog}>
-            {ui.selectNthFrames}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onInvertSelection}>
-            {ui.invertSelection}
-          </button>
-          <button
-            type="button"
-            className="contextMenuItem contextMenuItemFull"
-            onClick={onRenumberFrames}
-          >
-            {ui.renumberFrames}
-          </button>
-        </div>
-        <div className="contextMenuDivider" />
-        <div className="contextMenuGrid">
-          <button type="button" className="contextMenuItem" onClick={onCopyFrames}>
-            {ui.copyFrames}
-          </button>
-          <button type="button" className="contextMenuItem" onClick={onCutFrames}>
-            {ui.cutFrames}
-          </button>
-          <button
-            type="button"
-            className="contextMenuItem"
-            onClick={onPasteFramesAbove}
-            disabled={!hasClipboardFrames}
-          >
-            {ui.pasteFramesAbove}
-          </button>
-          <button
-            type="button"
-            className="contextMenuItem"
-            onClick={onPasteFramesBelow}
-            disabled={!hasClipboardFrames}
-          >
-            {ui.pasteFramesBelow}
-          </button>
-        </div>
-        <div className="contextMenuDivider" />
-        <button
-          type="button"
-          className="contextMenuItem contextMenuItemFull dangerItem"
-          onClick={onDeleteUnselectedFrames}
-          disabled={!canDeleteUnselectedFrames}
-        >
-          {ui.deleteUnselectedFrames}
-        </button>
+        {sections.map((section, sectionIndex) => {
+          const startIndex = sectionOffset;
+          sectionOffset += section.length;
+          return (
+            <div role="presentation" key={sectionIndex}>
+              {sectionIndex > 0 ? <div className="contextMenuDivider" role="separator" /> : null}
+              <div className="contextMenuGrid" role="presentation">
+                {section.map((item, itemIndex) => {
+                  const index = startIndex + itemIndex;
+                  const className = [
+                    "contextMenuItem",
+                    item.fullWidth ? "contextMenuItemFull" : "",
+                    item.danger ? "dangerItem" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
+                  return (
+                    <button
+                      key={item.label}
+                      ref={(element) => {
+                        itemRefs.current[index] = element;
+                      }}
+                      type="button"
+                      role="menuitem"
+                      className={className}
+                      disabled={item.disabled}
+                      tabIndex={index === rovingIndex ? 0 : -1}
+                      onFocus={() => setActiveIndex(index)}
+                      onClick={() => {
+                        item.onSelect();
+                        onClose();
+                      }}
+                    >
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
       </section>
     </div>
   );
