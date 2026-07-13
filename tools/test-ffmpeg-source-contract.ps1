@@ -15,6 +15,12 @@ Import-Module -Name $modulePath -Force
 
 $expectedEolPolicy = @(
   '/.gitattributes text eol=lf',
+  '/src/**/*.ts text eol=lf',
+  '/src/**/*.tsx text eol=lf',
+  '/src/**/*.css text eol=lf',
+  '/tests/**/*.ts text eol=lf',
+  '/package*.json text eol=lf',
+  '/.github/**/*.yml text eol=lf',
   '/src-tauri/Cargo.toml text eol=lf',
   '/src-tauri/tauri.conf.json text eol=lf',
   '/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe -text',
