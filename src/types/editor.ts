@@ -17,6 +17,7 @@ export type TimelineFrameView = {
   displayNumber: number;
   durationUs: number;
   durationSeconds: number;
+  startTimeUs: number;
   startTimeSeconds: number;
   sourceStartTimeSeconds: number;
 };

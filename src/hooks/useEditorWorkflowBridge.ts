@@ -65,9 +65,10 @@ export function useEditorWorkflowBridge({
     inspection?.ok && inspection.width && inspection.height
       ? `${inspection.width} x ${inspection.height}`
       : "-";
-  const quickFps = inspection?.ok && !inspection.isStaticImage
-    ? inspection.avgFps?.toFixed(2) ?? inspection.frameRateLabel ?? "-"
-    : null;
+  const quickFps =
+    inspection?.ok && !inspection.isStaticImage
+      ? (inspection.avgFps?.toFixed(2) ?? inspection.frameRateLabel ?? "-")
+      : null;
 
   return {
     previewKind,

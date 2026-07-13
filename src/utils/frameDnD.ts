@@ -21,6 +21,30 @@ type ResolveFrameDropTargetFromGeometryParams = {
   clientY: number;
 };
 
+type ResolveFrameDropTargetFromVirtualGeometryParams = {
+  listBounds: RectBounds;
+  scrollTop: number;
+  rowHeight: number;
+  orderedInstanceIds: readonly string[];
+  draggedInstanceIds: readonly string[];
+  clientX: number;
+  clientY: number;
+};
+
+type FrameRailAutoScrollDeltaParams = {
+  clientY: number;
+  listBounds: RectBounds;
+  edgeSize: number;
+  maxStep: number;
+};
+
+type ClampFrameRailAutoScrollParams = {
+  scrollTop: number;
+  delta: number;
+  scrollHeight: number;
+  clientHeight: number;
+};
+
 export function resolveFrameDropTargetFromGeometry({
   listBounds,
   rows,
@@ -63,6 +87,177 @@ export function resolveFrameDropTargetFromGeometry({
     anchorInstanceId: lastAnchorInstanceId,
     position: "below",
   } satisfies FrameDropTargetState;
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+export function resolveFrameDropTargetFromVirtualGeometry({
+  listBounds,
+  scrollTop,
+  rowHeight,
+  orderedInstanceIds,
+  draggedInstanceIds,
+  clientX,
+  clientY,
+}: ResolveFrameDropTargetFromVirtualGeometryParams): FrameDropTargetState | null {
+  if (
+    orderedInstanceIds.length === 0 ||
+    !Number.isFinite(listBounds.left) ||
+    !Number.isFinite(listBounds.right) ||
+    !Number.isFinite(listBounds.top) ||
+    !Number.isFinite(listBounds.bottom) ||
+    listBounds.right < listBounds.left ||
+    listBounds.bottom < listBounds.top ||
+    !Number.isFinite(scrollTop) ||
+    !Number.isFinite(rowHeight) ||
+    rowHeight <= 0 ||
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(clientY) ||
+    clientX < listBounds.left ||
+    clientX > listBounds.right ||
+    clientY < listBounds.top ||
+    clientY > listBounds.bottom
+  ) {
+    return null;
+  }
+
+  const draggedInstanceIdSet = new Set(draggedInstanceIds);
+  if (
+    orderedInstanceIds.every((instanceId) =>
+      draggedInstanceIdSet.has(instanceId),
+    )
+  ) {
+    return null;
+  }
+
+  const contentY = Math.max(0, scrollTop) + clientY - listBounds.top;
+  const rawIndex = clamp(
+    Math.floor(contentY / rowHeight),
+    0,
+    orderedInstanceIds.length - 1,
+  );
+  const rowMidpoint = rawIndex * rowHeight + rowHeight / 2;
+  const position: FrameDropTargetState["position"] =
+    contentY < rowMidpoint ? "above" : "below";
+  const rawAnchorInstanceId = orderedInstanceIds[rawIndex];
+
+  if (!draggedInstanceIdSet.has(rawAnchorInstanceId)) {
+    return {
+      anchorInstanceId: rawAnchorInstanceId,
+      position,
+    };
+  }
+
+  if (position === "above") {
+    for (let index = rawIndex - 1; index >= 0; index -= 1) {
+      const instanceId = orderedInstanceIds[index];
+      if (!draggedInstanceIdSet.has(instanceId)) {
+        return { anchorInstanceId: instanceId, position: "below" };
+      }
+    }
+    for (
+      let index = rawIndex + 1;
+      index < orderedInstanceIds.length;
+      index += 1
+    ) {
+      const instanceId = orderedInstanceIds[index];
+      if (!draggedInstanceIdSet.has(instanceId)) {
+        return { anchorInstanceId: instanceId, position: "above" };
+      }
+    }
+  } else {
+    for (
+      let index = rawIndex + 1;
+      index < orderedInstanceIds.length;
+      index += 1
+    ) {
+      const instanceId = orderedInstanceIds[index];
+      if (!draggedInstanceIdSet.has(instanceId)) {
+        return { anchorInstanceId: instanceId, position: "above" };
+      }
+    }
+    for (let index = rawIndex - 1; index >= 0; index -= 1) {
+      const instanceId = orderedInstanceIds[index];
+      if (!draggedInstanceIdSet.has(instanceId)) {
+        return { anchorInstanceId: instanceId, position: "below" };
+      }
+    }
+  }
+
+  return null;
+}
+
+export function computeFrameRailAutoScrollDelta({
+  clientY,
+  listBounds,
+  edgeSize,
+  maxStep,
+}: FrameRailAutoScrollDeltaParams) {
+  const height = listBounds.bottom - listBounds.top;
+  if (
+    !Number.isFinite(clientY) ||
+    !Number.isFinite(listBounds.top) ||
+    !Number.isFinite(listBounds.bottom) ||
+    !Number.isFinite(height) ||
+    !Number.isFinite(edgeSize) ||
+    !Number.isFinite(maxStep) ||
+    height <= 0 ||
+    edgeSize <= 0 ||
+    maxStep <= 0 ||
+    clientY < listBounds.top ||
+    clientY > listBounds.bottom
+  ) {
+    return 0;
+  }
+
+  const effectiveEdgeSize = Math.min(edgeSize, height / 2);
+  const topEdgeEnd = listBounds.top + effectiveEdgeSize;
+  if (clientY < topEdgeEnd) {
+    const intensity = (topEdgeEnd - clientY) / effectiveEdgeSize;
+    return -Math.min(maxStep, maxStep * intensity);
+  }
+
+  const bottomEdgeStart = listBounds.bottom - effectiveEdgeSize;
+  if (clientY > bottomEdgeStart) {
+    const intensity = (clientY - bottomEdgeStart) / effectiveEdgeSize;
+    return Math.min(maxStep, maxStep * intensity);
+  }
+
+  return 0;
+}
+
+export function clampFrameRailAutoScroll({
+  scrollTop,
+  delta,
+  scrollHeight,
+  clientHeight,
+}: ClampFrameRailAutoScrollParams) {
+  if (
+    !Number.isFinite(scrollTop) ||
+    !Number.isFinite(delta) ||
+    !Number.isFinite(scrollHeight) ||
+    !Number.isFinite(clientHeight) ||
+    scrollHeight < 0 ||
+    clientHeight < 0
+  ) {
+    return 0;
+  }
+
+  const maximumScrollTop = Math.max(0, scrollHeight - clientHeight);
+  return clamp(scrollTop + delta, 0, maximumScrollTop);
+}
+
+export function advanceFrameRailAutoScroll(
+  params: ClampFrameRailAutoScrollParams,
+) {
+  const currentScrollTop = clampFrameRailAutoScroll({ ...params, delta: 0 });
+  const nextScrollTop = clampFrameRailAutoScroll(params);
+  return {
+    scrollTop: nextScrollTop,
+    didScroll: nextScrollTop !== currentScrollTop,
+  };
 }
 
 export function resolveFrameDropTargetFromList(

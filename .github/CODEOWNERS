@@ -1,0 +1,26 @@
+# Repository governance and protected automation
+/.gitattributes @Ayumudayo
+/.github/CODEOWNERS @Ayumudayo
+/.github/workflows/** @Ayumudayo
+
+# FFmpeg trust anchors, policy, and build entry points
+/tools/ffmpeg/ffmpeg-release-signing-key.asc @Ayumudayo
+/tools/ffmpeg/ffmpeg-version.json @Ayumudayo
+/tools/ffmpeg/FfmpegSourceVerification.psm1 @Ayumudayo
+/tools/ffmpeg/build-minimal-ffmpeg.ps1 @Ayumudayo
+/tools/bootstrap-build-windows.ps1 @Ayumudayo
+/tools/size-report.ps1 @Ayumudayo
+/tools/test-ffmpeg-source-contract.ps1 @Ayumudayo
+/tools/test-release-sidecar.ps1 @Ayumudayo
+/tools/test-tauri-policy.ps1 @Ayumudayo
+/tools/test-vendor-diff-policy.ps1 @Ayumudayo
+
+# Current legacy payload and future normalized vendor records
+/src-tauri/tauri.conf.json @Ayumudayo
+/src-tauri/binaries/** @Ayumudayo
+/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe @Ayumudayo
+/src-tauri/binaries/libwinpthread-1.dll @Ayumudayo
+/src-tauri/binaries/LICENSE-ffmpeg-BtbN.txt @Ayumudayo
+/src-tauri/binaries/LICENSE-ffmpeg.txt @Ayumudayo
+/src-tauri/binaries/LICENSE-libwinpthread.txt @Ayumudayo
+/src-tauri/binaries/ffmpeg-provenance.json @Ayumudayo

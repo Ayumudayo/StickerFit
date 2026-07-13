@@ -5,6 +5,7 @@ import type {
 } from "../../types/workflow";
 import {
   formatDuration,
+  formatElapsedTime,
   formatKiB,
   formatSimilarityScore,
   selectionReasonLabel,
@@ -33,19 +34,22 @@ export function ResultsStack({
   }
 
   const selectedCandidateId = searchResult
-    ? searchResult.winningCandidateId ?? searchResult.closestCandidateId
+    ? (searchResult.winningCandidateId ?? searchResult.closestCandidateId)
     : null;
-  const selectedAttempt = selectedCandidateId && searchResult
-    ? searchResult.attempts.find((attempt) => attempt.candidateId === selectedCandidateId) ?? null
-    : null;
+  const selectedAttempt =
+    selectedCandidateId && searchResult
+      ? (searchResult.attempts.find(
+          (attempt) => attempt.candidateId === selectedCandidateId,
+        ) ?? null)
+      : null;
   const bestOutputPathLabel =
     variant === "dock" && searchResult?.bestOutputPath
       ? compactPathLabel(searchResult.bestOutputPath, 56)
-      : searchResult?.bestOutputPath ?? null;
+      : (searchResult?.bestOutputPath ?? null);
   const conversionOutputPathLabel =
     variant === "dock" && conversionResult?.outputPath
       ? compactPathLabel(conversionResult.outputPath, 56)
-      : conversionResult?.outputPath ?? null;
+      : (conversionResult?.outputPath ?? null);
 
   return (
     <section className="bottomPanelsStack" aria-live="polite">
@@ -62,10 +66,18 @@ export function ResultsStack({
             <p className="summaryText">{searchResult.summary}</p>
           )}
 
-          <section className={searchResult.ok ? "resultCard resultOk resultCardInline" : "resultCard resultError resultCardInline"}>
+          <section
+            className={
+              searchResult.ok
+                ? "resultCard resultOk resultCardInline"
+                : "resultCard resultError resultCardInline"
+            }
+          >
             <p className="detailText resultSelectionReason">
               <span className="metaLabel">{copy.selectionBasis}</span>
-              <span>{selectionReasonLabel(searchResult.selectionReason, copy)}</span>
+              <span>
+                {selectionReasonLabel(searchResult.selectionReason, copy)}
+              </span>
             </p>
             {selectedAttempt ? (
               <p className="summaryText">{selectedAttempt.summary}</p>
@@ -73,7 +85,9 @@ export function ResultsStack({
             <div className="resultMetaGrid">
               <article className="metricPill">
                 <span className="metaLabel">{copy.bestOutput}</span>
-                <strong>{searchResult.bestWithinLimit ? copy.fits : copy.over}</strong>
+                <strong>
+                  {searchResult.bestWithinLimit ? copy.fits : copy.over}
+                </strong>
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.size}</span>
@@ -81,11 +95,17 @@ export function ResultsStack({
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.duration}</span>
-                <strong>{formatDuration(searchResult.selectedDurationSeconds, locale)}</strong>
+                <strong>
+                  {formatDuration(searchResult.selectedDurationSeconds, locale)}
+                </strong>
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.sourceMatch}</span>
-                <strong>{formatSimilarityScore(selectedAttempt?.sourceSimilarityScore ?? null)}</strong>
+                <strong>
+                  {formatSimilarityScore(
+                    selectedAttempt?.sourceSimilarityScore ?? null,
+                  )}
+                </strong>
               </article>
             </div>
             {searchResult.bestOutputPath ? (
@@ -96,7 +116,9 @@ export function ResultsStack({
                 <button
                   className="secondaryAction"
                   type="button"
-                  onClick={() => onOpenOutputFolder(searchResult.bestOutputPath)}
+                  onClick={() =>
+                    onOpenOutputFolder(searchResult.bestOutputPath)
+                  }
                 >
                   {copy.openOutputFolder}
                 </button>
@@ -113,7 +135,9 @@ export function ResultsStack({
               <div>
                 <h2>{copy.pngConversion}</h2>
                 <p className="summaryText">
-                  {conversionResult.ok ? copy.pngCreated : copy.pngConversionFailed}
+                  {conversionResult.ok
+                    ? copy.pngCreated
+                    : copy.pngConversionFailed}
                 </p>
               </div>
             </div>
@@ -123,7 +147,35 @@ export function ResultsStack({
             </p>
           )}
 
-          <section className={conversionResult.ok ? "resultCard resultOk resultCardInline" : "resultCard resultError resultCardInline"}>
+          <section
+            className={
+              conversionResult.ok
+                ? "resultCard resultOk resultCardInline"
+                : "resultCard resultError resultCardInline"
+            }
+          >
+            <div className="resultMetaGrid">
+              <article className="metricPill">
+                <span className="metaLabel">{copy.actualOutputSize}</span>
+                <strong>{formatKiB(conversionResult.sizeBytes)}</strong>
+              </article>
+              <article className="metricPill">
+                <span className="metaLabel">{copy.elapsedTime}</span>
+                <strong>
+                  {formatElapsedTime(conversionResult.elapsedMs, locale)}
+                </strong>
+              </article>
+            </div>
+            {conversionResult.warnings.length > 0 ? (
+              <div className="warningBox">
+                <p className="metaLabel">{copy.warnings}</p>
+                <ul className="warningList">
+                  {conversionResult.warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             {conversionResult.outputPath ? (
               <div className="outputPathRow">
                 <code className="pathCode" title={conversionResult.outputPath}>
@@ -132,7 +184,9 @@ export function ResultsStack({
                 <button
                   className="secondaryAction"
                   type="button"
-                  onClick={() => onOpenOutputFolder(conversionResult.outputPath)}
+                  onClick={() =>
+                    onOpenOutputFolder(conversionResult.outputPath)
+                  }
                 >
                   {copy.openOutputFolder}
                 </button>

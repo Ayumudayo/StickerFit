@@ -1,7 +1,11 @@
-import type { ChangeEvent, RefObject } from "react";
+import { type ChangeEvent, type RefObject, useId } from "react";
 
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 import type { EditorText } from "../../locales/editorText";
-import type { FrameDurationDialogMode, FrameDurationDialogState } from "../../types/editor";
+import type {
+  FrameDurationDialogMode,
+  FrameDurationDialogState,
+} from "../../types/editor";
 
 type FrameDialogsProps = {
   ui: EditorText;
@@ -44,6 +48,20 @@ export function FrameDialogs({
   onApplyNthFrameSelection,
   onCloseNthSelectionDialog,
 }: FrameDialogsProps) {
+  const frameDurationTitleId = useId();
+  const nthSelectionTitleId = useId();
+
+  useDialogFocus({
+    isOpen: frameDurationDialog !== null,
+    dialogRef: frameDurationDialogRef,
+    onClose: onCloseFrameDurationDialog,
+  });
+  useDialogFocus({
+    isOpen: showNthSelectionDialog,
+    dialogRef: nthSelectionDialogRef,
+    onClose: onCloseNthSelectionDialog,
+  });
+
   return (
     <>
       {frameDurationDialog ? (
@@ -53,9 +71,17 @@ export function FrameDialogs({
             className="dialogCard"
             role="dialog"
             aria-modal="true"
+            aria-labelledby={frameDurationTitleId}
+            tabIndex={-1}
           >
             <div className="cardHeading">
-              <h3>{ui.frameDurationDialogTitle}</h3>
+              <h3
+                id={frameDurationTitleId}
+                data-dialog-initial-focus
+                tabIndex={-1}
+              >
+                {ui.frameDurationDialogTitle}
+              </h3>
             </div>
             <div className="durationDialogBody">
               <label className="durationModeRow">
@@ -91,7 +117,9 @@ export function FrameDialogs({
                   step={0.05}
                   value={frameDurationSecondsValue.toFixed(2)}
                   onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                    onFrameDurationSecondsChange(Number(event.target.value) || 0.01)
+                    onFrameDurationSecondsChange(
+                      Number(event.target.value) || 0.01,
+                    )
                   }
                   disabled={frameDurationMode !== "seconds"}
                 />
@@ -105,11 +133,17 @@ export function FrameDialogs({
               <button
                 type="button"
                 className="primaryAction"
-                onClick={() => onApplyFrameDuration(frameDurationDialog.durationUs)}
+                onClick={() =>
+                  onApplyFrameDuration(frameDurationDialog.durationUs)
+                }
               >
                 {ui.confirm}
               </button>
-              <button type="button" className="secondaryAction" onClick={onCloseFrameDurationDialog}>
+              <button
+                type="button"
+                className="secondaryAction"
+                onClick={onCloseFrameDurationDialog}
+              >
                 {ui.cancel}
               </button>
             </div>
@@ -124,9 +158,17 @@ export function FrameDialogs({
             className="dialogCard"
             role="dialog"
             aria-modal="true"
+            aria-labelledby={nthSelectionTitleId}
+            tabIndex={-1}
           >
             <div className="cardHeading">
-              <h3>{ui.nthFrameDialogTitle}</h3>
+              <h3
+                id={nthSelectionTitleId}
+                data-dialog-initial-focus
+                tabIndex={-1}
+              >
+                {ui.nthFrameDialogTitle}
+              </h3>
             </div>
             <div className="durationDialogBody">
               <label className="field">
@@ -138,16 +180,26 @@ export function FrameDialogs({
                   step={1}
                   value={nthSelectionStep}
                   onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                    onNthSelectionStepChange(Math.max(2, Number(event.target.value) || 2))
+                    onNthSelectionStepChange(
+                      Math.max(2, Number(event.target.value) || 2),
+                    )
                   }
                 />
               </label>
             </div>
             <div className="dialogActionRow">
-              <button type="button" className="primaryAction" onClick={onApplyNthFrameSelection}>
+              <button
+                type="button"
+                className="primaryAction"
+                onClick={onApplyNthFrameSelection}
+              >
                 {ui.confirm}
               </button>
-              <button type="button" className="secondaryAction" onClick={onCloseNthSelectionDialog}>
+              <button
+                type="button"
+                className="secondaryAction"
+                onClick={onCloseNthSelectionDialog}
+              >
                 {ui.cancel}
               </button>
             </div>

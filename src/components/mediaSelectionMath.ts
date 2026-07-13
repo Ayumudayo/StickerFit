@@ -7,7 +7,8 @@ export type CropRegion = {
   height: number;
 };
 
-export type CropAspectRatioPreset = "free" | "1:1" | "4:3" | "3:4" | "16:9" | "9:16";
+export type CropAspectRatioPreset =
+  "free" | "1:1" | "4:3" | "3:4" | "16:9" | "9:16";
 export type PreviewZoomMode = "fit" | "manual";
 export type PreviewKind = "video" | "image";
 
@@ -450,14 +451,14 @@ export function nextCropRegionFromDrag(params: {
   if (dragKind === "create") {
     return lockedAspectRatio && sourceWidth && sourceHeight
       ? cropRegionFromAnchoredAspectRatio(
-        startX,
-        startY,
-        pointX,
-        pointY,
-        sourceWidth,
-        sourceHeight,
-        lockedAspectRatio,
-      )
+          startX,
+          startY,
+          pointX,
+          pointY,
+          sourceWidth,
+          sourceHeight,
+          lockedAspectRatio,
+        )
       : cropRegionFromPoints(startX, startY, pointX, pointY);
   }
 
@@ -472,22 +473,22 @@ export function nextCropRegionFromDrag(params: {
   if (resizeHandle) {
     return lockedAspectRatio && sourceWidth && sourceHeight
       ? resizeCropRegionFromHandleWithAspectRatio(
-        initialRegion,
-        resizeHandle,
-        pointX,
-        pointY,
-        sourceWidth,
-        sourceHeight,
-        lockedAspectRatio,
-      )
-      : normalizeCropRegion(
-        resizeCropRegionFromHandle(
           initialRegion,
           resizeHandle,
           pointX,
           pointY,
-        ),
-      );
+          sourceWidth,
+          sourceHeight,
+          lockedAspectRatio,
+        )
+      : normalizeCropRegion(
+          resizeCropRegionFromHandle(
+            initialRegion,
+            resizeHandle,
+            pointX,
+            pointY,
+          ),
+        );
   }
 
   return initialRegion;

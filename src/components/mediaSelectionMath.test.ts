@@ -18,9 +18,14 @@ describe("mediaSelectionMath", () => {
   it("summarizes full-frame and cropped selections", () => {
     expect(selectionSummary(FULL_CROP_REGION, MESSAGES.en)).toBe("Full frame");
     expect(
-      selectionSummary({ x: 0.1, y: 0.2, width: 0.5, height: 0.75 }, MESSAGES.en),
+      selectionSummary(
+        { x: 0.1, y: 0.2, width: 0.5, height: 0.75 },
+        MESSAGES.en,
+      ),
     ).toBe("50% x 75%");
-    expect(selectionSummary(FULL_CROP_REGION, MESSAGES.en, 200, 200)).toBe("Full frame");
+    expect(selectionSummary(FULL_CROP_REGION, MESSAGES.en, 200, 200)).toBe(
+      "Full frame",
+    );
     expect(
       selectionSummary(
         { x: 0.1, y: 0.2, width: 0.5, height: 0.75 },

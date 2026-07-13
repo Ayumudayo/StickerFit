@@ -32,8 +32,12 @@ export function PickerGrid({
   onResetOutputDirectory,
   onOpenOutputFolder,
 }: PickerGridProps) {
-  const compactInputLabel = hasInputPath ? compactPathLabel(inputLabel) : inputLabel;
-  const compactOutputLabel = hasOutputDirectory ? compactPathLabel(outputLabel) : outputLabel;
+  const compactInputLabel = hasInputPath
+    ? compactPathLabel(inputLabel)
+    : inputLabel;
+  const compactOutputLabel = hasOutputDirectory
+    ? compactPathLabel(outputLabel)
+    : outputLabel;
 
   return (
     <section className="desktopPickerGrid">
@@ -42,9 +46,17 @@ export function PickerGrid({
           <span className="metaLabel">{copy.sourceFile}</span>
         </div>
         <div className="pickerControlRow">
-          <div className={hasInputPath ? "pickerDisplaySurface" : "pickerDisplaySurface is-empty"}>
+          <div
+            className={
+              hasInputPath
+                ? "pickerDisplaySurface"
+                : "pickerDisplaySurface is-empty"
+            }
+          >
             <FileVideoIcon size={18} className="pickerSurfaceIcon" />
-            <strong className="pathValue" title={inputLabel}>{compactInputLabel}</strong>
+            <strong className="pathValue" title={inputLabel}>
+              {compactInputLabel}
+            </strong>
           </div>
           <button
             className="secondaryAction desktopSelectButton"
@@ -63,16 +75,28 @@ export function PickerGrid({
           <span className="metaLabel">{copy.outputFolder}</span>
         </div>
         <div className="pickerControlRow">
-          <div className={hasOutputDirectory ? "pickerDisplaySurface" : "pickerDisplaySurface is-muted"}>
+          <div
+            className={
+              hasOutputDirectory
+                ? "pickerDisplaySurface"
+                : "pickerDisplaySurface is-muted"
+            }
+          >
             <FolderDownIcon size={18} className="pickerSurfaceIcon" />
-            <strong className="pathValue" title={outputLabel}>{compactOutputLabel}</strong>
+            <strong className="pathValue" title={outputLabel}>
+              {compactOutputLabel}
+            </strong>
           </div>
           <div className="desktopPickerActions">
             <button
               className="secondaryAction iconButtonAction"
               type="button"
               onClick={onPickOutputDirectory}
-              title={outputActionsDisabled ? copy.desktopOnlyFeature : copy.chooseFolder}
+              title={
+                outputActionsDisabled
+                  ? copy.desktopOnlyFeature
+                  : copy.chooseFolder
+              }
               aria-label={
                 outputActionsDisabled
                   ? `${copy.chooseFolder}. ${copy.desktopOnlyFeature}`
@@ -87,7 +111,9 @@ export function PickerGrid({
               type="button"
               onClick={onResetOutputDirectory}
               disabled={outputActionsDisabled}
-              title={outputActionsDisabled ? copy.desktopOnlyFeature : undefined}
+              title={
+                outputActionsDisabled ? copy.desktopOnlyFeature : undefined
+              }
               aria-label={
                 outputActionsDisabled
                   ? `${copy.useSourceFolder}. ${copy.desktopOnlyFeature}`

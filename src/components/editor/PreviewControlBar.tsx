@@ -1,40 +1,30 @@
-import type { CSSProperties, PointerEventHandler, RefObject } from "react";
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEventHandler,
+  RefObject,
+} from "react";
 import { useMemo } from "react";
 
 import type { MessagesForLocale, Locale } from "../../locales/messages";
 import type { EditorText } from "../../locales/editorText";
 import type { PreviewZoomMode } from "../../components/MediaSelectionPreview";
-import type { FrameSelectionModel, TimelineFrameView } from "../../types/editor";
-import { formatTimelineTime } from "../../utils/timelineFrames";
+import type {
+  FrameSelectionModel,
+  TimelineFrameView,
+} from "../../types/editor";
+import { buildTimelineSegmentBuckets } from "../../utils/timelineSegments";
+import {
+  formatTimelineTime,
+  microsecondsToSeconds,
+} from "../../utils/timelineFrames";
 import { PauseIcon, PlayIcon } from "../AppIcons";
 
-const LARGE_TIMELINE_SEGMENT_THRESHOLD = 160;
-const TIMELINE_SEGMENT_FILL = "rgba(255, 255, 255, 0.05)";
-const TIMELINE_SEGMENT_DIMMED_FILL = "rgba(255, 255, 255, 0.014)";
+const TIMELINE_PAGE_STEP_US = 1_000_000;
 
-function formatPercent(value: number) {
-  return `${value.toFixed(4)}%`;
-}
-
-function buildTimelineSegmentBackground(
-  timelineFrameViews: TimelineFrameView[],
-  selectedInstanceIdSet: ReadonlySet<string>,
-) {
-  if (timelineFrameViews.length === 0) {
-    return "none";
-  }
-
-  const frameCount = timelineFrameViews.length;
-  return `linear-gradient(to right, ${timelineFrameViews
-    .map((frame, index) => {
-      const startPercent = formatPercent((index / frameCount) * 100);
-      const endPercent = formatPercent(((index + 1) / frameCount) * 100);
-      const fill = selectedInstanceIdSet.has(frame.instanceId)
-        ? TIMELINE_SEGMENT_FILL
-        : TIMELINE_SEGMENT_DIMMED_FILL;
-      return `${fill} ${startPercent} ${endPercent}`;
-    })
-    .join(", ")})`;
+function clampMicroseconds(value: number, maximum: number) {
+  const finiteValue = Number.isFinite(value) ? Math.round(value) : 0;
+  return Math.min(maximum, Math.max(0, finiteValue));
 }
 
 type PreviewControlBarProps = {
@@ -44,6 +34,8 @@ type PreviewControlBarProps = {
   isStaticImage: boolean;
   currentTime: number;
   totalDuration: number;
+  currentTimeUs: number;
+  totalDurationUs: number;
   timelineFrameViews: TimelineFrameView[];
   selection: FrameSelectionModel;
   isPlaying: boolean;
@@ -58,6 +50,7 @@ type PreviewControlBarProps = {
   onPointerMove: PointerEventHandler<HTMLDivElement>;
   onPointerUp: PointerEventHandler<HTMLDivElement>;
   onPointerCancel: PointerEventHandler<HTMLDivElement>;
+  onTimelineTimeChangeUs: (nextTimeUs: number) => void;
   onPreviewZoomFit: () => void;
   onPreviewZoomStep: (delta: number) => void;
   onPreviewZoomChange: (nextScale: number) => void;
@@ -70,6 +63,8 @@ export function PreviewControlBar({
   isStaticImage,
   currentTime,
   totalDuration,
+  currentTimeUs,
+  totalDurationUs,
   timelineFrameViews,
   selection,
   isPlaying,
@@ -84,24 +79,90 @@ export function PreviewControlBar({
   onPointerMove,
   onPointerUp,
   onPointerCancel,
+  onTimelineTimeChangeUs,
   onPreviewZoomFit,
   onPreviewZoomStep,
   onPreviewZoomChange,
 }: PreviewControlBarProps) {
-  const useDenseTimelineSegments =
-    timelineFrameViews.length >= LARGE_TIMELINE_SEGMENT_THRESHOLD;
-  const timelineSegmentsStyle = useMemo<CSSProperties | undefined>(() => {
-    if (!useDenseTimelineSegments) {
-      return undefined;
+  const normalizedTotalDurationUs = Math.max(
+    0,
+    Number.isFinite(totalDurationUs) ? Math.round(totalDurationUs) : 0,
+  );
+  const normalizedCurrentTimeUs = clampMicroseconds(
+    currentTimeUs,
+    normalizedTotalDurationUs,
+  );
+  const timelineSegmentBuckets = useMemo(
+    () =>
+      buildTimelineSegmentBuckets({
+        frames: timelineFrameViews,
+        currentTimeUs: normalizedCurrentTimeUs,
+        selectedInstanceIds: selection.selectedInstanceIdSet,
+      }),
+    [
+      normalizedCurrentTimeUs,
+      selection.selectedInstanceIdSet,
+      timelineFrameViews,
+    ],
+  );
+  const timelineBoundariesUs = useMemo(() => {
+    const boundaries = timelineFrameViews.map((frame) =>
+      clampMicroseconds(frame.startTimeUs, normalizedTotalDurationUs),
+    );
+    boundaries.push(0, normalizedTotalDurationUs);
+    return [...new Set(boundaries)].sort((left, right) => left - right);
+  }, [normalizedTotalDurationUs, timelineFrameViews]);
+  const bucketDurationTotalUs = timelineSegmentBuckets.reduce(
+    (sum, bucket) => sum + bucket.durationUs,
+    0,
+  );
+
+  function handleTimelineKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    let nextTimeUs: number | null = null;
+
+    switch (event.key) {
+      case "ArrowLeft":
+      case "ArrowDown":
+        nextTimeUs =
+          [...timelineBoundariesUs]
+            .reverse()
+            .find((boundaryUs) => boundaryUs < normalizedCurrentTimeUs) ?? 0;
+        break;
+      case "ArrowRight":
+      case "ArrowUp":
+        nextTimeUs =
+          timelineBoundariesUs.find(
+            (boundaryUs) => boundaryUs > normalizedCurrentTimeUs,
+          ) ?? normalizedTotalDurationUs;
+        break;
+      case "Home":
+        nextTimeUs = 0;
+        break;
+      case "End":
+        nextTimeUs = normalizedTotalDurationUs;
+        break;
+      case "PageUp":
+        nextTimeUs = clampMicroseconds(
+          normalizedCurrentTimeUs + TIMELINE_PAGE_STEP_US,
+          normalizedTotalDurationUs,
+        );
+        break;
+      case "PageDown":
+        nextTimeUs = clampMicroseconds(
+          normalizedCurrentTimeUs - TIMELINE_PAGE_STEP_US,
+          normalizedTotalDurationUs,
+        );
+        break;
+      default:
+        return;
     }
 
-    return {
-      "--timeline-segment-background": buildTimelineSegmentBackground(
-        timelineFrameViews,
-        selection.selectedInstanceIdSet,
-      ),
-    } as CSSProperties;
-  }, [selection.selectedInstanceIdSet, timelineFrameViews, useDenseTimelineSegments]);
+    if (nextTimeUs === null) {
+      return;
+    }
+    event.preventDefault();
+    onTimelineTimeChangeUs(nextTimeUs);
+  }
 
   return (
     <section className="previewControlBar">
@@ -116,37 +177,46 @@ export function PreviewControlBar({
             {isPlaying ? <PauseIcon size={18} /> : <PlayIcon size={18} />}
           </button>
 
-          <section className="previewTransportRailBlock" aria-label={ui.timelineTitle}>
+          <section
+            className="previewTransportRailBlock"
+            aria-label={ui.timelineTitle}
+          >
             <div
               ref={timelineRailRef}
               className="timelineRail previewTimelineRail"
               style={timelineRailStyle}
+              role="slider"
+              tabIndex={0}
+              aria-label={ui.timelineTitle}
+              aria-orientation="horizontal"
+              aria-valuemin={0}
+              aria-valuemax={normalizedTotalDurationUs}
+              aria-valuenow={normalizedCurrentTimeUs}
+              aria-valuetext={formatTimelineTime(
+                microsecondsToSeconds(normalizedCurrentTimeUs),
+                locale,
+              )}
+              data-editor-interactive="true"
+              onKeyDown={handleTimelineKeyDown}
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
               onPointerCancel={onPointerCancel}
             >
-              <div
-                className={
-                  useDenseTimelineSegments
-                    ? "timelineSegments timelineSegmentsDense"
-                    : "timelineSegments"
-                }
-                style={timelineSegmentsStyle}
-                aria-hidden="true"
-              >
-                {!useDenseTimelineSegments
-                  ? timelineFrameViews.map((frame) => (
-                      <div
-                        key={frame.instanceId}
-                        className={
-                          selection.selectedInstanceIdSet.has(frame.instanceId)
-                            ? "timelineSegment"
-                            : "timelineSegment is-dimmed"
-                        }
-                      />
-                    ))
-                  : null}
+              <div className="timelineSegments" aria-hidden="true">
+                {timelineSegmentBuckets.map((bucket) => (
+                  <div
+                    key={`${bucket.firstFrameIndex}-${bucket.lastFrameIndex}`}
+                    className={`timelineSegment${bucket.containsSelected ? "" : " is-dimmed"}${bucket.containsCurrent ? " is-current" : ""}`}
+                    style={{
+                      flex: `0 0 ${
+                        bucketDurationTotalUs > 0
+                          ? (bucket.durationUs / bucketDurationTotalUs) * 100
+                          : 100 / timelineSegmentBuckets.length
+                      }%`,
+                    }}
+                  />
+                ))}
               </div>
 
               <div className="timelinePlayhead" aria-hidden="true" />
@@ -154,7 +224,10 @@ export function PreviewControlBar({
 
             <div className="previewTransportMeta">
               <span>{formatTimelineTime(0, locale)}</span>
-              <span>{formatTimelineTime(currentTime, locale)} / {formatTimelineTime(totalDuration, locale)}</span>
+              <span>
+                {formatTimelineTime(currentTime, locale)} /{" "}
+                {formatTimelineTime(totalDuration, locale)}
+              </span>
               <span>{formatTimelineTime(totalDuration, locale)}</span>
             </div>
           </section>
@@ -162,7 +235,9 @@ export function PreviewControlBar({
       ) : null}
 
       <div className="previewZoomBar">
-        <span className="previewZoomDockReadout" aria-live="polite">{previewZoomPercent}%</span>
+        <span className="previewZoomDockReadout" aria-live="polite">
+          {previewZoomPercent}%
+        </span>
         <button
           className="secondaryAction previewZoomDockStepButton"
           type="button"
@@ -180,7 +255,9 @@ export function PreviewControlBar({
           max={400}
           step={0.5}
           value={previewZoomSliderValue}
-          onChange={(event) => onPreviewZoomChange(Number(event.target.value) / 100)}
+          onChange={(event) =>
+            onPreviewZoomChange(Number(event.target.value) / 100)
+          }
         />
         <button
           className="secondaryAction previewZoomDockStepButton"
@@ -191,7 +268,11 @@ export function PreviewControlBar({
           +
         </button>
         <button
-          className={previewZoomMode === "fit" ? "secondaryAction previewZoomDockButton is-active" : "secondaryAction previewZoomDockButton"}
+          className={
+            previewZoomMode === "fit"
+              ? "secondaryAction previewZoomDockButton is-active"
+              : "secondaryAction previewZoomDockButton"
+          }
           type="button"
           aria-pressed={previewZoomMode === "fit"}
           onClick={onPreviewZoomFit}

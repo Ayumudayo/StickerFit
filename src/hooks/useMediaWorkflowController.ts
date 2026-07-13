@@ -1,45 +1,60 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   FULL_CROP_REGION,
   type CropAspectRatioPreset,
   type CropRegion,
 } from "../components/MediaSelectionPreview";
-import { getAppRuntime } from "../platform/runtime";
-import { useMediaInputSelector } from "./mediaWorkflow/useMediaInputSelector";
-import { useToolHealthReport } from "./mediaWorkflow/useToolHealthReport";
-import type { Locale } from "../locales/messages";
+import { type Locale } from "../locales/messages";
+import { getAppRuntime, normalizeLegacyMediaError } from "../platform/runtime";
+import { createMediaOperationId } from "../platform/mediaOperationId";
 import type {
-  FitMode,
   MediaInspection,
   OptimizerGoal,
   OptimizerPlanRequest,
-  OptimizerPresetStrategy,
   OptimizerPlanResponse,
+  OptimizerPresetStrategy,
   OptimizerSearchDepth,
-  OptimizerSearchRequest,
   OptimizerSearchResponse,
-  StaticImageConversionRequest,
+  OperationProgress,
   StaticImageConversionResult,
   TimelineFrameRequest,
 } from "../types/workflow";
+import {
+  buildOptimizerSearchRequest,
+  buildStaticImageConversionRequest,
+} from "./mediaWorkflow/mediaRequestBuilders";
+import { normalizeOptimizerStopReason } from "../utils/outputSizeEstimate";
+import {
+  isCurrentWorkflowRequest,
+  workflowStateFromResult,
+  type VersionedWorkflowState,
+  type WorkflowFingerprints,
+  type WorkflowRequestTicket,
+  type WorkflowResultEnvelope,
+} from "./mediaWorkflow/workflowFingerprint";
+import { useMediaInputSelector } from "./mediaWorkflow/useMediaInputSelector";
+import { useToolHealthReport } from "./mediaWorkflow/useToolHealthReport";
 
 type UseMediaWorkflowControllerParams = {
   locale: Locale;
   initialLocale: Locale;
-  advancedPreviewCount: number;
   onCommitEditorSession: () => void;
+  getCurrentWorkflowFingerprints: () => WorkflowFingerprints;
 };
 
 type WorkflowRequestContext = {
   baseFrameCount: number;
   editedTimelineFramesForRequest: TimelineFrameRequest[] | undefined;
+  fingerprint: string;
 };
 
-type OptimizerBaseRequestContext = WorkflowRequestContext & {
+export type OptimizerBaseRequestContext = Omit<
+  WorkflowRequestContext,
+  "fingerprint"
+> & {
   inspection: MediaInspection;
   locale: Locale;
-  fitMode: FitMode;
   presetStrategy: OptimizerPresetStrategy;
   optimizerGoal: OptimizerGoal;
   qualityFrameDropInterval: number;
@@ -47,10 +62,11 @@ type OptimizerBaseRequestContext = WorkflowRequestContext & {
   cropRegion: CropRegion;
 };
 
-function buildOptimizerBaseRequest({
+type WorkflowFingerprintKind = "planner" | "export";
+
+export function buildOptimizerPlanRequest({
   inspection,
   locale,
-  fitMode,
   presetStrategy,
   optimizerGoal,
   qualityFrameDropInterval,
@@ -65,7 +81,6 @@ function buildOptimizerBaseRequest({
     inputWidth: inspection.width,
     inputHeight: inspection.height,
     avgFps: inspection.avgFps,
-    fitMode,
     presetStrategy,
     optimizerGoal,
     qualityFrameDropInterval,
@@ -80,15 +95,31 @@ function buildOptimizerBaseRequest({
 export function useMediaWorkflowController({
   locale,
   initialLocale,
-  advancedPreviewCount,
   onCommitEditorSession,
+  getCurrentWorkflowFingerprints,
 }: UseMediaWorkflowControllerParams) {
   const runtime = getAppRuntime();
-  const [plan, setPlan] = useState<OptimizerPlanResponse | null>(null);
-  const [searchResult, setSearchResult] = useState<OptimizerSearchResponse | null>(null);
-  const [conversionResult, setConversionResult] =
-    useState<StaticImageConversionResult | null>(null);
-  const [fitMode, setFitMode] = useState<FitMode>("contain");
+  const [planState, setPlanState] = useState<
+    VersionedWorkflowState<OptimizerPlanResponse, OperationProgress>
+  >({
+    status: "idle",
+    revision: 0,
+    fingerprint: "",
+  });
+  const [searchState, setSearchState] = useState<
+    VersionedWorkflowState<OptimizerSearchResponse, OperationProgress>
+  >({
+    status: "idle",
+    revision: 0,
+    fingerprint: "",
+  });
+  const [conversionState, setConversionState] = useState<
+    VersionedWorkflowState<StaticImageConversionResult, OperationProgress>
+  >({
+    status: "idle",
+    revision: 0,
+    fingerprint: "",
+  });
   const [optimizerPresetStrategy, setOptimizerPresetStrategy] =
     useState<OptimizerPresetStrategy>("auto");
   const [optimizerGoal, setOptimizerGoal] = useState<OptimizerGoal>("balanced");
@@ -98,23 +129,97 @@ export function useMediaWorkflowController({
   const [cropRegion, setCropRegion] = useState<CropRegion>(FULL_CROP_REGION);
   const [cropAspectRatioPreset, setCropAspectRatioPreset] =
     useState<CropAspectRatioPreset>("free");
-  const [planLoading, setPlanLoading] = useState(false);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [conversionLoading, setConversionLoading] = useState(false);
-  const [plannerError, setPlannerError] = useState<string | null>(null);
 
-  const resetWorkflowDerivedState = useCallback(() => {
-    setPlan(null);
-    setSearchResult(null);
-    setConversionResult(null);
-    setPlannerError(null);
-    setCropRegion(FULL_CROP_REGION);
-    setCropAspectRatioPreset("free");
+  const planTicketRef = useRef(0);
+  const searchTicketRef = useRef(0);
+  const conversionTicketRef = useRef(0);
+  const planAbortControllerRef = useRef<AbortController | null>(null);
+  const searchAbortControllerRef = useRef<AbortController | null>(null);
+  const conversionAbortControllerRef = useRef<AbortController | null>(null);
+  const workflowRevisionRef = useRef(0);
+  const invalidatedFingerprintsRef = useRef<WorkflowFingerprints | null>(null);
+  const mountedRef = useRef(true);
+
+  const nextWorkflowRevision = useCallback(() => {
+    workflowRevisionRef.current += 1;
+    return workflowRevisionRef.current;
   }, []);
 
+  const invalidateWorkflowResults = useCallback(
+    (fingerprints: WorkflowFingerprints, force = false) => {
+      const previous = invalidatedFingerprintsRef.current;
+
+      if (force || previous?.planner !== fingerprints.planner) {
+        planAbortControllerRef.current?.abort();
+        planTicketRef.current += 1;
+        setPlanState({
+          status: "idle",
+          revision: nextWorkflowRevision(),
+          fingerprint: fingerprints.planner,
+        });
+      }
+
+      if (force || previous?.export !== fingerprints.export) {
+        searchAbortControllerRef.current?.abort();
+        conversionAbortControllerRef.current?.abort();
+        searchTicketRef.current += 1;
+        conversionTicketRef.current += 1;
+        setSearchState({
+          status: "idle",
+          revision: nextWorkflowRevision(),
+          fingerprint: fingerprints.export,
+        });
+        setConversionState({
+          status: "idle",
+          revision: nextWorkflowRevision(),
+          fingerprint: fingerprints.export,
+        });
+      }
+
+      invalidatedFingerprintsRef.current = fingerprints;
+    },
+    [nextWorkflowRevision],
+  );
+
+  const isCurrentOperation = useCallback(
+    (
+      kind: WorkflowFingerprintKind,
+      ticket: WorkflowRequestTicket,
+      currentTicket: number,
+    ) =>
+      mountedRef.current &&
+      isCurrentWorkflowRequest(
+        ticket,
+        currentTicket,
+        getCurrentWorkflowFingerprints()[kind],
+      ),
+    [getCurrentWorkflowFingerprints],
+  );
+
+  const isCurrentProgressUpdate = useCallback(
+    (
+      kind: WorkflowFingerprintKind,
+      ticket: WorkflowRequestTicket,
+      currentTicket: number,
+      controllerRef: { current: AbortController | null },
+      controller: AbortController,
+    ) =>
+      mountedRef.current &&
+      controllerRef.current === controller &&
+      isCurrentWorkflowRequest(
+        ticket,
+        currentTicket,
+        getCurrentWorkflowFingerprints()[kind],
+      ),
+    [getCurrentWorkflowFingerprints],
+  );
+
   const resetForNewInspection = useCallback(() => {
-    resetWorkflowDerivedState();
-  }, [resetWorkflowDerivedState]);
+    invalidateWorkflowResults(getCurrentWorkflowFingerprints(), true);
+    setCropRegion(FULL_CROP_REGION);
+    setCropAspectRatioPreset("free");
+  }, [getCurrentWorkflowFingerprints, invalidateWorkflowResults]);
+
   const { toolReport, toolError } = useToolHealthReport(runtime, initialLocale);
   const {
     inspection,
@@ -132,79 +237,178 @@ export function useMediaWorkflowController({
     onCommitEditorSession,
   });
 
-  const buildPlan = useCallback(async ({ baseFrameCount, editedTimelineFramesForRequest }: WorkflowRequestContext) => {
-    if (!inspection?.ok || inspection.isStaticImage) {
-      return null;
-    }
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      planAbortControllerRef.current?.abort();
+      searchAbortControllerRef.current?.abort();
+      conversionAbortControllerRef.current?.abort();
+      planTicketRef.current += 1;
+      searchTicketRef.current += 1;
+      conversionTicketRef.current += 1;
+    };
+  }, []);
 
-    setPlanLoading(true);
-    setPlannerError(null);
-    setSearchResult(null);
-
-    try {
-      if (!runtime.capabilities.backendProcessing) {
-        throw new Error("Desktop optimization is unavailable in browser preview mode.");
+  const buildPlan = useCallback(
+    async ({
+      baseFrameCount,
+      editedTimelineFramesForRequest,
+      fingerprint,
+    }: WorkflowRequestContext): Promise<WorkflowResultEnvelope<OptimizerPlanResponse> | null> => {
+      if (!inspection?.ok || inspection.isStaticImage) {
+        return null;
       }
 
-      const request = buildOptimizerBaseRequest({
-        inspection,
-        locale,
-        fitMode,
-        presetStrategy: optimizerPresetStrategy,
-        optimizerGoal,
-        qualityFrameDropInterval,
-        searchDepth: optimizerSearchDepth,
-        cropRegion,
-        baseFrameCount,
-        editedTimelineFramesForRequest,
+      planAbortControllerRef.current?.abort();
+      searchAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      planAbortControllerRef.current = controller;
+      const operationId = createMediaOperationId();
+
+      searchTicketRef.current += 1;
+      setSearchState({
+        status: "idle",
+        revision: nextWorkflowRevision(),
+        fingerprint: getCurrentWorkflowFingerprints().export,
       });
-      const result = await runtime.buildOptimizerPlan(request);
-      const trimmedResult = {
-        ...result,
-        candidates: result.candidates.slice(0, advancedPreviewCount),
+
+      const ticket: WorkflowRequestTicket = {
+        revision: planTicketRef.current + 1,
+        fingerprint,
       };
-      setPlan(trimmedResult);
-      if (!result.ok && result.errorMessage) {
-        setPlannerError(result.errorMessage);
-      }
-      return trimmedResult;
-    } catch (error) {
-      setPlannerError(error instanceof Error ? error.message : String(error));
-      return null;
-    } finally {
-      setPlanLoading(false);
-    }
-  }, [
-    advancedPreviewCount,
-    cropRegion,
-    fitMode,
-    inspection,
-    locale,
-    optimizerPresetStrategy,
-    optimizerGoal,
-    qualityFrameDropInterval,
-    optimizerSearchDepth,
-    runtime,
-  ]);
+      planTicketRef.current = ticket.revision;
+      const stateRevision = nextWorkflowRevision();
+      setPlanState({
+        status: "loading",
+        revision: stateRevision,
+        fingerprint,
+        progress: null,
+      });
 
-  const runBoundedSearch = useCallback(async ({ baseFrameCount, editedTimelineFramesForRequest }: WorkflowRequestContext) => {
-    if (!inspection?.ok || inspection.isStaticImage) {
-      return null;
-    }
+      try {
+        if (!runtime.capabilities.backendProcessing) {
+          throw new Error(
+            "Desktop optimization is unavailable in browser preview mode.",
+          );
+        }
 
-    setSearchLoading(true);
-    setPlannerError(null);
-
-    try {
-      if (!runtime.capabilities.backendProcessing || !inspection.backendInputPath) {
-        throw new Error("Desktop optimization is unavailable in browser preview mode.");
-      }
-
-      const request = {
-        ...buildOptimizerBaseRequest({
+        const request = buildOptimizerPlanRequest({
           inspection,
           locale,
-          fitMode,
+          presetStrategy: optimizerPresetStrategy,
+          optimizerGoal,
+          qualityFrameDropInterval,
+          searchDepth: optimizerSearchDepth,
+          cropRegion,
+          baseFrameCount,
+          editedTimelineFramesForRequest,
+        });
+        const result = await runtime.buildOptimizerPlan(request, {
+          operationId,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (
+              !isCurrentProgressUpdate(
+                "planner",
+                ticket,
+                planTicketRef.current,
+                planAbortControllerRef,
+                controller,
+              )
+            ) {
+              return;
+            }
+            setPlanState((current) =>
+              current.status === "loading" &&
+              current.revision === stateRevision &&
+              current.fingerprint === fingerprint
+                ? { ...current, progress }
+                : current,
+            );
+          },
+        });
+        if (!isCurrentOperation("planner", ticket, planTicketRef.current)) {
+          return null;
+        }
+
+        const nextState = workflowStateFromResult(
+          result,
+          stateRevision,
+          fingerprint,
+        );
+        setPlanState(nextState);
+        return nextState.status === "ready"
+          ? { fingerprint, value: result }
+          : null;
+      } catch (error) {
+        if (!isCurrentOperation("planner", ticket, planTicketRef.current)) {
+          return null;
+        }
+
+        const normalized = normalizeLegacyMediaError(error);
+        setPlanState(
+          normalized.errorCode === "cancelled"
+            ? { status: "cancelled", revision: stateRevision, fingerprint }
+            : {
+                status: "error",
+                revision: stateRevision,
+                fingerprint,
+                code: normalized.errorCode ?? "internal-task-failed",
+                reasonCode: normalized.reasonCode,
+                message: normalized.diagnostics ?? "",
+              },
+        );
+        return null;
+      } finally {
+        if (isCurrentOperation("planner", ticket, planTicketRef.current)) {
+          setPlanState((current) =>
+            current.status === "loading" &&
+            current.revision === stateRevision &&
+            current.fingerprint === fingerprint
+              ? {
+                  status: "cancelled",
+                  revision: stateRevision,
+                  fingerprint,
+                }
+              : current,
+          );
+        }
+        if (planAbortControllerRef.current === controller) {
+          planAbortControllerRef.current = null;
+        }
+      }
+    },
+    [
+      cropRegion,
+      getCurrentWorkflowFingerprints,
+      inspection,
+      isCurrentOperation,
+      isCurrentProgressUpdate,
+      locale,
+      nextWorkflowRevision,
+      optimizerGoal,
+      optimizerPresetStrategy,
+      optimizerSearchDepth,
+      qualityFrameDropInterval,
+      runtime,
+    ],
+  );
+
+  const runBoundedSearch = useCallback(
+    async ({
+      baseFrameCount,
+      editedTimelineFramesForRequest,
+      fingerprint,
+    }: WorkflowRequestContext): Promise<WorkflowResultEnvelope<OptimizerSearchResponse> | null> => {
+      if (!inspection?.ok || inspection.isStaticImage) {
+        return null;
+      }
+
+      const request = buildOptimizerSearchRequest(inspection, {
+        ...buildOptimizerPlanRequest({
+          inspection,
+          locale,
           presetStrategy: optimizerPresetStrategy,
           optimizerGoal,
           qualityFrameDropInterval,
@@ -213,68 +417,292 @@ export function useMediaWorkflowController({
           baseFrameCount,
           editedTimelineFramesForRequest,
         }),
-        inputPath: inspection.backendInputPath,
         outputDirectory,
-      } satisfies OptimizerSearchRequest;
-      const result = await runtime.runOptimizerSearch(request);
-      setSearchResult(result);
-      return result;
-    } catch (error) {
-      setPlannerError(error instanceof Error ? error.message : String(error));
-      return null;
-    } finally {
-      setSearchLoading(false);
-    }
-  }, [
-    cropRegion,
-    fitMode,
-    inspection,
-    locale,
-    optimizerPresetStrategy,
-    optimizerGoal,
-    qualityFrameDropInterval,
-    optimizerSearchDepth,
-    outputDirectory,
-    runtime,
-  ]);
-
-  const convertStaticImageToPng = useCallback(async () => {
-    if (!inspection?.ok || !inspection.isStaticImage) {
-      return;
-    }
-
-    setConversionLoading(true);
-    setPlannerError(null);
-
-    try {
-      if (!runtime.capabilities.backendProcessing || !inspection.backendInputPath) {
-        throw new Error("Desktop export is unavailable in browser preview mode.");
+      });
+      if (!request) {
+        return null;
       }
 
-      const result = await runtime.convertStaticImageToPng({
-        inputPath: inspection.backendInputPath,
+      planAbortControllerRef.current?.abort();
+      planTicketRef.current += 1;
+      setPlanState((current) =>
+        current.status === "loading"
+          ? {
+              status: "cancelled",
+              revision: current.revision,
+              fingerprint: current.fingerprint,
+            }
+          : current,
+      );
+
+      searchAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      searchAbortControllerRef.current = controller;
+      const operationId = createMediaOperationId();
+
+      const ticket: WorkflowRequestTicket = {
+        revision: searchTicketRef.current + 1,
+        fingerprint,
+      };
+      searchTicketRef.current = ticket.revision;
+      const stateRevision = nextWorkflowRevision();
+      setSearchState({
+        status: "loading",
+        revision: stateRevision,
+        fingerprint,
+        progress: null,
+      });
+
+      try {
+        if (!runtime.capabilities.backendProcessing) {
+          throw new Error(
+            "Desktop optimization is unavailable in browser preview mode.",
+          );
+        }
+
+        const result = await runtime.runOptimizerSearch(request, {
+          operationId,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (
+              !isCurrentProgressUpdate(
+                "export",
+                ticket,
+                searchTicketRef.current,
+                searchAbortControllerRef,
+                controller,
+              )
+            ) {
+              return;
+            }
+            setSearchState((current) =>
+              current.status === "loading" &&
+              current.revision === stateRevision &&
+              current.fingerprint === fingerprint
+                ? { ...current, progress }
+                : current,
+            );
+          },
+        });
+
+        if (!isCurrentOperation("export", ticket, searchTicketRef.current)) {
+          return null;
+        }
+
+        const normalizedResult = {
+          ...result,
+          stopReason: normalizeOptimizerStopReason(result.stopReason),
+        };
+        const nextState = workflowStateFromResult(
+          normalizedResult,
+          stateRevision,
+          fingerprint,
+        );
+        setSearchState(nextState);
+        return nextState.status === "ready"
+          ? { fingerprint, value: normalizedResult }
+          : null;
+      } catch (error) {
+        if (!isCurrentOperation("export", ticket, searchTicketRef.current)) {
+          return null;
+        }
+
+        const normalized = normalizeLegacyMediaError(error);
+        setSearchState(
+          normalized.errorCode === "cancelled"
+            ? { status: "cancelled", revision: stateRevision, fingerprint }
+            : {
+                status: "error",
+                revision: stateRevision,
+                fingerprint,
+                code: normalized.errorCode ?? "internal-task-failed",
+                reasonCode: normalized.reasonCode,
+                message: normalized.diagnostics ?? "",
+              },
+        );
+        return null;
+      } finally {
+        if (isCurrentOperation("export", ticket, searchTicketRef.current)) {
+          setSearchState((current) =>
+            current.status === "loading" &&
+            current.revision === stateRevision &&
+            current.fingerprint === fingerprint
+              ? {
+                  status: "cancelled",
+                  revision: stateRevision,
+                  fingerprint,
+                }
+              : current,
+          );
+        }
+        if (searchAbortControllerRef.current === controller) {
+          searchAbortControllerRef.current = null;
+        }
+      }
+    },
+    [
+      cropRegion,
+      inspection,
+      isCurrentOperation,
+      isCurrentProgressUpdate,
+      locale,
+      nextWorkflowRevision,
+      optimizerGoal,
+      optimizerPresetStrategy,
+      optimizerSearchDepth,
+      outputDirectory,
+      qualityFrameDropInterval,
+      runtime,
+    ],
+  );
+
+  const cancelOptimizerSearch = useCallback(() => {
+    searchAbortControllerRef.current?.abort();
+  }, []);
+
+  const convertStaticImageToPng = useCallback(
+    async (
+      fingerprint: string,
+    ): Promise<WorkflowResultEnvelope<StaticImageConversionResult> | null> => {
+      if (!inspection?.ok || !inspection.isStaticImage) {
+        return null;
+      }
+
+      const request = buildStaticImageConversionRequest(inspection, {
         outputDirectory,
         locale,
         cropRegion,
-      } satisfies StaticImageConversionRequest);
-      setConversionResult(result);
-    } catch (error) {
-      setPlannerError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setConversionLoading(false);
-    }
-  }, [cropRegion, inspection, locale, outputDirectory, runtime]);
+      });
+      if (!request) {
+        return null;
+      }
+
+      conversionAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      conversionAbortControllerRef.current = controller;
+      const operationId = createMediaOperationId();
+
+      const ticket: WorkflowRequestTicket = {
+        revision: conversionTicketRef.current + 1,
+        fingerprint,
+      };
+      conversionTicketRef.current = ticket.revision;
+      const stateRevision = nextWorkflowRevision();
+      setConversionState({
+        status: "loading",
+        revision: stateRevision,
+        fingerprint,
+        progress: null,
+      });
+
+      try {
+        if (!runtime.capabilities.backendProcessing) {
+          throw new Error(
+            "Desktop export is unavailable in browser preview mode.",
+          );
+        }
+
+        const result = await runtime.convertStaticImageToPng(request, {
+          operationId,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (
+              !isCurrentProgressUpdate(
+                "export",
+                ticket,
+                conversionTicketRef.current,
+                conversionAbortControllerRef,
+                controller,
+              )
+            ) {
+              return;
+            }
+            setConversionState((current) =>
+              current.status === "loading" &&
+              current.revision === stateRevision &&
+              current.fingerprint === fingerprint
+                ? { ...current, progress }
+                : current,
+            );
+          },
+        });
+
+        if (
+          !isCurrentOperation("export", ticket, conversionTicketRef.current)
+        ) {
+          return null;
+        }
+
+        const nextState = workflowStateFromResult(
+          result,
+          stateRevision,
+          fingerprint,
+        );
+        setConversionState(nextState);
+        return nextState.status === "ready"
+          ? { fingerprint, value: result }
+          : null;
+      } catch (error) {
+        if (
+          !isCurrentOperation("export", ticket, conversionTicketRef.current)
+        ) {
+          return null;
+        }
+
+        const normalized = normalizeLegacyMediaError(error);
+        setConversionState(
+          normalized.errorCode === "cancelled"
+            ? { status: "cancelled", revision: stateRevision, fingerprint }
+            : {
+                status: "error",
+                revision: stateRevision,
+                fingerprint,
+                code: normalized.errorCode ?? "internal-task-failed",
+                reasonCode: normalized.reasonCode,
+                message: normalized.diagnostics ?? "",
+              },
+        );
+        return null;
+      } finally {
+        if (isCurrentOperation("export", ticket, conversionTicketRef.current)) {
+          setConversionState((current) =>
+            current.status === "loading" &&
+            current.revision === stateRevision &&
+            current.fingerprint === fingerprint
+              ? {
+                  status: "cancelled",
+                  revision: stateRevision,
+                  fingerprint,
+                }
+              : current,
+          );
+        }
+        if (conversionAbortControllerRef.current === controller) {
+          conversionAbortControllerRef.current = null;
+        }
+      }
+    },
+    [
+      cropRegion,
+      inspection,
+      isCurrentOperation,
+      isCurrentProgressUpdate,
+      locale,
+      nextWorkflowRevision,
+      outputDirectory,
+      runtime,
+    ],
+  );
 
   return {
     runtime,
     toolReport,
     toolError,
     inspection,
-    plan,
-    searchResult,
-    conversionResult,
+    planState,
+    searchState,
+    conversionState,
     outputDirectory,
-    fitMode,
     optimizerPresetStrategy,
     optimizerGoal,
     qualityFrameDropInterval,
@@ -282,13 +710,8 @@ export function useMediaWorkflowController({
     cropRegion,
     cropAspectRatioPreset,
     inspectionLoading,
-    planLoading,
-    searchLoading,
-    conversionLoading,
-    plannerError,
     isDragging,
     setOutputDirectory,
-    setFitMode,
     setOptimizerPresetStrategy,
     setOptimizerGoal,
     setQualityFrameDropInterval,
@@ -300,6 +723,8 @@ export function useMediaWorkflowController({
     openOutputFolder,
     buildPlan,
     runBoundedSearch,
+    cancelOptimizerSearch,
     convertStaticImageToPng,
+    invalidateWorkflowResults,
   };
 }

@@ -1,6 +1,9 @@
 const COMPACT_PATH_LIMIT = 28;
 
-export function compactPathLabel(value: string, maxLength = COMPACT_PATH_LIMIT) {
+export function compactPathLabel(
+  value: string,
+  maxLength = COMPACT_PATH_LIMIT,
+) {
   const normalizedValue = value.trim();
   if (normalizedValue.length <= maxLength) {
     return normalizedValue;

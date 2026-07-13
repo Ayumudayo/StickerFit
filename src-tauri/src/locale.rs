@@ -66,12 +66,72 @@ pub(crate) fn crop_needs_source_height_error(locale: UiLocale) -> String {
     )
 }
 
-pub(crate) fn unknown_fit_mode_fallback_warning(locale: UiLocale) -> String {
+pub(crate) fn legacy_fit_mode_fallback_warning(locale: UiLocale) -> String {
     tr(
         locale,
-        "Unknown fit mode was received, so contain was used.",
-        "알 수 없는 맞춤 모드가 들어와 contain으로 처리했습니다.",
+        "A legacy or unknown fit mode was ignored; contain is now always used.",
+        "레거시 또는 알 수 없는 맞춤 모드는 무시되며, 이제 항상 contain으로 처리합니다.",
     )
+}
+
+pub(crate) fn media_pipeline_diagnostic(locale: UiLocale, error_code: &str) -> String {
+    match error_code {
+        "cancelled" => tr(
+            locale,
+            "The media operation was cancelled.",
+            "미디어 작업이 취소되었습니다.",
+        ),
+        "timed-out" => tr(
+            locale,
+            "The media operation timed out.",
+            "미디어 작업 시간이 초과되었습니다.",
+        ),
+        "operation-conflict" => tr(
+            locale,
+            "Another media operation is already using this resource.",
+            "다른 미디어 작업이 이 자원을 사용 중입니다.",
+        ),
+        "invalid-request" => tr(
+            locale,
+            "The media request is no longer valid.",
+            "미디어 요청이 더 이상 유효하지 않습니다.",
+        ),
+        "source-changed" => tr(
+            locale,
+            "The source file changed. Inspect it again before continuing.",
+            "원본 파일이 변경되었습니다. 계속하기 전에 다시 검사하세요.",
+        ),
+        "media-input-too-large"
+        | "media-dimensions-too-large"
+        | "media-frame-limit"
+        | "decoded-byte-limit"
+        | "png-chunk-limit" => tr(
+            locale,
+            "The media exceeds StickerFit's safe processing limits.",
+            "미디어가 StickerFit의 안전한 처리 한도를 초과했습니다.",
+        ),
+        "malformed-media" | "malformed-process-output" => tr(
+            locale,
+            "The media data is malformed or incomplete.",
+            "미디어 데이터가 손상되었거나 불완전합니다.",
+        ),
+        "tool-missing" => tr(
+            locale,
+            "A required media tool is unavailable.",
+            "필요한 미디어 도구를 사용할 수 없습니다.",
+        ),
+        "process-failed" => tr(
+            locale,
+            "A media tool could not complete the operation.",
+            "미디어 도구가 작업을 완료하지 못했습니다.",
+        ),
+        "output-conflict" => tr(
+            locale,
+            "The selected output already exists.",
+            "선택한 출력이 이미 존재합니다.",
+        ),
+        _ => internal_task_error_message(locale),
+    }
 }
 
 pub(crate) fn selected_duration_limit_error(locale: UiLocale) -> String {
@@ -98,6 +158,14 @@ pub(crate) fn invalid_frame_selection_error(locale: UiLocale) -> String {
     )
 }
 
+pub(crate) fn invalid_frame_duration_error(locale: UiLocale) -> String {
+    tr(
+        locale,
+        "One or more frame durations are invalid.",
+        "하나 이상의 프레임 길이가 올바르지 않습니다.",
+    )
+}
+
 pub(crate) fn recommended_duration_warning(locale: UiLocale) -> String {
     tr(
         locale,
@@ -106,11 +174,11 @@ pub(crate) fn recommended_duration_warning(locale: UiLocale) -> String {
     )
 }
 
-pub(crate) fn crop_applied_before_fit_warning(locale: UiLocale) -> String {
+pub(crate) fn crop_applied_before_scale_warning(locale: UiLocale) -> String {
     tr(
         locale,
-        "The selected crop area will be applied before fit and scale are evaluated.",
-        "선택한 크롭 영역을 먼저 적용한 뒤 맞춤 방식과 스케일을 계산합니다.",
+        "The selected crop area will be applied before output scale is evaluated.",
+        "선택한 크롭 영역을 먼저 적용한 뒤 출력 스케일을 계산합니다.",
     )
 }
 
@@ -175,6 +243,7 @@ pub(crate) fn missing_sidecar_reason(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn command_non_zero_exit_message(command_display: &str, locale: UiLocale) -> String {
     match locale {
         UiLocale::En => format!("{command_display} returned a non-zero exit code"),
@@ -219,6 +288,22 @@ pub(crate) fn native_video_detail(locale: UiLocale, format_name: &str) -> String
             format!("{format_name} 비디오 메타데이터를 Windows Media Foundation으로 읽었습니다.")
         }
     }
+}
+
+pub(crate) fn media_foundation_fallback_warning(locale: UiLocale) -> String {
+    tr(
+        locale,
+        "Windows Media Foundation could not inspect this file, so StickerFit used the bundled FFmpeg decoder.",
+        "Windows Media Foundation에서 이 파일을 검사하지 못해 StickerFit이 번들 FFmpeg 디코더를 사용했습니다.",
+    )
+}
+
+pub(crate) fn media_foundation_fallback_attempt_detail(locale: UiLocale) -> String {
+    tr(
+        locale,
+        "Windows Media Foundation could not inspect this file, so StickerFit attempted inspection with the bundled FFmpeg decoder.",
+        "Windows Media Foundation에서 이 파일을 검사하지 못해 StickerFit이 번들 FFmpeg 디코더로 검사를 시도했습니다.",
+    )
 }
 
 pub(crate) fn native_png_encode_detail(locale: UiLocale) -> String {

@@ -1,7 +1,12 @@
-import type { Locale, MessagesForLocale } from "../../locales/messages";
+import {
+  mediaOperationMessage,
+  type Locale,
+  type MessagesForLocale,
+} from "../../locales/messages";
 import type { OptimizerSearchResponse } from "../../types/workflow";
 import {
   formatDuration,
+  formatElapsedTime,
   formatKiB,
   formatSimilarityScore,
   selectionReasonLabel,
@@ -15,7 +20,6 @@ type EditorResultsOverlayProps = {
   copy: MessagesForLocale;
   locale: Locale;
   searchResult: OptimizerSearchResponse | null;
-  fitModeLabel: (value: string) => string;
   onOpenOutputFolder: (path?: string | null) => void;
 };
 
@@ -23,7 +27,6 @@ export function EditorResultsOverlay({
   copy,
   locale,
   searchResult,
-  fitModeLabel,
   onOpenOutputFolder,
 }: EditorResultsOverlayProps) {
   if (!searchResult) {
@@ -36,41 +39,89 @@ export function EditorResultsOverlay({
     );
   }
 
-  const selectedCandidateId = searchResult.winningCandidateId ?? searchResult.closestCandidateId;
+  const selectedCandidateId =
+    searchResult.winningCandidateId ?? searchResult.closestCandidateId;
   const selectedAttempt = selectedCandidateId
-    ? searchResult.attempts.find((attempt) => attempt.candidateId === selectedCandidateId) ?? null
+    ? (searchResult.attempts.find(
+        (attempt) => attempt.candidateId === selectedCandidateId,
+      ) ?? null)
     : null;
   const bestOutputPathLabel = searchResult.bestOutputPath
     ? compactPathLabel(searchResult.bestOutputPath, 72)
     : null;
+  const representativeFailure =
+    searchResult.attempts.find(
+      (attempt) => !attempt.skipped && attempt.errorCode !== null,
+    ) ?? null;
 
   return (
     <section className="editorResultsOverlay" aria-live="polite">
       <p className="summaryText">{searchResult.summary}</p>
 
+      {searchResult.warnings.length > 0 ? (
+        <section className="warningBox">
+          <p className="metaLabel">{copy.warnings}</p>
+          <ul className="warningList">
+            {searchResult.warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {representativeFailure ? (
+        <section
+          className="editorResultsSection resultRepresentativeError"
+          role="alert"
+        >
+          <p className="metaLabel">{copy.representativeError}</p>
+          <p className="detailText">
+            {mediaOperationMessage(
+              locale,
+              representativeFailure.errorCode,
+              representativeFailure.reasonCode,
+            )}
+          </p>
+        </section>
+      ) : null}
+
       {selectedAttempt ? (
         <section className="editorResultsSection">
           <p className="panelLabel">{copy.selectionBasis}</p>
           <article className="editorResultsCard editorResultsCardSelected">
-            <p className="detailText">{selectionReasonLabel(searchResult.selectionReason, copy)}</p>
+            <p className="detailText">
+              {selectionReasonLabel(searchResult.selectionReason, copy)}
+            </p>
             <p className="summaryText">{selectedAttempt.summary}</p>
 
             <div className="editorResultsMetrics">
               <article className="metricPill">
                 <span className="metaLabel">{copy.bestOutput}</span>
-                <strong>{searchResult.bestWithinLimit ? copy.fits : copy.over}</strong>
+                <strong>
+                  {searchResult.bestWithinLimit ? copy.fits : copy.over}
+                </strong>
               </article>
               <article className="metricPill">
-                <span className="metaLabel">{copy.size}</span>
+                <span className="metaLabel">{copy.actualOutputSize}</span>
                 <strong>{formatKiB(searchResult.bestSizeBytes)}</strong>
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.duration}</span>
-                <strong>{formatDuration(searchResult.selectedDurationSeconds, locale)}</strong>
+                <strong>
+                  {formatDuration(searchResult.selectedDurationSeconds, locale)}
+                </strong>
               </article>
               <article className="metricPill">
                 <span className="metaLabel">{copy.sourceMatch}</span>
-                <strong>{formatSimilarityScore(selectedAttempt.sourceSimilarityScore)}</strong>
+                <strong>
+                  {formatSimilarityScore(selectedAttempt.sourceSimilarityScore)}
+                </strong>
+              </article>
+              <article className="metricPill">
+                <span className="metaLabel">{copy.elapsedTime}</span>
+                <strong>
+                  {formatElapsedTime(selectedAttempt.elapsedMs, locale)}
+                </strong>
               </article>
             </div>
 
@@ -82,7 +133,9 @@ export function EditorResultsOverlay({
                 <button
                   className="secondaryAction"
                   type="button"
-                  onClick={() => onOpenOutputFolder(searchResult.bestOutputPath)}
+                  onClick={() =>
+                    onOpenOutputFolder(searchResult.bestOutputPath)
+                  }
                 >
                   {copy.openOutputFolder}
                 </button>
@@ -94,8 +147,12 @@ export function EditorResultsOverlay({
 
       <section className="editorResultsSection">
         <p className="panelLabel">{copy.attemptLog}</p>
-        <p className="summaryText">{selectionReasonLabel(searchResult.selectionReason, copy)}</p>
-        <p className="detailText">{stopReasonLabel(searchResult.stopReason, copy)}</p>
+        <p className="summaryText">
+          {selectionReasonLabel(searchResult.selectionReason, copy)}
+        </p>
+        <p className="detailText">
+          {stopReasonLabel(searchResult.stopReason, copy)}
+        </p>
 
         <div className="editorResultsAttempts">
           {searchResult.attempts.map((attempt) => {
@@ -104,13 +161,20 @@ export function EditorResultsOverlay({
               : null;
 
             return (
-              <article className="editorResultsAttemptCard" key={attempt.candidateId}>
+              <article
+                className="editorResultsAttemptCard"
+                key={attempt.candidateId}
+              >
                 <div className="editorResultsAttemptHeader">
                   <span className="rankBadge">#{attempt.rank}</span>
                   {attempt.candidateId === selectedCandidateId ? (
-                    <span className="badge badgeNeutral">{copy.selectedResult}</span>
+                    <span className="badge badgeNeutral">
+                      {copy.selectedResult}
+                    </span>
                   ) : null}
-                  <span className={statusClassName(attempt)}>{statusText(attempt, copy)}</span>
+                  <span className={statusClassName(attempt)}>
+                    {statusText(attempt, copy)}
+                  </span>
                 </div>
 
                 <h3>{attempt.summary}</h3>
@@ -121,16 +185,20 @@ export function EditorResultsOverlay({
                     <strong>{formatKiB(attempt.sizeBytes)}</strong>
                   </div>
                   <div>
-                    <span className="metaLabel">{copy.fit}</span>
-                    <strong>{fitModeLabel(attempt.fitMode)}</strong>
-                  </div>
-                  <div>
                     <span className="metaLabel">{copy.frameRate}</span>
                     <strong>{attempt.fps}</strong>
                   </div>
                   <div>
                     <span className="metaLabel">{copy.sourceMatch}</span>
-                    <strong>{formatSimilarityScore(attempt.sourceSimilarityScore)}</strong>
+                    <strong>
+                      {formatSimilarityScore(attempt.sourceSimilarityScore)}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="metaLabel">{copy.elapsedTime}</span>
+                    <strong>
+                      {formatElapsedTime(attempt.elapsedMs, locale)}
+                    </strong>
                   </div>
                 </div>
 
@@ -142,7 +210,15 @@ export function EditorResultsOverlay({
                   </div>
                 ) : null}
 
-                {attempt.errorMessage ? <p className="detailText">{attempt.errorMessage}</p> : null}
+                {attempt.errorCode ? (
+                  <p className="detailText">
+                    {mediaOperationMessage(
+                      locale,
+                      attempt.errorCode,
+                      attempt.reasonCode,
+                    )}
+                  </p>
+                ) : null}
               </article>
             );
           })}

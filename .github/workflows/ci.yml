@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality (Node 24 / Rust 1.96.1)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Rust 1.96.1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.96.1"
+          components: rustfmt, clippy
+          cache: false
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: "./src-tauri -> target"
+          key: ${{ hashFiles('rust-toolchain.toml', 'src-tauri/Cargo.lock') }}
+          cache-on-failure: false
+
+      - name: Set up MSYS2 GnuPG
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          update: true
+          install: >-
+            gnupg
+            tar
+
+      - name: Resolve MSYS2 tools
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $tools = [ordered]@{
+            STICKERFIT_BASH_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\bash.exe"
+            STICKERFIT_GPG_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\gpg.exe"
+            STICKERFIT_GPGV_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\gpgv.exe"
+            STICKERFIT_TAR_PATH = Join-Path $env:MSYS2_LOCATION "usr\bin\tar.exe"
+          }
+          foreach ($entry in $tools.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) {
+              throw "Required MSYS2 tool is missing: $($entry.Value)"
+            }
+            $versionOutput = @(& $entry.Value --version 2>&1)
+            $versionExitCode = $LASTEXITCODE
+            if ($versionExitCode -ne 0) { throw "$($entry.Key) version check failed." }
+            $versionLine = @($versionOutput | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -First 1)
+            if ($versionLine.Count -ne 1) { throw "$($entry.Key) did not report a version." }
+            Write-Host $versionLine[0]
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)"
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw "vswhere.exe is unavailable." }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "STICKERFIT_VSWHERE_PATH=$vswhere"
+
+      - name: Install exact cargo-audit
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo-audit installation failed." }
+          $version = (& cargo-audit --version)
+          if ($LASTEXITCODE -ne 0 -or $version -ne "cargo-audit 0.22.2") {
+            throw "Expected cargo-audit 0.22.2, got '$version'."
+          }
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Audit JavaScript dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Check PowerShell source
+        run: npm run test:powershell-syntax
+
+      - name: Check bootstrap contract
+        run: npm run test:bootstrap-contract
+
+      - name: Check FFmpeg source contract
+        run: npm run test:ffmpeg-source-contract
+
+      - name: Check vendor policy fixtures
+        run: npm run test:vendor-policy
+
+      - name: Verify tracked FFmpeg vendor
+        run: npm run ffmpeg:verify-vendor
+
+      - name: Check Rust formatting and lints
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed." }
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed." }
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Run Rust tests
+        run: npm run test:rust
+
+      - name: Build web frontend
+        run: npm run build:web
+
+      - name: Run web smoke tests
+        run: |
+          $edge = Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"
+          if (-not (Test-Path -LiteralPath $edge -PathType Leaf)) { throw "Microsoft Edge is unavailable." }
+          npm run test:web-smoke
+          if ($LASTEXITCODE -ne 0) { throw "Web smoke tests failed." }
+
+      - name: Check deterministic generated media
+        run: npm run test:generated-media
+
+      - name: Check Tauri policy
+        run: npm run test:tauri-policy
+
+      - name: Audit Rust dependencies
+        run: npm run test:rust-audit
+
+  node-22-compatibility:
+    name: Compatibility (Node 22)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install JavaScript dependencies
+        run: npm ci
+      - name: Run unit tests
+        run: npm run test:unit
+      - name: Build web frontend
+        run: npm run build:web
+
+  rust-msrv:
+    name: MSRV (Rust 1.88.0)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Rust 1.88.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.88.0"
+          cache: false
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: "./src-tauri -> target"
+          key: ${{ hashFiles('rust-toolchain.toml', 'src-tauri/Cargo.lock') }}-msrv-1.88.0
+          cache-on-failure: false
+      - name: Check MSRV
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+      - name: Test MSRV
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml

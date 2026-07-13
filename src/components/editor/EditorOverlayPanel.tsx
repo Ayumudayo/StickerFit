@@ -1,14 +1,21 @@
+import { useId, useRef } from "react";
+
 import { AdvancedDetailsPanel } from "../AdvancedDetailsPanel";
 import { CloseIcon } from "../AppIcons";
 import { EditorResultsOverlay } from "./EditorResultsOverlay";
 import { AdvancedOptimizerSettingsPanel } from "./AdvancedOptimizerSettingsPanel";
 import type { Locale, MessagesForLocale } from "../../locales/messages";
 import type {
+  OperationProgress,
+  OutputSizeEstimate,
   OptimizerGoal,
   OptimizerPlanResponse,
   OptimizerSearchDepth,
   OptimizerSearchResponse,
 } from "../../types/workflow";
+import type { VersionedWorkflowState } from "../../hooks/mediaWorkflow/workflowFingerprint";
+import type { VersionedProbeState } from "../../hooks/outputSizeEstimateCoordinator";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 
 export type EditorDockPanelMode = "preview" | "results" | "settings";
 
@@ -21,6 +28,16 @@ type EditorOverlayPanelProps = {
   resultsPanelId: string;
   plan: OptimizerPlanResponse | null;
   searchResult: OptimizerSearchResponse | null;
+  estimateState: VersionedWorkflowState<
+    OutputSizeEstimate[],
+    OperationProgress
+  >;
+  estimateByCandidateId: ReadonlyMap<string, OutputSizeEstimate>;
+  probeState: VersionedProbeState;
+  desktopAvailable: boolean;
+  onRetryEstimate: () => void;
+  onProbeCandidate: (candidateId: string) => void;
+  onCancelProbe: () => void;
   optimizerGoal: OptimizerGoal;
   qualityFrameDropInterval: number;
   optimizerSearchDepth: OptimizerSearchDepth;
@@ -29,7 +46,6 @@ type EditorOverlayPanelProps = {
   onOptimizerSearchDepthChange: (value: OptimizerSearchDepth) => void;
   onOpenOutputFolder: (path?: string | null) => void;
   onClose: () => void;
-  fitModeLabel: (value: string) => string;
 };
 
 export function EditorOverlayPanel({
@@ -41,6 +57,13 @@ export function EditorOverlayPanel({
   resultsPanelId,
   plan,
   searchResult,
+  estimateState,
+  estimateByCandidateId,
+  probeState,
+  desktopAvailable,
+  onRetryEstimate,
+  onProbeCandidate,
+  onCancelProbe,
   optimizerGoal,
   qualityFrameDropInterval,
   optimizerSearchDepth,
@@ -49,8 +72,16 @@ export function EditorOverlayPanel({
   onOptimizerSearchDepthChange,
   onOpenOutputFolder,
   onClose,
-  fitModeLabel,
 }: EditorOverlayPanelProps) {
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const panelTitleId = useId();
+
+  useDialogFocus({
+    isOpen: activePanel !== null,
+    dialogRef,
+    onClose,
+  });
+
   if (!activePanel) {
     return null;
   }
@@ -77,14 +108,24 @@ export function EditorOverlayPanel({
         onClick={onClose}
       />
       <section
+        ref={dialogRef}
         className={`editorDockPanel editorDockPanel--${activePanel}`}
         aria-live="polite"
         role="dialog"
         aria-modal="true"
+        aria-labelledby={panelTitleId}
+        tabIndex={-1}
         id={panelId}
       >
         <div className="editorDockPanelHeader">
-          <p className="panelLabel">{panelLabel}</p>
+          <p
+            id={panelTitleId}
+            className="panelLabel"
+            data-dialog-initial-focus
+            tabIndex={-1}
+          >
+            {panelLabel}
+          </p>
           <button
             className="subtleAction editorDockCloseButton"
             type="button"
@@ -98,14 +139,15 @@ export function EditorOverlayPanel({
         <div className="editorDockPanelBody">
           {activePanel === "settings" ? (
             <AdvancedOptimizerSettingsPanel
-              panelId={advancedSettingsPanelId}
               layout="dock"
               copy={copy}
               optimizerGoal={optimizerGoal}
               qualityFrameDropInterval={qualityFrameDropInterval}
               optimizerSearchDepth={optimizerSearchDepth}
               onOptimizerGoalChange={onOptimizerGoalChange}
-              onQualityFrameDropIntervalChange={onQualityFrameDropIntervalChange}
+              onQualityFrameDropIntervalChange={
+                onQualityFrameDropIntervalChange
+              }
               onOptimizerSearchDepthChange={onOptimizerSearchDepthChange}
             />
           ) : null}
@@ -116,7 +158,13 @@ export function EditorOverlayPanel({
               locale={locale}
               plan={plan}
               searchResult={null}
-              fitModeLabel={fitModeLabel}
+              estimateState={estimateState}
+              estimateByCandidateId={estimateByCandidateId}
+              probeState={probeState}
+              desktopAvailable={desktopAvailable}
+              onRetryEstimate={onRetryEstimate}
+              onProbeCandidate={onProbeCandidate}
+              onCancelProbe={onCancelProbe}
               variant="dock"
             />
           ) : null}
@@ -126,7 +174,6 @@ export function EditorOverlayPanel({
               copy={copy}
               locale={locale}
               searchResult={searchResult}
-              fitModeLabel={fitModeLabel}
               onOpenOutputFolder={onOpenOutputFolder}
             />
           ) : null}

@@ -1,0 +1,163 @@
+name: Vendor Policy
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - edited
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  classify:
+    name: Classify protected changes
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.base.ref == 'main'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      protected_changed: ${{ steps.classification.outputs.protected_changed }}
+    steps:
+      - name: Checkout trusted base policy only
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Read base/head blobs and changed-file metadata
+        id: classification
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          $result = Join-Path $env:RUNNER_TEMP "vendor-classification.json"
+          & .\tools\test-vendor-diff-policy.ps1 `
+            -DetectOnly `
+            -Repository $env:REPOSITORY `
+            -PullRequestNumber ([int]$env:PR_NUMBER) `
+            -BaseSha $env:BASE_SHA `
+            -HeadSha $env:HEAD_SHA `
+            -AuthorLogin $env:AUTHOR_LOGIN `
+            -AuthorAssociation $env:AUTHOR_ASSOCIATION `
+            -HeadRepository $env:HEAD_REPOSITORY `
+            -GitHubToken $env:GITHUB_TOKEN `
+            -ResultPath $result
+          $classification = Get-Content -Raw -LiteralPath $result | ConvertFrom-Json
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("protected_changed=" + ([bool]$classification.protectedChanged).ToString().ToLowerInvariant())
+
+  unprotected_review:
+    name: Verify protected files are byte-identical
+    needs: classify
+    if: needs.classify.outputs.protected_changed == 'false'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted base policy only
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Prove byte identity from Git blobs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          & .\tools\test-vendor-diff-policy.ps1 `
+            -Repository $env:REPOSITORY `
+            -PullRequestNumber ([int]$env:PR_NUMBER) `
+            -BaseSha $env:BASE_SHA `
+            -HeadSha $env:HEAD_SHA `
+            -AuthorLogin $env:AUTHOR_LOGIN `
+            -AuthorAssociation $env:AUTHOR_ASSOCIATION `
+            -HeadRepository $env:HEAD_REPOSITORY `
+            -GitHubToken $env:GITHUB_TOKEN
+
+  protected_review:
+    name: Verify protected change provenance
+    needs: classify
+    if: >-
+      needs.classify.outputs.protected_changed == 'true' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.author_association == 'OWNER' &&
+      github.event.pull_request.user.login == github.repository_owner
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment: ffmpeg-vendor-update
+    steps:
+      - name: Checkout trusted base policy only
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Validate author, protected run, and artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          & .\tools\test-vendor-diff-policy.ps1 `
+            -Repository $env:REPOSITORY `
+            -PullRequestNumber ([int]$env:PR_NUMBER) `
+            -BaseSha $env:BASE_SHA `
+            -HeadSha $env:HEAD_SHA `
+            -AuthorLogin $env:AUTHOR_LOGIN `
+            -AuthorAssociation $env:AUTHOR_ASSOCIATION `
+            -HeadRepository $env:HEAD_REPOSITORY `
+            -GitHubToken $env:GITHUB_TOKEN
+
+  vendor_policy:
+    name: Vendor policy
+    needs:
+      - classify
+      - unprotected_review
+      - protected_review
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the applicable policy path
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          PROTECTED_CHANGED: ${{ needs.classify.outputs.protected_changed }}
+          UNPROTECTED_RESULT: ${{ needs.unprotected_review.result }}
+          PROTECTED_RESULT: ${{ needs.protected_review.result }}
+        run: |
+          if ($env:CLASSIFY_RESULT -ne "success") { throw "Protected change classification did not succeed." }
+          if ($env:PROTECTED_CHANGED -eq "true") {
+            if ($env:PROTECTED_RESULT -ne "success" -or $env:UNPROTECTED_RESULT -ne "skipped") {
+              throw "Protected vendor policy validation did not succeed."
+            }
+          } elseif ($env:PROTECTED_CHANGED -eq "false") {
+            if ($env:UNPROTECTED_RESULT -ne "success" -or $env:PROTECTED_RESULT -ne "skipped") {
+              throw "Protected byte-identity validation did not succeed."
+            }
+          } else {
+            throw "Protected change classification output is invalid."
+          }

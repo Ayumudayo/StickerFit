@@ -18,7 +18,9 @@ describe("buildEditedTimelineFramesForRequest", () => {
       durationUs: frame.durationUs,
     }));
 
-    expect(buildEditedTimelineFramesForRequest(timelineFrames, sourceFrames)).toBeUndefined();
+    expect(
+      buildEditedTimelineFramesForRequest(timelineFrames, sourceFrames),
+    ).toBeUndefined();
   });
 
   it("sends timeline frames after order or duration edits", () => {
@@ -37,7 +39,9 @@ describe("buildEditedTimelineFramesForRequest", () => {
       },
     ];
 
-    expect(buildEditedTimelineFramesForRequest(editedTimelineFrames, sourceFrames)).toEqual([
+    expect(
+      buildEditedTimelineFramesForRequest(editedTimelineFrames, sourceFrames),
+    ).toEqual([
       { sourceFrameId: 2, durationUs: 250_000 },
       { sourceFrameId: 1, durationUs: 100_000 },
     ]);

@@ -1,0 +1,78 @@
+{
+  "errorCodes": [
+    "cancelled",
+    "timed-out",
+    "operation-conflict",
+    "invalid-request",
+    "source-changed",
+    "media-input-too-large",
+    "media-dimensions-too-large",
+    "media-frame-limit",
+    "decoded-byte-limit",
+    "png-chunk-limit",
+    "malformed-media",
+    "malformed-process-output",
+    "tool-missing",
+    "process-failed",
+    "output-conflict",
+    "internal-task-failed"
+  ],
+  "reasonCodes": [
+    "no-frames-selected",
+    "invalid-frame-selection",
+    "invalid-frame-duration",
+    "duration-too-long",
+    "invalid-crop",
+    "invalid-output-directory",
+    "unsupported-source-format",
+    "unsupported-frame-preview",
+    "frame-preview-decode-failed",
+    "frame-preview-encode-failed",
+    "decode-failed",
+    "encode-failed",
+    "missing-output",
+    "plan-invalid",
+    "invoke-failed"
+  ],
+  "wireCases": [
+    {
+      "name": "success-null",
+      "wire": {
+        "errorCode": null,
+        "reasonCode": null,
+        "errorMessage": null
+      },
+      "expected": {
+        "errorCode": null,
+        "reasonCode": null,
+        "errorMessage": null
+      }
+    },
+    {
+      "name": "cancelled",
+      "wire": {
+        "errorCode": "cancelled",
+        "reasonCode": null,
+        "errorMessage": "The media operation was cancelled."
+      },
+      "expected": {
+        "errorCode": "cancelled",
+        "reasonCode": null,
+        "errorMessage": "The media operation was cancelled."
+      }
+    },
+    {
+      "name": "invalid-request-invalid-crop",
+      "wire": {
+        "errorCode": "invalid-request",
+        "reasonCode": "invalid-crop",
+        "errorMessage": "Crop selection values must be valid numbers."
+      },
+      "expected": {
+        "errorCode": "invalid-request",
+        "reasonCode": "invalid-crop",
+        "errorMessage": "Crop selection values must be valid numbers."
+      }
+    }
+  ]
+}

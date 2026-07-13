@@ -11,7 +11,10 @@ import {
   selectNthTimelineFrames,
   setSelectedFrameDurationUs,
 } from "../../utils/frameEditing";
-import { microsecondsToSeconds, secondsToMicroseconds } from "../../utils/timelineFrames";
+import {
+  microsecondsToSeconds,
+  secondsToMicroseconds,
+} from "../../utils/timelineFrames";
 import type {
   FrameContextMenuState,
   FrameDurationDialogMode,
@@ -77,8 +80,11 @@ export function useFrameDialogState({
   }, []);
 
   const openFrameDurationDialog = useCallback(() => {
-    const anchorId = frameContextMenu?.anchorInstanceId ?? selectedInstanceIds[0];
-    const anchorFrame = timelineFrames.find((frame) => frame.instanceId === anchorId);
+    const anchorId =
+      frameContextMenu?.anchorInstanceId ?? selectedInstanceIds[0];
+    const anchorFrame = timelineFrames.find(
+      (frame) => frame.instanceId === anchorId,
+    );
     if (!anchorFrame) {
       return;
     }
@@ -89,7 +95,12 @@ export function useFrameDialogState({
     });
     setFrameDurationMode("fps");
     closeFrameContextMenu();
-  }, [closeFrameContextMenu, frameContextMenu, selectedInstanceIds, timelineFrames]);
+  }, [
+    closeFrameContextMenu,
+    frameContextMenu,
+    selectedInstanceIds,
+    timelineFrames,
+  ]);
 
   const applyDurationChange = useCallback(
     (durationUs: number) => {
@@ -111,7 +122,10 @@ export function useFrameDialogState({
         current
           ? {
               ...current,
-              durationUs: Math.max(minDurationUs, secondsToMicroseconds(seconds)),
+              durationUs: Math.max(
+                minDurationUs,
+                secondsToMicroseconds(seconds),
+              ),
             }
           : current,
       );
@@ -133,10 +147,17 @@ export function useFrameDialogState({
   }, [closeFrameContextMenu]);
 
   const applyNthFrameSelection = useCallback(() => {
-    setSelectedInstanceIds(selectNthTimelineFrames(timelineFrames, nthSelectionStep, 0));
+    setSelectedInstanceIds(
+      selectNthTimelineFrames(timelineFrames, nthSelectionStep, 0),
+    );
     setShowNthSelectionDialog(false);
     closeFrameContextMenu();
-  }, [closeFrameContextMenu, nthSelectionStep, setSelectedInstanceIds, timelineFrames]);
+  }, [
+    closeFrameContextMenu,
+    nthSelectionStep,
+    setSelectedInstanceIds,
+    timelineFrames,
+  ]);
 
   const closeFrameDurationDialog = useCallback(() => {
     setFrameDurationDialog(null);

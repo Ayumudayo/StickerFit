@@ -1,4 +1,10 @@
-import { type MouseEvent as ReactMouseEvent, useCallback, useLayoutEffect, useRef, useState } from "react";
+import {
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import type { FrameContextMenuState } from "../../types/editor";
 
@@ -11,7 +17,8 @@ export function useFrameContextMenuState({
   selectedInstanceIdSet,
   setSelectedInstanceIds,
 }: UseFrameContextMenuStateParams) {
-  const [frameContextMenu, setFrameContextMenu] = useState<FrameContextMenuState | null>(null);
+  const [frameContextMenu, setFrameContextMenu] =
+    useState<FrameContextMenuState | null>(null);
   const frameContextMenuRef = useRef<HTMLElement | null>(null);
 
   const closeFrameContextMenu = useCallback(() => {

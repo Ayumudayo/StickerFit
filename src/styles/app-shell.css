@@ -33,7 +33,7 @@
 }
 
 .desktopTitleIcon {
-  color: #5865F2;
+  color: #5865f2;
 }
 
 .desktopHeaderActions {
@@ -355,7 +355,7 @@
 
 .previewInfoSettings {
   display: grid;
-  grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr) auto;
+  grid-template-columns: minmax(152px, 1fr) auto;
   align-items: end;
   align-content: center;
   gap: 10px 12px;
@@ -393,17 +393,6 @@
   white-space: nowrap;
 }
 
-.previewInlineSelect:disabled {
-  background: #12141b;
-  color: #7b8191;
-  border-color: rgba(255, 255, 255, 0.06);
-  cursor: not-allowed;
-}
-
-.previewInlineSelect:disabled + .previewInlineChevron {
-  color: #5b6170;
-}
-
 .previewInlineChevron {
   position: absolute;
   right: 10px;
@@ -436,17 +425,6 @@
   max-width: 100%;
 }
 
-@media (max-width: 1320px) {
-  .previewInfoSettings {
-    grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr);
-  }
-
-  .previewInfoResetAction {
-    grid-column: 1 / -1;
-    justify-self: start;
-  }
-}
-
 .previewControlBar {
   display: flex;
   align-items: center;
@@ -472,7 +450,7 @@
   height: 30px;
   border: 0;
   border-radius: 9px;
-  background: #5865F2;
+  background: #5865f2;
   color: #ffffff;
 }
 
@@ -809,7 +787,7 @@
   padding: 4px 10px;
   border-radius: 999px;
   background: rgba(88, 101, 242, 0.16);
-  color: #5865F2;
+  color: #5865f2;
   font-size: 0.85rem;
 }
 
@@ -858,7 +836,7 @@
   position: relative;
 }
 
-.fitModeSelect,
+.fieldSelect,
 .fieldInput {
   width: 100%;
   appearance: none;
@@ -868,7 +846,7 @@
   color: #ffffff;
 }
 
-.fitModeSelect {
+.fieldSelect {
   min-height: 36px;
   padding: 7px 34px 7px 10px;
 }
@@ -1149,7 +1127,7 @@
   }
 
   .previewInfoSettings {
-    grid-template-columns: minmax(176px, 1fr) minmax(152px, 0.88fr) auto;
+    grid-template-columns: minmax(152px, 1fr) auto;
     padding-left: 0;
     padding-top: 8px;
     border-left: 0;
@@ -1172,7 +1150,6 @@
   .previewUtilityPrimaryAction {
     justify-self: auto;
   }
-
 }
 
 @media (max-width: 760px) {
@@ -1190,7 +1167,6 @@
     width: 100%;
     justify-content: center;
   }
-
 }
 
 @media (max-width: 1040px) {

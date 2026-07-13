@@ -66,9 +66,7 @@ export function setSelectedFrameDurationUs(
 ) {
   const selectedIds = selectedIdSet(selectedInstanceIds);
   return timelineFrames.map((frame) =>
-    selectedIds.has(frame.instanceId)
-      ? { ...frame, durationUs }
-      : frame,
+    selectedIds.has(frame.instanceId) ? { ...frame, durationUs } : frame,
   );
 }
 
@@ -86,7 +84,10 @@ export function scaleSelectedFrameDurations(
 
     return {
       ...frame,
-      durationUs: Math.max(minDurationUs, Math.round(frame.durationUs * factor)),
+      durationUs: Math.max(
+        minDurationUs,
+        Math.round(frame.durationUs * factor),
+      ),
     };
   });
 }
@@ -149,9 +150,7 @@ function selectedFrameIndexes(
   selectedIds: ReadonlySet<string>,
 ) {
   return timelineFrames
-    .map((frame, index) =>
-      selectedIds.has(frame.instanceId) ? index : -1,
-    )
+    .map((frame, index) => (selectedIds.has(frame.instanceId) ? index : -1))
     .filter((index) => index !== -1);
 }
 
@@ -162,7 +161,8 @@ export function moveSelectedFramesByStep(
 ) {
   const selectedIds = selectedIdSet(selectedInstanceIds);
   const nextFrames = [...timelineFrames];
-  const isSelected = (frame: EditableTimelineFrame) => selectedIds.has(frame.instanceId);
+  const isSelected = (frame: EditableTimelineFrame) =>
+    selectedIds.has(frame.instanceId);
 
   if (direction === -1) {
     for (let index = 1; index < nextFrames.length; index += 1) {
@@ -192,7 +192,9 @@ export function moveSelectedFramesToBoundary(
 ) {
   const selectedIds = selectedIdSet(selectedInstanceIds);
   const selected = orderedSelectedFrames(timelineFrames, selectedIds);
-  const unselected = timelineFrames.filter((frame) => !selectedIds.has(frame.instanceId));
+  const unselected = timelineFrames.filter(
+    (frame) => !selectedIds.has(frame.instanceId),
+  );
 
   return boundary === "start"
     ? [...selected, ...unselected]
@@ -206,10 +208,12 @@ export function copySelectedFramesToBoundary(
   createInstanceId: () => string,
 ) {
   const selectedIds = selectedIdSet(selectedInstanceIds);
-  const selectedClones = orderedSelectedFrames(timelineFrames, selectedIds).map((frame) => ({
-    ...frame,
-    instanceId: createInstanceId(),
-  }));
+  const selectedClones = orderedSelectedFrames(timelineFrames, selectedIds).map(
+    (frame) => ({
+      ...frame,
+      instanceId: createInstanceId(),
+    }),
+  );
 
   return boundary === "start"
     ? [...selectedClones, ...timelineFrames]
@@ -222,7 +226,10 @@ export function reverseSelectedFramesInPlace(
 ) {
   const selectedIds = selectedIdSet(selectedInstanceIds);
   const indexes = selectedFrameIndexes(timelineFrames, selectedIds);
-  const reversedFrames = orderedSelectedFrames(timelineFrames, selectedIds).reverse();
+  const reversedFrames = orderedSelectedFrames(
+    timelineFrames,
+    selectedIds,
+  ).reverse();
   const nextFrames = [...timelineFrames];
 
   indexes.forEach((index, order) => {
@@ -236,7 +243,10 @@ export function copySelectedFrames(
   timelineFrames: EditableTimelineFrame[],
   selectedInstanceIds: string[],
 ) {
-  return orderedSelectedFrames(timelineFrames, selectedIdSet(selectedInstanceIds));
+  return orderedSelectedFrames(
+    timelineFrames,
+    selectedIdSet(selectedInstanceIds),
+  );
 }
 
 export function cutSelectedFrames(
@@ -245,7 +255,10 @@ export function cutSelectedFrames(
 ) {
   return {
     clipboardFrames: copySelectedFrames(timelineFrames, selectedInstanceIds),
-    timelineFrames: deleteSelectedTimelineFrames(timelineFrames, selectedInstanceIds),
+    timelineFrames: deleteSelectedTimelineFrames(
+      timelineFrames,
+      selectedInstanceIds,
+    ),
   };
 }
 
@@ -295,7 +308,9 @@ export function moveSelectedFramesAroundAnchor(
   }
 
   const selectedFrames = orderedSelectedFrames(timelineFrames, selectedIds);
-  const remainingFrames = timelineFrames.filter((frame) => !selectedIds.has(frame.instanceId));
+  const remainingFrames = timelineFrames.filter(
+    (frame) => !selectedIds.has(frame.instanceId),
+  );
   const anchorIndex = remainingFrames.findIndex(
     (frame) => frame.instanceId === anchorInstanceId,
   );

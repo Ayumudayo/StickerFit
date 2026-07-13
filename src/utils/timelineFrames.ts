@@ -1,5 +1,9 @@
 import type { Locale } from "../locales/messages";
-import type { SourceFrame, TimelineFrame, TimelineFrameView } from "../types/editor";
+import type {
+  SourceFrame,
+  TimelineFrame,
+  TimelineFrameView,
+} from "../types/editor";
 
 export function formatTimelineTime(value: number, locale: Locale) {
   return locale === "ko" ? `${value.toFixed(2)}초` : `${value.toFixed(2)}s`;
@@ -13,25 +17,25 @@ export function microsecondsToSeconds(value: number) {
   return value / 1_000_000;
 }
 
+export function timelineDurationSeconds(
+  frames: readonly Pick<TimelineFrame, "durationUs">[],
+) {
+  return frames.reduce((sum, frame) => sum + frame.durationUs, 0) / 1_000_000;
+}
+
 export function buildSourceFrames(
   durationSeconds: number | null,
   estimatedFrames: number | null,
   frameDurationsSeconds: number[] | null,
 ) {
-  if (
-    frameDurationsSeconds &&
-    frameDurationsSeconds.length > 0 &&
-    durationSeconds &&
-    durationSeconds > 0
-  ) {
+  if (frameDurationsSeconds && frameDurationsSeconds.length > 0) {
     let currentStartUs = 0;
 
     return frameDurationsSeconds.map((frameDurationSeconds, index) => {
-      const normalizedDuration = Number(frameDurationSeconds.toFixed(3));
       const frame = {
         sourceFrameId: index + 1,
         startTimeUs: currentStartUs,
-        durationUs: secondsToMicroseconds(normalizedDuration),
+        durationUs: secondsToMicroseconds(frameDurationSeconds),
       } satisfies SourceFrame;
 
       currentStartUs += frame.durationUs;
@@ -39,19 +43,27 @@ export function buildSourceFrames(
     });
   }
 
-  if (!durationSeconds || durationSeconds <= 0 || !estimatedFrames || estimatedFrames <= 0) {
+  if (
+    !durationSeconds ||
+    durationSeconds <= 0 ||
+    !estimatedFrames ||
+    estimatedFrames <= 0
+  ) {
     return [] as SourceFrame[];
   }
 
-  const frameCount = Math.max(1, Math.round(estimatedFrames));
-  const uniformFrameDuration = Number((durationSeconds / frameCount).toFixed(3));
+  const totalDurationUs = secondsToMicroseconds(durationSeconds);
+  const requestedFrameCount = Math.max(1, Math.round(estimatedFrames));
+  const frameCount = Math.min(requestedFrameCount, totalDurationUs);
+  const baseDurationUs = Math.floor(totalDurationUs / frameCount);
+  const remainderUs = totalDurationUs % frameCount;
   let currentStartUs = 0;
 
   return Array.from({ length: frameCount }, (_, index) => {
     const frame = {
       sourceFrameId: index + 1,
       startTimeUs: currentStartUs,
-      durationUs: secondsToMicroseconds(uniformFrameDuration),
+      durationUs: baseDurationUs + (index < remainderUs ? 1 : 0),
     } satisfies SourceFrame;
 
     currentStartUs += frame.durationUs;
@@ -72,8 +84,10 @@ export function buildTimelineFrameViews(
   timelineFrames: TimelineFrame[],
   sourceFrames: SourceFrame[],
 ) {
-  let currentTimeSeconds = 0;
-  const sourceFrameMap = new Map(sourceFrames.map((frame) => [frame.sourceFrameId, frame]));
+  let currentStartUs = 0;
+  const sourceFrameMap = new Map(
+    sourceFrames.map((frame) => [frame.sourceFrameId, frame]),
+  );
 
   return timelineFrames.map((frame) => {
     const sourceFrame = sourceFrameMap.get(frame.sourceFrameId);
@@ -83,11 +97,14 @@ export function buildTimelineFrameViews(
       displayNumber: frame.displayNumber,
       durationUs: frame.durationUs,
       durationSeconds: microsecondsToSeconds(frame.durationUs),
-      startTimeSeconds: Number(currentTimeSeconds.toFixed(3)),
-      sourceStartTimeSeconds: microsecondsToSeconds(sourceFrame?.startTimeUs ?? 0),
+      startTimeUs: currentStartUs,
+      startTimeSeconds: microsecondsToSeconds(currentStartUs),
+      sourceStartTimeSeconds: microsecondsToSeconds(
+        sourceFrame?.startTimeUs ?? 0,
+      ),
     } satisfies TimelineFrameView;
 
-    currentTimeSeconds += microsecondsToSeconds(frame.durationUs);
+    currentStartUs += frame.durationUs;
     return view;
   });
 }

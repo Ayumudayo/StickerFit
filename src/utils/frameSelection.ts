@@ -52,9 +52,10 @@ function addRangeToSelectionHistory(
   rangeIds: string[],
   targetInstanceId: string,
 ) {
-  const nextIds = validSelectionHistory(orderedFrameIds, selectedInstanceIds).filter(
-    (instanceId) => instanceId !== targetInstanceId,
-  );
+  const nextIds = validSelectionHistory(
+    orderedFrameIds,
+    selectedInstanceIds,
+  ).filter((instanceId) => instanceId !== targetInstanceId);
   const selectedIds = new Set(nextIds);
 
   for (const instanceId of rangeIds) {
@@ -85,8 +86,13 @@ export function buildFramePointerSelection({
     const rangeAnchor =
       anchorInstanceId && orderedFrameIds.includes(anchorInstanceId)
         ? anchorInstanceId
-        : selectedInstanceIds[selectedInstanceIds.length - 1] ?? targetInstanceId;
-    const rangeIds = frameIdsInRange(orderedFrameIds, rangeAnchor, targetInstanceId);
+        : (selectedInstanceIds[selectedInstanceIds.length - 1] ??
+          targetInstanceId);
+    const rangeIds = frameIdsInRange(
+      orderedFrameIds,
+      rangeAnchor,
+      targetInstanceId,
+    );
 
     if (ctrlKey) {
       return {
@@ -109,7 +115,10 @@ export function buildFramePointerSelection({
   }
 
   if (ctrlKey) {
-    const selectedHistory = validSelectionHistory(orderedFrameIds, selectedInstanceIds);
+    const selectedHistory = validSelectionHistory(
+      orderedFrameIds,
+      selectedInstanceIds,
+    );
     const isSelected = selectedHistory.includes(targetInstanceId);
     const nextSelectedIds = isSelected
       ? selectedHistory.filter((instanceId) => instanceId !== targetInstanceId)

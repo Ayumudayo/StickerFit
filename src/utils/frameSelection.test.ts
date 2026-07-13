@@ -16,6 +16,7 @@ const frameViews: TimelineFrameView[] = frameIds.map((instanceId, index) => ({
   displayNumber: index + 1,
   durationUs: 100_000,
   durationSeconds: 0.1,
+  startTimeUs: index * 100_000,
   startTimeSeconds: index / 10,
   sourceStartTimeSeconds: index / 10,
 }));
@@ -74,15 +75,23 @@ describe("frame selection helpers", () => {
       "frame-3",
       "frame-2",
     ]);
-    expect(lastSelectedFrameView(frameViews, ["frame-1", "frame-3"])?.instanceId).toBe("frame-3");
-    expect(lastSelectedFrameView(frameViews, ["frame-3", "frame-2"])?.instanceId).toBe("frame-2");
+    expect(
+      lastSelectedFrameView(frameViews, ["frame-1", "frame-3"])?.instanceId,
+    ).toBe("frame-3");
+    expect(
+      lastSelectedFrameView(frameViews, ["frame-3", "frame-2"])?.instanceId,
+    ).toBe("frame-2");
   });
 
   it("keeps playback based on every frame present in the frame rail", () => {
-    expect(selectedPlaybackFrames(frameViews, ["frame-4", "frame-2"]).map((frame) => frame.instanceId))
-      .toEqual(frameIds);
-    expect(selectedPlaybackFrames(frameViews, []).map((frame) => frame.instanceId))
-      .toEqual(frameIds);
+    expect(
+      selectedPlaybackFrames(frameViews, ["frame-4", "frame-2"]).map(
+        (frame) => frame.instanceId,
+      ),
+    ).toEqual(frameIds);
+    expect(
+      selectedPlaybackFrames(frameViews, []).map((frame) => frame.instanceId),
+    ).toEqual(frameIds);
   });
 
   it("deselects the clicked selected frame with Ctrl-click", () => {

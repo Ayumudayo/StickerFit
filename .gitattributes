@@ -1,0 +1,20 @@
+/.gitattributes text eol=lf
+/src/**/*.ts text eol=lf
+/src/**/*.tsx text eol=lf
+/src/**/*.css text eol=lf
+/tests/**/*.ts text eol=lf
+/package*.json text eol=lf
+/.github/**/*.yml text eol=lf
+/src-tauri/Cargo.toml text eol=lf
+/src-tauri/tauri.conf.json text eol=lf
+/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe -text
+/tools/test-release-sidecar.ps1 text eol=lf
+/tools/ffmpeg/FfmpegSourceVerification.psm1 text eol=lf
+/tools/ffmpeg/ffmpeg-release-signing-key.asc text eol=lf
+/tools/ffmpeg/ffmpeg-version.json text eol=lf
+/src-tauri/binaries/ffmpeg-provenance.json text eol=lf
+/src-tauri/binaries/LICENSE-ffmpeg.txt text eol=lf
+/src-tauri/binaries/LICENSE-libwinpthread.txt text eol=lf
+/src-tauri/tests/fixtures/LICENSE-chromium.txt text eol=lf
+/src-tauri/tests/fixtures/media-fixtures.json text eol=lf
+/src-tauri/binaries/LICENSE-ffmpeg-BtbN.txt text eol=crlf

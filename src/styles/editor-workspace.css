@@ -51,7 +51,7 @@
   width: 44px;
   height: 44px;
   border-radius: 12px;
-  background: #5865F2;
+  background: #5865f2;
   color: #ffffff;
 }
 
@@ -92,13 +92,17 @@
   opacity: 0.28;
 }
 
+.timelineSegment.is-current {
+  box-shadow: inset 0 0 0 1px rgba(246, 234, 212, 0.72);
+}
+
 .timelineTrimRange {
   position: absolute;
   top: 0;
   bottom: 0;
   background: rgba(88, 101, 242, 0.14);
-  border-left: 2px solid #5865F2;
-  border-right: 2px solid #5865F2;
+  border-left: 2px solid #5865f2;
+  border-right: 2px solid #5865f2;
 }
 
 .timelinePlayhead {
@@ -128,7 +132,7 @@
   bottom: 12px;
   width: 4px;
   border-radius: 999px;
-  background: #5865F2;
+  background: #5865f2;
   transform: translateX(-50%);
 }
 
@@ -152,6 +156,11 @@
   align-items: center;
 }
 
+.frameTable.with-preview,
+.frameRow.with-preview {
+  grid-template-columns: 42px minmax(52px, 0.8fr) minmax(64px, 1fr);
+}
+
 .frameTableHeader {
   color: #71717a;
   font-size: 0.78rem;
@@ -160,21 +169,44 @@
 }
 
 .frameTableBody {
-  --frame-row-intrinsic-size: 42px;
-  display: grid;
-  gap: 2px;
+  --frame-row-height: 48px;
+  display: block;
   max-height: min(58vh, 640px);
   overflow-y: auto;
   padding-right: 4px;
+  position: relative;
 }
 
-.frameTableBody.is-large .frameRow {
-  content-visibility: auto;
-  contain-intrinsic-size: var(--frame-row-intrinsic-size);
+.frameTableBodyShell {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.frameTableBodyShell .frameTableBody {
+  height: 100%;
+}
+
+.frameVirtualSpacer {
+  position: relative;
+  width: 100%;
+}
+
+.frameVirtualRows {
+  position: absolute;
+  inset: 0 0 auto;
+  width: 100%;
+  will-change: transform;
+}
+
+.frameVirtualItem {
+  position: relative;
+  width: 100%;
 }
 
 .frameRow {
   width: 100%;
+  height: 100%;
   border: 1px solid transparent;
   border-radius: 8px;
   padding: 6px 10px;
@@ -188,6 +220,80 @@
     border-color 120ms ease,
     background 120ms ease,
     opacity 120ms ease;
+}
+
+.framePreviewCell {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #a1a1aa;
+}
+
+.framePreviewCell img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.framePreviewStatus {
+  max-width: 32px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.58rem;
+  line-height: 1.1;
+}
+
+.framePreviewPlaceholder {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.framePreviewCell.is-error {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.frameVirtualItem.has-preview-error .frameRow {
+  padding-right: 70px;
+}
+
+.framePreviewRetry {
+  position: absolute;
+  z-index: 4;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 62px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: rgba(127, 29, 29, 0.45);
+  color: #fecaca;
+  font-size: 0.68rem;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.framePreviewRetryLayer {
+  position: absolute;
+  z-index: 4;
+  inset: 0 16px 0 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.framePreviewRetry:hover,
+.framePreviewRetry:focus-visible {
+  background: rgba(153, 27, 27, 0.7);
 }
 
 .frameRow::before,
@@ -218,9 +324,8 @@
   background: rgba(255, 255, 255, 0.04);
 }
 
-.frameRow:focus,
 .frameRow:focus-visible {
-  outline: none;
+  outline-offset: -2px;
 }
 
 .frameRow.is-selected {
@@ -238,14 +343,29 @@
 }
 
 .frameRow.is-dragged {
-  will-change: transform;
-  opacity: 0.96;
+  opacity: 0.24;
   cursor: grabbing;
-  z-index: 3;
   pointer-events: none;
-  transform: translateY(var(--frame-row-drag-y, 0px)) scale(1.02);
-  box-shadow: 0 18px 32px rgba(15, 23, 42, 0.42);
   transition: none;
+}
+
+.frameDragOverlay {
+  position: absolute;
+  z-index: 6;
+  left: 4px;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(129, 140, 248, 0.72);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: rgba(30, 41, 59, 0.96);
+  color: #e0e7ff;
+  box-shadow: 0 18px 32px rgba(15, 23, 42, 0.42);
+  font-size: 0.78rem;
+  pointer-events: none;
 }
 
 .frameRow.is-drop-above {
@@ -417,6 +537,110 @@
   padding: 24px;
 }
 
+.previewUtilityPrimaryStack {
+  display: grid;
+  gap: 10px;
+  width: min(100%, 440px);
+  margin-left: auto;
+}
+
+.previewUtilityAreaStatic .previewUtilityPrimaryStack {
+  width: min(100%, 520px);
+}
+
+.outputEstimateCard {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid rgba(129, 140, 248, 0.26);
+  border-radius: 14px;
+  background: rgba(30, 32, 43, 0.9);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.18);
+}
+
+.outputEstimateHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.outputEstimateSummary {
+  color: #f4f4f5;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.outputEstimateStateActions,
+.outputEstimateProbe {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+}
+
+.operationProgressBlock {
+  display: grid;
+  gap: 7px;
+}
+
+.operationProgressTrack {
+  position: relative;
+  width: 100%;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.operationProgressFill {
+  display: block;
+  width: var(--operation-progress, 0%);
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #5865f2, #818cf8);
+  transition: width 160ms ease;
+}
+
+.operationProgressTrackIndeterminate .operationProgressFill {
+  width: 34%;
+  animation: operation-progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+.outputEstimateNotice {
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.operationCancelledMessage {
+  margin: 0;
+  color: #a1a1aa;
+}
+
+.estimateSettingsHint {
+  margin: 0;
+  color: #8b8d97;
+}
+
+@keyframes operation-progress-indeterminate {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(310%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .operationProgressFill {
+    transition: none;
+  }
+
+  .operationProgressTrackIndeterminate .operationProgressFill {
+    animation: none;
+    transform: translateX(95%);
+  }
+}
+
 @media (max-width: 940px) {
   .desktopPickerGrid,
   .ctaRow,
@@ -509,6 +733,10 @@
 }
 
 @media (max-width: 760px) {
+  .previewUtilityPrimaryStack {
+    width: 100%;
+    margin-left: 0;
+  }
 
   .editorWorkspace,
   .editorWorkspaceStatic {
@@ -551,17 +779,20 @@
   }
 
   .frameTableBody {
-    --frame-row-intrinsic-size: 68px;
-    gap: 8px;
+    --frame-row-height: 48px;
     padding-right: 0;
   }
 
   .frameRow {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px 14px;
-    padding: 10px 12px;
-    border-radius: 12px;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 8px;
     background: rgba(255, 255, 255, 0.02);
+  }
+
+  .frameRow.with-preview {
+    grid-template-columns: 42px minmax(52px, 0.8fr) minmax(64px, 1fr);
   }
 
   .frameIdCell,
